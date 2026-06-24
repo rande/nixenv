@@ -14,9 +14,9 @@
 #   4. A BASIC runtime container (debian:stable-slim) mounts the volume read-only
 #      at /nix, creates a non-root `app` user, and starts zsh + starship.
 #
-# Per-project layout (under $PROJECTS_DIR, created on demand):
-#   <project>/home  → copied into /home/app (.ssh, .zshrc, configs)
-#   <project>/repo  → mounted at /app (your code; WORKDIR)
+# Per-project layout:
+#   <project>/home        → copied into /home/app (.ssh, .zshrc, configs)
+#   docker volume <name>_app → mounted at /app (your code; WORKDIR)
 # =============================================================================
 
 set -euo pipefail
@@ -33,8 +33,13 @@ RUNTIME_IMAGE="${RUNTIME_IMAGE:-debian:stable-slim}"
 FLAKE_REF="${FLAKE_REF:-.#default}"                  # what to build/install from the flake
 PROFILE="${PROFILE:-/nix/var/nix/profiles/shared}"  # profile path INSIDE /nix
 CONTAINER_PREFIX="${CONTAINER_PREFIX:-nixenv}"       # container name = <prefix>-<project>
-PROJECTS_DIR="${PROJECTS_DIR:-$SCRIPT_DIR/projects}" # holds all projects
 APP_USER="${APP_USER:-app}"                          # non-root user in the runtime container
+PROJECTS_DIR="$HOME/.nixenv/projects"                # all projects live here
+CLAUDE_DIR="$HOME/.nixenv/claude"                    # shared Claude CLI creds/config dir (~/.claude)
+CLAUDE_JSON="$HOME/.nixenv/claude.json"              # shared Claude global config file (~/.claude.json)
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-}"             # docker|podman; empty = auto-detect
+ENGINE_FILE="$HOME/.nixenv/engine"                   # remembered engine choice
+ENGINE=""                                            # resolved at runtime
 
 # ── Pretty output ────────────────────────────────────────────────────────────
 c_blue='\033[1;34m'; c_green='\033[1;32m'; c_yellow='\033[1;33m'; c_red='\033[1;31m'; c_reset='\033[0m'
@@ -56,11 +61,12 @@ materialize_context() {
 {
   description = "Shared NixOS dev environment (store lives in a Docker volume)";
 
-  # Pinned to the same channel the reference Dockerfile used.
-  # Bump this tag (and run `nix flake update`) to roll all tools forward.
+  # Stable channel for the whole toolchain; unstable ONLY for fast-moving tools
+  # like the Claude CLI. Run `nixenv.sh update` to roll the locked revs forward.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  inputs.nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, nixpkgs-unstable }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
@@ -73,6 +79,10 @@ materialize_context() {
       packages = forAllSystems (system:
         let
           pkgs = import nixpkgs {
+            inherit system;
+            config.allowUnfree = true;
+          };
+          unstable = import nixpkgs-unstable {
             inherit system;
             config.allowUnfree = true;
           };
@@ -121,17 +131,21 @@ materialize_context() {
               findutils
               less
               openssh
+              runit
               cacert
 
               # ── Languages & runtimes ───────────────────────────────────────
               nodejs_22
               go
               rustup
-              php83
-              php83Packages.composer
+              php85
+              php85Packages.composer
               python312
               uv
               sqlite
+
+              # ── AI tooling (from nixpkgs-unstable only) ────────────────────
+              unstable.claude-code
 
               # ── Misc handy tools ───────────────────────────────────────────
               httpie
@@ -173,7 +187,7 @@ FROM nixos/nix:2.32.8
 
 ARG NIXPKGS_CHANNEL=nixos-26.05
 ARG NODE_MAJOR=22
-ARG PHP_PKG=83
+ARG PHP_PKG=85
 ARG RUST_CHANNEL=stable
 ARG PYTHON_PKG=312
 ARG OH_MY_ZSH_THEME=robbyrussell
@@ -250,6 +264,9 @@ if ! id "$APP_USER" >/dev/null 2>&1; then
     || adduser --disabled-password --gecos "" --uid "$APP_UID" --gid "$APP_GID" \
                --home "$HOME_DIR" --shell "$ZSH_BIN" "$APP_USER" 2>/dev/null || true
 fi
+# Blank the app account password so SSH can log in with no key and no password
+# (local-dev convenience; the port is published on 127.0.0.1 only).
+passwd -d "$APP_USER" 2>/dev/null || usermod -p '' "$APP_USER" 2>/dev/null || true
 mkdir -p "$HOME_DIR"
 
 # --- Seed home from the mounted project home (copy, not bind) ----------------
@@ -266,10 +283,19 @@ export ZSH="$PROFILE/share/oh-my-zsh"
 export ZSH_CACHE_DIR="\$HOME/.cache/omz"
 export SSL_CERT_FILE="$PROFILE/etc/ssl/certs/ca-bundle.crt"
 export NIX_SSL_CERT_FILE="$PROFILE/etc/ssl/certs/ca-bundle.crt"
+export NIXENV_PROJECT="${NIXENV_PROJECT:-}"
 export EDITOR=vim
 export LANG=C.UTF-8
 EOF
 mkdir -p "$HOME_DIR/.cache/omz"
+
+# --- Build authorized_keys from any *.pub if absent (for inbound SSH) --------
+if [ -d "$HOME_DIR/.ssh" ] && [ ! -f "$HOME_DIR/.ssh/authorized_keys" ]; then
+  for pub in "$HOME_DIR"/.ssh/*.pub; do
+    [ -f "$pub" ] || continue
+    cat "$pub" >> "$HOME_DIR/.ssh/authorized_keys"
+  done
+fi
 
 # --- Ownership + strict SSH perms --------------------------------------------
 chown -R "$APP_UID:$APP_GID" "$HOME_DIR"
@@ -278,26 +304,85 @@ if [ -d "$HOME_DIR/.ssh" ]; then
   find "$HOME_DIR/.ssh" -type f -exec chmod 600 {} \; 2>/dev/null || true
 fi
 
-# Give the app user ownership of its working copy (the project's repo/ folder).
+# Give the app user ownership of its working copy (the project's app volume).
 # Disable with APP_CHOWN_REPO=0 if you don't want ownership changed.
 if [ "${APP_CHOWN_REPO:-1}" = "1" ] && [ -d /app ]; then
   chown -R "$APP_UID:$APP_GID" /app 2>/dev/null || true
 fi
 
-# --- Drop privileges and start zsh (login → sources .zshenv + .zshrc) --------
-if command -v runuser >/dev/null 2>&1; then
-  if [ "$#" -eq 0 ]; then
-    exec runuser -u "$APP_USER" -- "$ZSH_BIN" -l
-  else
+# =============================================================================
+# Command mode: run the given command as the app user, then exit.
+# =============================================================================
+if [ "$#" -gt 0 ]; then
+  if command -v runuser >/dev/null 2>&1; then
     exec runuser -u "$APP_USER" -- "$ZSH_BIN" -lc 'exec "$@"' zsh "$@"
-  fi
-else
-  if [ "$#" -eq 0 ]; then
-    exec su - "$APP_USER" -s "$ZSH_BIN"
   else
     exec su "$APP_USER" -s "$ZSH_BIN" -c "exec $*"
   fi
 fi
+
+# =============================================================================
+# Service mode: configure sshd + runit, then hand PID 1 to runsvdir so the
+# container stays up and you can SSH into it. sshd listens on 22 inside the
+# container; the host-side port mapping is done by `docker run -p`.
+# =============================================================================
+SSHD="$PROFILE/bin/sshd";             [ -x "$SSHD" ]      || SSHD="$(command -v sshd || true)"
+SSHKEYGEN="$PROFILE/bin/ssh-keygen";  [ -x "$SSHKEYGEN" ] || SSHKEYGEN="$(command -v ssh-keygen || true)"
+RUNSVDIR="$PROFILE/bin/runsvdir";     [ -x "$RUNSVDIR" ]  || RUNSVDIR="$(command -v runsvdir || true)"
+[ -n "$SSHD" ]     || { echo "nixenv: sshd not found in profile"; exit 1; }
+[ -n "$RUNSVDIR" ] || { echo "nixenv: runsvdir (runit) not found in profile"; exit 1; }
+
+# sshd needs a privilege-separation user and an empty, root-owned 0711 dir.
+id sshd >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin sshd 2>/dev/null \
+  || adduser --system --no-create-home --shell /usr/sbin/nologin sshd 2>/dev/null || true
+mkdir -p /var/empty /run/sshd && chmod 711 /var/empty
+mkdir -p /etc/ssh
+
+# Host keys (into a writable dir; the Nix sysconfdir is read-only).
+for t in ed25519 rsa; do
+  f="/etc/ssh/ssh_host_${t}_key"
+  [ -f "$f" ] || "$SSHKEYGEN" -t "$t" -f "$f" -N "" -q
+done
+
+# Optional sftp subsystem.
+SFTP="$(ls "$PROFILE"/libexec/sftp-server 2>/dev/null || ls "$PROFILE"/libexec/openssh/sftp-server 2>/dev/null || true)"
+
+{
+  echo "Port 22"
+  echo "HostKey /etc/ssh/ssh_host_ed25519_key"
+  echo "HostKey /etc/ssh/ssh_host_rsa_key"
+  echo "PidFile /run/sshd.pid"
+  echo "PermitRootLogin no"
+  # Open local-dev login: no key and no password required. The app account has a
+  # blank password and sshd permits empty passwords, so the SSH 'none' method
+  # succeeds and you connect with no prompt. Pubkey still works if keys present.
+  echo "PubkeyAuthentication yes"
+  echo "PasswordAuthentication yes"
+  echo "PermitEmptyPasswords yes"
+  echo "KbdInteractiveAuthentication no"
+  echo "AuthorizedKeysFile .ssh/authorized_keys"
+  echo "AllowUsers $APP_USER"
+  echo "UsePAM no"
+  echo "PrintMotd no"
+  echo "AcceptEnv LANG LC_*"
+  [ -n "$SFTP" ] && echo "Subsystem sftp $SFTP"
+} > /etc/ssh/sshd_config
+
+# runit service tree: one supervised sshd.
+SVDIR=/etc/service
+mkdir -p "$SVDIR/sshd"
+cat > "$SVDIR/sshd/run" <<RUN
+#!/bin/sh
+exec "$SSHD" -D -e -f /etc/ssh/sshd_config
+RUN
+chmod +x "$SVDIR/sshd/run"
+
+echo "nixenv: sshd ready — open login as '$APP_USER' (no key/password needed)"
+
+# runsvdir spawns its `runsv` children via PATH, so the profile bin must be on
+# PATH or no service starts (you'd see a defunct runsvdir child and no sshd).
+export PATH="$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+exec "$RUNSVDIR" "$SVDIR"
 NIXENV_ENTRYPOINT
 
   cat > "$c/home-skel/.zshrc" <<'NIXENV_ZSHRC'
@@ -344,6 +429,7 @@ NIXENV_ZSHRC
   cat > "$c/home-skel/.gitconfig" <<'NIXENV_GITCONFIG'
 [include]
 	path = ~/.gitconfig.identity
+	path = ~/.gitconfig.credentials
 
 [init]
 	defaultBranch = main
@@ -364,6 +450,13 @@ NIXENV_GITCONFIG
 [character]
 success_symbol = "[➜](bold green)"
 error_symbol = "[✗](bold red)"
+
+# Show the nixenv project name (set per container via $NIXENV_PROJECT).
+[env_var.NIXENV_PROJECT]
+variable = "NIXENV_PROJECT"
+symbol = "📂 "
+style = "bold blue"
+format = "[$symbol$env_value]($style) "
 
 [container]
 format = '[$symbol]($style) '
@@ -423,31 +516,137 @@ NIXENV_SSHCFG
   chmod 600 "$c/home-skel/.ssh/config" "$c/home-skel/.ssh/known_hosts" 2>/dev/null || true
 }
 
-require_docker() {
-  command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
-  docker info >/dev/null 2>&1 || die "docker daemon not reachable"
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Decide which container engine to use (docker or podman). Order:
+#   1. CONTAINER_ENGINE env override
+#   2. remembered choice in $ENGINE_FILE
+#   3. auto-detect; if BOTH are present, prompt (and remember the answer)
+resolve_engine() {
+  [ -n "$ENGINE" ] && return 0
+
+  if [ -n "$CONTAINER_ENGINE" ]; then
+    have "$CONTAINER_ENGINE" || die "CONTAINER_ENGINE='$CONTAINER_ENGINE' not found on PATH"
+    ENGINE="$CONTAINER_ENGINE"; return 0
+  fi
+
+  if [ -f "$ENGINE_FILE" ]; then
+    local saved; saved="$(cat "$ENGINE_FILE" 2>/dev/null || true)"
+    if have "$saved"; then ENGINE="$saved"; return 0; fi
+  fi
+
+  local d=0 p=0
+  have docker && d=1
+  have podman && p=1
+
+  if [ "$d" = 1 ] && [ "$p" = 1 ]; then
+    local choice=""
+    if [ -t 0 ]; then
+      printf 'Both docker and podman are available. Which to use? [docker/podman] (docker): '
+      read -r choice || true
+    fi
+    case "$choice" in
+      podman|p)        ENGINE=podman;;
+      ""|docker|d)     ENGINE=docker;;
+      *) die "invalid choice: $choice";;
+    esac
+    mkdir -p "$(dirname "$ENGINE_FILE")" && printf '%s\n' "$ENGINE" > "$ENGINE_FILE"
+    ok "Using container engine: $ENGINE  (remembered in $ENGINE_FILE — delete it to re-choose)"
+  elif [ "$d" = 1 ]; then ENGINE=docker
+  elif [ "$p" = 1 ]; then ENGINE=podman
+  else return 1
+  fi
+}
+
+# Qualify image names with docker.io for podman (which doesn't assume a default
+# registry for short names); a no-op for docker.
+img() {
+  [ "$ENGINE" = podman ] || { printf '%s' "$1"; return; }
+  case "$1" in
+    */*)
+      # Has a slash: the first component is a registry only if it looks like a
+      # host (contains '.' or ':' or is 'localhost'); otherwise it's a repo path.
+      case "${1%%/*}" in
+        *.*|*:*|localhost) printf '%s' "$1";;
+        *) printf 'docker.io/%s' "$1";;
+      esac;;
+    *) printf 'docker.io/%s' "$1";;        # no slash → Docker Hub short name
+  esac
+}
+
+require_engine() {
+  resolve_engine || die "neither docker nor podman found on PATH"
+  "$ENGINE" info >/dev/null 2>&1 || die "$ENGINE not reachable (is the daemon running?)"
 }
 
 # ── Volume helpers ───────────────────────────────────────────────────────────
-volume_exists()  { docker volume inspect "$NIX_VOLUME" >/dev/null 2>&1; }
+volume_exists()  { "$ENGINE" volume inspect "$NIX_VOLUME" >/dev/null 2>&1; }
 ensure_volume()  {
   if volume_exists; then
     ok "Volume '$NIX_VOLUME' already exists"
   else
     log "Creating standalone volume '$NIX_VOLUME'"
-    docker volume create "$NIX_VOLUME" >/dev/null
+    "$ENGINE" volume create "$NIX_VOLUME" >/dev/null
     ok "Volume created"
   fi
 }
 
 # True once the shared profile has been populated inside the volume.
 store_is_populated() {
-  docker run --rm -v "$NIX_VOLUME":/nix "$BUILDER_IMAGE" \
+  "$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" \
     sh -c "[ -e '$PROFILE/bin' ]" >/dev/null 2>&1
 }
 
 # ── Project helpers ──────────────────────────────────────────────────────────
-project_dir() { printf '%s/%s' "$PROJECTS_DIR" "$1"; }
+project_dir()    { printf '%s/%s' "$PROJECTS_DIR" "$1"; }
+repo_volume()    { printf '%s_app' "$1"; }                 # named volume backing /app
+container_name() { printf '%s-%s' "$CONTAINER_PREFIX" "$1"; }
+container_exists()  { "$ENGINE" ps -a --format '{{.Names}}' | grep -qx "$1"; }
+container_running() { "$ENGINE" ps    --format '{{.Names}}' | grep -qx "$1"; }
+
+# Prepare the shared Claude state mounted into every container.
+#   ~/.nixenv/claude       → /home/app/.claude       (creds, settings, backups)
+#   ~/.nixenv/claude.json  → /home/app/.claude.json  (global config file)
+# Claude keeps ~/.claude.json in the home root (outside the .claude dir), so we
+# share it as its own file. If it's missing but Claude left a backup in the
+# shared dir, restore the newest one so state carries over.
+prepare_claude_share() {
+  mkdir -p "$CLAUDE_DIR/backups"
+
+  # Is the current global config effectively unconfigured? (missing, empty, {})
+  local need_restore=0 content=""
+  if [ ! -f "$CLAUDE_JSON" ]; then
+    need_restore=1
+  else
+    content="$(tr -d '[:space:]' < "$CLAUDE_JSON" 2>/dev/null || true)"
+    if [ -z "$content" ] || [ "$content" = "{}" ]; then need_restore=1; fi
+  fi
+
+  if [ "$need_restore" = 1 ]; then
+    local latest
+    latest="$(ls -1t "$CLAUDE_DIR"/backups/.claude.json.backup.* 2>/dev/null | head -1 || true)"
+    if [ -n "$latest" ] && [ -f "$latest" ]; then
+      cp "$latest" "$CLAUDE_JSON"
+      log "restored Claude config from $(basename "$latest")"
+    elif [ ! -f "$CLAUDE_JSON" ]; then
+      printf '{}\n' > "$CLAUDE_JSON"
+    fi
+  fi
+}
+
+# Per-project host SSH port: random once, stored in <project>/port, reused after.
+project_port() {
+  local pdir pf p; pdir="$(project_dir "$1")"; pf="$pdir/port"
+  if [ -f "$pf" ]; then cat "$pf"; return 0; fi
+  mkdir -p "$pdir"
+  local i
+  for i in $(seq 1 20); do
+    p=$(( (RANDOM % 10000) + 20000 ))                       # 20000–29999
+    grep -rqsx "$p" "$PROJECTS_DIR"/*/port 2>/dev/null || break
+  done
+  printf '%s\n' "$p" > "$pf"
+  printf '%s\n' "$p"
+}
 
 # Prompt for git identity and write it to home/.gitconfig.identity, which the
 # project's .gitconfig includes. Rewriting this one file avoids duplicate
@@ -476,26 +675,95 @@ EOF
   fi
 }
 
-# Clone a git repo into the (empty) project repo/ dir. Uses host git if present,
-# otherwise an alpine/git container so no host git is required.
-clone_repo() {
-  local url="$1" dest="$2"
-  if [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
-    warn "repo dir not empty — skipping clone into $dest"
+# For an HTTP(S) clone URL, prompt for a username + Personal Access Token and
+# store them with git's credential-store helper inside the project home:
+#   home/.git-credentials       holds  https://user:token@host
+#   home/.gitconfig.credentials enables `credential.helper = store`
+# (included by home/.gitconfig). SSH URLs are skipped — they use keys.
+# Non-interactive: reads GIT_HTTP_USER / GIT_HTTP_TOKEN.
+configure_git_credentials() {
+  local pdir="$1" url="$2"
+  case "$url" in
+    http://*|https://*) ;;
+    *) return 0 ;;
+  esac
+
+  local scheme rest host user="" token=""
+  scheme="${url%%://*}"
+  rest="${url#*://}"
+  host="${rest%%/*}"
+  host="${host##*@}"          # drop any embedded user@
+  host="${host%%:*}"         # drop any :port for the prompt/match
+
+  if [ -t 0 ]; then
+    printf 'Git username for %s: ' "$host"; read -r user || true
+    printf 'Personal Access Token (input hidden): '; stty -echo 2>/dev/null; read -r token || true; stty echo 2>/dev/null; printf '\n'
+  else
+    user="${GIT_HTTP_USER:-}"; token="${GIT_HTTP_TOKEN:-}"
+  fi
+  if [ -z "$user" ] || [ -z "$token" ]; then
+    warn "no username/token entered — cloning without stored credentials"
     return 0
   fi
-  log "Cloning $url → $dest"
-  if command -v git >/dev/null 2>&1; then
-    git clone "$url" "$dest"
-  else
-    require_docker
-    warn "host git not found — cloning via alpine/git container"
-    docker run --rm -v "$dest":/repo alpine/git clone "$url" /repo
+
+  # Store credentials (replace any prior entry for this host).
+  local cf="$pdir/home/.git-credentials"
+  if [ -f "$cf" ]; then grep -v "@$host\$" "$cf" 2>/dev/null > "$cf.tmp" || true; mv "$cf.tmp" "$cf"; fi
+  printf '%s://%s:%s@%s\n' "$scheme" "$user" "$token" "$host" >> "$cf"
+  chmod 600 "$cf"
+
+  # Enable the store helper (included by .gitconfig).
+  cat > "$pdir/home/.gitconfig.credentials" <<'GITCRED'
+[credential]
+	helper = store
+GITCRED
+
+  # Make sure .gitconfig actually includes the credentials file (older projects).
+  local gc="$pdir/home/.gitconfig"
+  if [ -f "$gc" ] && ! grep -q '\.gitconfig\.credentials' "$gc"; then
+    printf '\n[include]\n\tpath = ~/.gitconfig.credentials\n' >> "$gc"
   fi
-  ok "cloned"
+
+  ok "stored HTTPS credentials for $host (user '$user') in home/.git-credentials"
 }
 
-# Scaffold projects/<name>/{home,repo}, seed home/, set git identity, optional clone.
+# Clone a git repo into the project's app volume (must be empty). Uses the
+# debian runtime image with the shared Nix store mounted, so the clone runs with
+# the store's git and the project's SSH keys (via the entrypoint), writing
+# straight into the volume — no extra image to pull.
+clone_repo() {
+  local url="$1" name="$2"
+  require_engine
+  local pdir vol; pdir="$(project_dir "$name")"; vol="$(repo_volume "$name")"
+
+  if ! store_is_populated; then
+    warn "shared store not built yet — skipping clone"
+    warn "run '$0 build', then '$0 init $name $url' to clone into the volume"
+    return 0
+  fi
+  if [ -n "$("$ENGINE" run --rm -v "$vol":/app "$(img "$RUNTIME_IMAGE")" sh -c 'ls -A /app' 2>/dev/null)" ]; then
+    warn "volume '$vol' not empty — skipping clone"
+    return 0
+  fi
+
+  log "Cloning $url → volume '$vol' (/app) via $RUNTIME_IMAGE + shared git"
+  "$ENGINE" run --rm \
+    -v "$NIX_VOLUME":/nix:ro \
+    -v "$pdir/home":/seed:ro \
+    -v "$vol":/app \
+    -v "$ENTRYPOINT_FILE":/usr/local/bin/nixenv-entrypoint:ro \
+    -w /app \
+    -e PROFILE="$PROFILE" \
+    -e APP_USER="$APP_USER" \
+    -e APP_UID="$(id -u)" \
+    -e APP_GID="$(id -g)" \
+    -e GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" \
+    "$(img "$RUNTIME_IMAGE")" \
+    sh /usr/local/bin/nixenv-entrypoint git clone "$url" /app
+  ok "cloned into volume '$vol'"
+}
+
+# Scaffold <name>/home + app volume, seed home/, set git identity, optional clone.
 #   usage: init <project> [git-repo-url]
 cmd_init() {
   local name="${1:-}"
@@ -505,7 +773,7 @@ cmd_init() {
 
   local pdir; pdir="$(project_dir "$name")"
   log "Initialising project '$name' at $pdir"
-  mkdir -p "$pdir/home" "$pdir/repo"
+  mkdir -p "$pdir/home"
 
   # Seed home from the skeleton WITHOUT clobbering existing files.
   if [ -d "$HOME_SKEL" ]; then
@@ -517,19 +785,26 @@ cmd_init() {
   chmod 700 "$pdir/home/.ssh"
   find "$pdir/home/.ssh" -type f -exec chmod 600 {} \; 2>/dev/null || true
 
-  # Git identity (prompted) + optional repo clone.
+  # Git identity (prompted) + optional HTTPS credentials + optional clone.
   configure_git_identity "$pdir"
-  [ -n "$git_url" ] && clone_repo "$git_url" "$pdir/repo"
+  if [ -n "$git_url" ]; then
+    configure_git_credentials "$pdir" "$git_url"
+    clone_repo "$git_url" "$name"
+  fi
+
+  # Assign a stable random SSH port for this project.
+  local port; port="$(project_port "$name")"
 
   ok "Project '$name' ready"
-  echo "   home → /home/$APP_USER  ($pdir/home  — drop SSH keys in home/.ssh)"
-  echo "   repo → /app             ($pdir/repo)"
+  echo "   home → /home/$APP_USER  ($pdir/home — drop SSH keys in home/.ssh)"
+  echo "   repo → /app             (docker volume $(repo_volume "$name"))"
+  echo "   ssh  → host port $port  (add your public key to home/.ssh/authorized_keys)"
 }
 
 # Auto-scaffold a project if missing.
 ensure_project() {
   local name="$1" pdir; pdir="$(project_dir "$name")"
-  if [ ! -d "$pdir/home" ] || [ ! -d "$pdir/repo" ]; then
+  if [ ! -d "$pdir/home" ]; then
     warn "Project '$name' not initialised — scaffolding it now"
     cmd_init "$name"
   fi
@@ -539,7 +814,7 @@ ensure_project() {
 # build — download all flake deps into the standalone volume
 # =============================================================================
 cmd_build() {
-  require_docker
+  require_engine
   [ -f "$FLAKE_DIR/flake.nix" ] || die "no flake.nix in $FLAKE_DIR"
   ensure_volume
 
@@ -548,12 +823,12 @@ cmd_build() {
   # Mount:
   #   - the volume at /nix          → the shared store gets populated here
   #   - the flake dir at /flake (rw) → so nix can write/refresh flake.lock
-  docker run --rm \
+  "$ENGINE" run --rm \
     -v "$NIX_VOLUME":/nix \
     -v "$FLAKE_DIR":/flake \
     -w /flake \
     -e NIX_CONFIG=$'experimental-features = nix-command flakes\nmax-jobs = auto' \
-    "$BUILDER_IMAGE" \
+    "$(img "$BUILDER_IMAGE")" \
     sh -euc '
       echo "--- resetting shared profile (so flake changes take effect) ---"
       rm -f "'"$PROFILE"'" "'"$PROFILE"'"-*-link 2>/dev/null || true
@@ -575,11 +850,11 @@ cmd_build() {
 }
 
 # =============================================================================
-# run — start the basic runtime container for a project, using the shared store
-#   usage: run <project> [cmd...]
+# run — start the project's background service (sshd under runit)
+#   usage: run <project>
 # =============================================================================
 cmd_run() {
-  require_docker
+  require_engine
   local name="${1:-}"
   [ -n "$name" ] || die "usage: $0 run <project> [cmd...]"
   shift
@@ -592,44 +867,118 @@ cmd_run() {
   local pdir; pdir="$(project_dir "$name")"
   [ -f "$ENTRYPOINT_FILE" ] || die "missing entrypoint at $ENTRYPOINT_FILE"
 
-  # Match the in-container app user to the host uid/gid so the bind-mounted
-  # repo stays writable on Linux (harmless/permissive on Docker Desktop).
-  local host_uid host_gid
+  # Match the in-container app user to the host uid/gid so the app volume stays
+  # writable on Linux (harmless/permissive on Docker Desktop).
+  local host_uid host_gid app_vol cname
   host_uid="$(id -u)"; host_gid="$(id -g)"
+  app_vol="$(repo_volume "$name")"
+  cname="$(container_name "$name")"
+  [ "$#" -eq 0 ] || die "run takes no command — use '$0 shell $name' or '$0 ssh $name'"
+  prepare_claude_share   # shared Claude creds + global config, mounted rw
 
-  log "Starting project '$name' ($RUNTIME_IMAGE) as user '$APP_USER' — store ro, home → /home/$APP_USER, repo → /app"
+  # --- Start a detached container running sshd under runit -------------------
+  local port; port="$(project_port "$name")"
 
-  # Mounts:
-  #   /nix   (ro)  shared store/profile — runtime must not mutate it
-  #   /seed  (ro)  the project home; entrypoint copies it into /home/app
-  #   /app         the project repo — writable, and the WORKDIR
-  #   entrypoint   creates the app user, fixes perms, starts zsh+starship
-  exec docker run --rm -it \
-    --name "$CONTAINER_PREFIX-$name" \
-    -v "$NIX_VOLUME":/nix:ro \
-    -v "$pdir/home":/seed:ro \
-    -v "$pdir/repo":/app \
-    -v "$ENTRYPOINT_FILE":/usr/local/bin/nixenv-entrypoint:ro \
-    -w /app \
-    -e PROFILE="$PROFILE" \
-    -e APP_USER="$APP_USER" \
-    -e APP_UID="$host_uid" \
-    -e APP_GID="$host_gid" \
-    -e TERM="${TERM:-xterm-256color}" \
-    -e SHELL="$PROFILE/bin/zsh" \
-    "$RUNTIME_IMAGE" \
-    sh /usr/local/bin/nixenv-entrypoint "$@"
+  # Published ports: ssh (loopback) + any specs from <project>/ports.
+  # Each non-comment line: "8080" → 127.0.0.1:8080:8080, or a full docker spec
+  # like "3000:3000", "0.0.0.0:8080:80", "127.0.0.1:5173:5173".
+  local pub; pub=(-p "127.0.0.1:$port:22")
+  if [ -f "$pdir/ports" ]; then
+    local _line _spec
+    while IFS= read -r _line || [ -n "$_line" ]; do
+      _spec="$(printf '%s' "${_line%%#*}" | tr -d '[:space:]')"
+      [ -n "$_spec" ] || continue
+      case "$_spec" in
+        *:*) pub+=(-p "$_spec");;
+        *)   pub+=(-p "127.0.0.1:$_spec:$_spec");;
+      esac
+    done < "$pdir/ports"
+  fi
+
+  if container_running "$cname"; then
+    ok "Project '$name' already running as '$cname'"
+  else
+    container_exists "$cname" && "$ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
+    log "Starting service '$cname' ($RUNTIME_IMAGE) — sshd on 127.0.0.1:$port, repo volume '$app_vol' → /app"
+    "$ENGINE" run -d \
+      --name "$cname" \
+      "${pub[@]}" \
+      -v "$NIX_VOLUME":/nix:ro \
+      -v "$pdir/home":/seed:ro \
+      -v "$app_vol":/app \
+      -v "$CLAUDE_DIR":/home/"$APP_USER"/.claude \
+      -v "$CLAUDE_JSON":/home/"$APP_USER"/.claude.json \
+      -v "$ENTRYPOINT_FILE":/usr/local/bin/nixenv-entrypoint:ro \
+      -w /app \
+      -e PROFILE="$PROFILE" \
+      -e APP_USER="$APP_USER" \
+      -e APP_UID="$host_uid" \
+      -e APP_GID="$host_gid" \
+      -e NIXENV_PROJECT="$name" \
+      "$(img "$RUNTIME_IMAGE")" \
+      sh /usr/local/bin/nixenv-entrypoint >/dev/null
+    ok "Started '$cname'"
+  fi
+  echo "   ssh:    ssh -p $port $APP_USER@127.0.0.1   (or: $0 ssh $name)"
+  echo "   shell:  $0 shell $name   ($ENGINE exec, no key needed)"
+  if [ -f "$pdir/ports" ] && grep -q '[^[:space:]]' "$pdir/ports" 2>/dev/null; then
+    echo "   ports:  $(grep -v '^[[:space:]]*#' "$pdir/ports" | tr -s '[:space:]' ' ')"
+  fi
+  echo "   stop:   $0 stop $name"
+}
+
+# =============================================================================
+# expose — publish extra port(s) for a project (stored in <project>/ports),
+#          then restart it to apply. Examples of a <spec>:
+#   8080            → 127.0.0.1:8080:8080  (loopback, host==container)
+#   3000:3000       → host:container on 127.0.0.1
+#   0.0.0.0:80:80   → bind all interfaces (reachable from your network)
+# =============================================================================
+cmd_expose() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: $0 expose <project> <port|host:container>..."
+  case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  shift
+  [ "$#" -gt 0 ] || die "give at least one port to expose"
+  local pdir; pdir="$(project_dir "$name")"
+  [ -d "$pdir" ] || die "unknown project '$name' — run '$0 init $name' first"
+
+  local pf="$pdir/ports" p
+  touch "$pf"
+  for p in "$@"; do
+    p="$(printf '%s' "$p" | tr -d '[:space:]')"
+    [ -n "$p" ] || continue
+    if grep -qxF "$p" "$pf" 2>/dev/null; then
+      warn "already listed: $p"
+    else
+      printf '%s\n' "$p" >> "$pf"; ok "added port $p"
+    fi
+  done
+
+  if resolve_engine 2>/dev/null && container_running "$(container_name "$name")"; then
+    warn "restarting '$name' to apply the new ports"
+    cmd_stop "$name" >/dev/null 2>&1 || true
+    cmd_run "$name"
+  else
+    log "ports saved — they apply on the next '$0 run $name'"
+  fi
 }
 
 # =============================================================================
 # projects — list initialised projects
 # =============================================================================
 cmd_projects() {
+  resolve_engine 2>/dev/null || true
   if [ -d "$PROJECTS_DIR" ] && [ -n "$(ls -A "$PROJECTS_DIR" 2>/dev/null)" ]; then
     log "Projects in $PROJECTS_DIR:"
+    local d name port state
     for d in "$PROJECTS_DIR"/*/; do
       [ -d "$d" ] || continue
-      printf '   • %s\n' "$(basename "$d")"
+      name="$(basename "$d")"
+      port="$( [ -f "$d/port" ] && cat "$d/port" || echo '—' )"
+      state="stopped"
+      have "$ENGINE" && container_running "$(container_name "$name")" && state="running"
+      printf '   • %-20s ssh port %-6s [%s]\n' "$name" "$port" "$state"
     done
   else
     warn "No projects yet — create one with '$0 init <project>'"
@@ -641,7 +990,7 @@ cmd_projects() {
 #   usage: up <project> [cmd...]
 # =============================================================================
 cmd_up() {
-  require_docker
+  require_engine
   local name="${1:-}"
   [ -n "$name" ] || die "usage: $0 up <project> [cmd...]"
   if store_is_populated 2>/dev/null; then
@@ -653,21 +1002,112 @@ cmd_up() {
 }
 
 # =============================================================================
-# shell — alias for `run <project>` with an interactive shell
+# shell — interactive zsh inside the running service container (via docker exec)
 # =============================================================================
-cmd_shell() { cmd_run "$@"; }
+cmd_shell() {
+  require_engine
+  local name="${1:-}"; [ -n "$name" ] || die "usage: $0 shell <project>"
+  case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  local cname; cname="$(container_name "$name")"
+  container_running "$cname" || cmd_run "$name"
+  exec "$ENGINE" exec -it -u "$APP_USER" -w /app \
+    -e HOME="/home/$APP_USER" \
+    -e TERM="${TERM:-xterm-256color}" \
+    "$cname" "$PROFILE/bin/zsh" -l
+}
+
+# =============================================================================
+# ssh — SSH into the running service container on its assigned port
+# =============================================================================
+cmd_ssh() {
+  require_engine
+  local name="${1:-}"; [ -n "$name" ] || die "usage: $0 ssh <project>"
+  case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  command -v ssh >/dev/null 2>&1 || die "host 'ssh' client not found"
+  local cname port; cname="$(container_name "$name")"
+  container_running "$cname" || cmd_run "$name"
+  port="$(project_port "$name")"
+  sleep 1   # give sshd a moment to come up on first start
+  log "Connecting to '$name' on port $port"
+  exec ssh -p "$port" \
+    -o StrictHostKeyChecking=accept-new \
+    -o UserKnownHostsFile=/dev/null \
+    "$APP_USER@127.0.0.1"
+}
+
+# =============================================================================
+# stop — stop and remove a project's service container
+# =============================================================================
+cmd_stop() {
+  require_engine
+  local name="${1:-}"; [ -n "$name" ] || die "usage: $0 stop <project>"
+  local cname; cname="$(container_name "$name")"
+  container_exists "$cname" || { warn "'$cname' is not running"; return 0; }
+  "$ENGINE" rm -f "$cname" >/dev/null && ok "Stopped '$cname'"
+}
+
+# =============================================================================
+# delete — permanently remove a project: container(s), code volume, home dir.
+#          Prints the exact commands and asks for confirmation before running.
+# =============================================================================
+cmd_delete() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: $0 delete <project>"
+  case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  resolve_engine || true   # host files can be removed even without an engine
+
+  local pdir vol cname
+  pdir="$(project_dir "$name")"
+  vol="$(repo_volume "$name")"
+  cname="$(container_name "$name")"
+
+  [ -d "$pdir" ] || warn "no project home at $pdir (will still try its container/volume)"
+
+  log "This will PERMANENTLY delete project '$name' by running:"
+  if [ -n "$ENGINE" ]; then
+    echo "    $ENGINE rm -f $cname"
+    echo "    $ENGINE volume rm $vol"
+  else
+    warn "no container engine detected — its container/volume won't be removed"
+  fi
+  echo "    rm -rf $pdir"
+  warn "This cannot be undone (code volume, SSH keys, stored git credentials, port)."
+
+  printf 'Proceed? [y/N] '
+  local ans=""; read -r ans || true
+  case "$ans" in
+    [yY]|[yY][eE][sS]) ;;
+    *) warn "Aborted — nothing deleted"; return 0 ;;
+  esac
+
+  if [ -n "$ENGINE" ]; then
+    "$ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
+    "$ENGINE" volume rm "$vol" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$pdir"
+  ok "Deleted project '$name'"
+}
+
+# =============================================================================
+# logs — follow the service container logs (sshd / runit output)
+# =============================================================================
+cmd_logs() {
+  require_engine
+  local name="${1:-}"; [ -n "$name" ] || die "usage: $0 logs <project>"
+  exec "$ENGINE" logs -f "$(container_name "$name")"
+}
 
 # =============================================================================
 # update — refresh flake.lock then rebuild into the volume
 # =============================================================================
 cmd_update() {
-  require_docker
+  require_engine
   [ -f "$FLAKE_DIR/flake.nix" ] || die "no flake.nix in $FLAKE_DIR"
   log "Updating flake.lock in $FLAKE_DIR"
-  docker run --rm \
+  "$ENGINE" run --rm \
     -v "$FLAKE_DIR":/flake -w /flake \
     -e NIX_CONFIG=$'experimental-features = nix-command flakes' \
-    "$BUILDER_IMAGE" nix flake update
+    "$(img "$BUILDER_IMAGE")" nix flake update
   cmd_build
 }
 
@@ -676,12 +1116,12 @@ cmd_update() {
 # =============================================================================
 cmd_status() {
   ok "Context materialised at $CONTEXT_DIR"
-  require_docker
+  require_engine
   if volume_exists; then
     ok "Volume '$NIX_VOLUME' exists"
-    docker volume inspect "$NIX_VOLUME" --format '   mountpoint: {{.Mountpoint}}'
+    "$ENGINE" volume inspect "$NIX_VOLUME" --format '   mountpoint: {{.Mountpoint}}'
     local size
-    size=$(docker run --rm -v "$NIX_VOLUME":/nix "$BUILDER_IMAGE" du -sh /nix 2>/dev/null | cut -f1 || echo '?')
+    size=$("$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" du -sh /nix 2>/dev/null | cut -f1 || echo '?')
     echo "   store size: $size"
     if store_is_populated; then ok "Shared profile present at $PROFILE"; else warn "Shared profile not built yet"; fi
   else
@@ -693,13 +1133,64 @@ cmd_status() {
 # clean — remove the standalone volume (deletes the shared store)
 # =============================================================================
 cmd_clean() {
-  require_docker
+  require_engine
   volume_exists || { warn "Volume '$NIX_VOLUME' does not exist"; return 0; }
   read -r -p "Remove volume '$NIX_VOLUME' and all shared packages? [y/N] " ans
   case "$ans" in
-    [yY]*) docker volume rm "$NIX_VOLUME" >/dev/null && ok "Removed volume '$NIX_VOLUME'";;
+    [yY]*) "$ENGINE" volume rm "$NIX_VOLUME" >/dev/null && ok "Removed volume '$NIX_VOLUME'";;
     *) warn "Aborted";;
   esac
+}
+
+# =============================================================================
+# install / uninstall — put this self-contained script on the global PATH
+# =============================================================================
+cmd_install() {
+  local dir name src dest
+  dir="${INSTALL_DIR:-/usr/local/bin}"
+  name="${INSTALL_NAME:-nixenv}"
+  src="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+  dest="$dir/$name"
+
+  [ -f "$src" ] || die "cannot locate this script at $src"
+  if [ -e "$dest" ] && [ "$src" -ef "$dest" ]; then
+    ok "Already installed at $dest"
+    return 0
+  fi
+
+  log "Installing $src → $dest"
+  # Mode 0755 (a+rx): a script must be READABLE to run, so +x alone (which can
+  # leave 0711) is not enough for other users.
+  if mkdir -p "$dir" 2>/dev/null && [ -w "$dir" ]; then
+    cp "$src" "$dest" && chmod 0755 "$dest"
+  elif command -v sudo >/dev/null 2>&1; then
+    warn "no write access to $dir — using sudo"
+    sudo mkdir -p "$dir" && sudo cp "$src" "$dest" && sudo chmod 0755 "$dest"
+  else
+    die "cannot write to $dir and sudo not available (set INSTALL_DIR to a writable dir)"
+  fi
+
+  [ -r "$dest" ] && [ -x "$dest" ] || warn "installed but not readable+executable — run: chmod 0755 $dest"
+  ok "Installed as '$name' in $dir"
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) warn "$dir is not on your PATH — add: export PATH=\"$dir:\$PATH\"";;
+  esac
+  log "Now run: $name --help"
+}
+
+cmd_uninstall() {
+  local dest="${INSTALL_DIR:-/usr/local/bin}/${INSTALL_NAME:-nixenv}"
+  [ -e "$dest" ] || { warn "not installed at $dest"; return 0; }
+  log "Removing $dest"
+  if [ -w "$(dirname "$dest")" ]; then
+    rm -f "$dest"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo rm -f "$dest"
+  else
+    die "cannot remove $dest (no write access, no sudo)"
+  fi
+  ok "Uninstalled $dest"
 }
 
 usage() {
@@ -714,22 +1205,38 @@ skeleton) is written to \$CONTEXT_DIR and the build runs from there.
 Commands:
   build                     (Re)write context, then download all flake deps
                             into the volume '$NIX_VOLUME'
-  init <project> [git-url]  Scaffold <project>/{home,repo}; prompts for git
-                            name/email; clones git-url into repo/ if given
-  run <project> [cmd...]    Start the runtime container for a project
-                            (no cmd → interactive shared zsh)
-  up <project> [cmd...]     build if needed, then run the project
-  shell <project>           Alias for 'run <project>' (interactive shell)
-  projects                  List initialised projects
+  init <project> [git-url]  Scaffold <project>/home + the <project>_app volume;
+                            prompts for git name/email; clones git-url into the
+                            app volume if given
+  run <project>             Start the project as a background service (sshd under
+                            runit); prints the SSH port
+  ssh <project>             SSH into the running service (auto-starts it)
+  shell <project>           Interactive zsh via the engine's 'exec' (no SSH key)
+  expose <project> <port>…  Publish extra port(s) (e.g. 8080 or 3000:3000),
+                            stored in <project>/ports; restarts to apply
+  up <project>              build if needed, then start the service
+  stop <project>            Stop & remove the project's service container
+  logs <project>            Follow the service container logs
+  delete <project>          Permanently remove a project (container, code volume,
+                            home dir) — prints the commands and asks to confirm
+  projects                  List projects with their SSH port and state
   update                    Refresh flake.lock, then rebuild into the volume
   status                    Show context + volume + shared-profile state
   clean                     Delete the standalone volume (removes shared packages)
+  install                   Copy this script onto your PATH (as '${INSTALL_NAME:-nixenv}')
+  uninstall                 Remove the installed copy
 
-Per-project mounts (runtime runs as non-root user '$APP_USER'):
-  <project>/home → copied into /home/$APP_USER (.ssh, .zshrc, configs)
-  <project>/repo → /app  (your code; WORKDIR)
+Per-project (runtime runs as non-root user '$APP_USER'):
+  <project>/home        → copied into /home/$APP_USER (.ssh, .zshrc, configs)
+  <project>/port        → the project's stable random host SSH port
+  volume <project>_app  → /app  (your code; WORKDIR)
+
+SSH: each project gets a random host port (stored once in <project>/port). The
+container runs sshd via runit; add your public key to home/.ssh/authorized_keys
+(or drop an *.pub there) to log in as '$APP_USER'.
 
 Environment overrides:
+  CONTAINER_ENGINE=${CONTAINER_ENGINE:-auto}   (docker|podman; auto-detects, asks if both)
   CONTEXT_DIR=$CONTEXT_DIR
   NIX_VOLUME=$NIX_VOLUME
   BUILDER_IMAGE=$BUILDER_IMAGE
@@ -737,16 +1244,20 @@ Environment overrides:
   FLAKE_DIR=$FLAKE_DIR
   FLAKE_REF=$FLAKE_REF
   PROFILE=$PROFILE
-  PROJECTS_DIR=$PROJECTS_DIR
   APP_USER=$APP_USER
+  INSTALL_DIR=${INSTALL_DIR:-/usr/local/bin}   (install/uninstall target dir)
+  INSTALL_NAME=${INSTALL_NAME:-nixenv}         (installed command name)
+
+Projects always live in $PROJECTS_DIR.
 
 Examples:
   $0 build                                  # populate the volume once
   $0 init myapp                             # scaffold + prompt for git identity
-  $0 init myapp git@github.com:me/app.git   # also clone the repo into repo/
-  $0 run myapp                              # dev shell, repo mounted at /app
-  $0 run myapp node --version               # run a shared tool directly
-  $0 up myapp                               # build (first time) + shell
+  $0 init myapp git@github.com:me/app.git   # also clone into the app volume
+  $0 run myapp                              # start the service (prints SSH port)
+  $0 ssh myapp                              # SSH in as 'app'
+  $0 shell myapp                            # interactive zsh via engine exec
+  $0 stop myapp                             # stop the service
 
 Skip the git prompt by exporting GIT_USER_NAME / GIT_USER_EMAIL before init.
 EOF
@@ -756,6 +1267,8 @@ main() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     ""|-h|--help|help) usage; return 0;;
+    install)   cmd_install "$@"; return $?;;
+    uninstall) cmd_uninstall "$@"; return $?;;
   esac
 
   # Always (re)materialise the embedded context first, then run from it.
@@ -767,6 +1280,11 @@ main() {
     run)      cmd_run "$@";;
     up)       cmd_up "$@";;
     shell)    cmd_shell "$@";;
+    ssh)      cmd_ssh "$@";;
+    expose)   cmd_expose "$@";;
+    stop)     cmd_stop "$@";;
+    logs)     cmd_logs "$@";;
+    delete|rm) cmd_delete "$@";;
     projects) cmd_projects "$@";;
     update)   cmd_update "$@";;
     status)   cmd_status "$@";;
