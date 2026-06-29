@@ -31,7 +31,9 @@ NIX_VOLUME="${NIX_VOLUME:-nixos-store}"              # standalone Docker volume 
 BUILDER_IMAGE="${BUILDER_IMAGE:-nixos/nix:2.32.8}"
 RUNTIME_IMAGE="${RUNTIME_IMAGE:-debian:stable-slim}"
 FLAKE_REF="${FLAKE_REF:-.#default}"                  # what to build/install from the flake
-PROFILE="${PROFILE:-/nix/var/nix/profiles/shared}"  # profile path INSIDE /nix
+PROFILE="${PROFILE:-/nix/var/nix/profiles/shared}"  # base profile path INSIDE /nix
+PROJECT_ATTR="${PROJECT_ATTR:-default}"              # flake output attr installed from a project repo
+SSHD_PORT="${SSHD_PORT:-2222}"                       # unprivileged in-container sshd port (non-root)
 CONTAINER_PREFIX="${CONTAINER_PREFIX:-nixenv}"       # container name = <prefix>-<project>
 APP_USER="${APP_USER:-app}"                          # non-root user in the runtime container
 PROJECTS_DIR="$HOME/.nixenv/projects"                # all projects live here
@@ -144,6 +146,16 @@ materialize_context() {
               uv
               sqlite
 
+              # ── Build tools (compile native deps: node-gyp, wheels, etc.) ──
+              gnumake
+              gcc
+              binutils
+              pkg-config
+              cmake
+              autoconf
+              automake
+              libtool
+
               # ── AI tooling (from nixpkgs-unstable only) ────────────────────
               unstable.claude-code
 
@@ -233,129 +245,92 @@ NIXENV_DOCKERFILE
   cat > "$c/entrypoint.sh" <<'NIXENV_ENTRYPOINT'
 #!/bin/sh
 # =============================================================================
-# Runtime container entrypoint (runs as root, then drops to the app user)
+# Runtime container entrypoint — runs ENTIRELY as a non-root user
 # =============================================================================
-# - Creates a non-root `app` user whose login shell is the shared-store zsh.
-# - Seeds /home/app from the project home mounted read-only at /seed, so .ssh
-#   and config files are *copied* into the container fs — letting us enforce
-#   strict perms regardless of how the host bind-mount exposes ownership.
-# - Hands off to zsh (with starship/oh-my-zsh) as the app user.
+# The container is started with `--user <uid>:<gid>` (your host id). The login
+# user ("app") is resolved from a bind-mounted /etc/passwd; HOME (/home/app) and
+# /app are writable bind-mounts/volumes owned by that uid. Nothing here needs
+# root: sshd runs unprivileged on a high port (2222) with no privilege
+# separation, writing its keys/config/runit-service into the writable HOME.
 # =============================================================================
 set -eu
 
 APP_USER="${APP_USER:-app}"
-APP_UID="${APP_UID:-1000}"
-APP_GID="${APP_GID:-1000}"
 PROFILE="${PROFILE:-/nix/var/nix/profiles/shared}"
 ZSH_BIN="$PROFILE/bin/zsh"
-HOME_DIR="/home/$APP_USER"
+HOME_DIR="${HOME:-/home/$APP_USER}"
+SSHD_PORT="${SSHD_PORT:-2222}"
 
-# Never collide with root.
-[ "$APP_UID" = "0" ] && APP_UID=1000
-[ "$APP_GID" = "0" ] && APP_GID=1000
+mkdir -p "$HOME_DIR/.cache/omz" "$HOME_DIR/.ssh" 2>/dev/null || true
+chmod 700 "$HOME_DIR/.ssh" 2>/dev/null || true
 
-# --- Create group + user (idempotent; works with passwd or adduser tools) ----
-if ! getent group "$APP_GID" >/dev/null 2>&1; then
-  groupadd -g "$APP_GID" "$APP_USER" 2>/dev/null \
-    || addgroup --gid "$APP_GID" "$APP_USER" 2>/dev/null || true
-fi
-if ! id "$APP_USER" >/dev/null 2>&1; then
-  useradd -u "$APP_UID" -g "$APP_GID" -d "$HOME_DIR" -s "$ZSH_BIN" -M "$APP_USER" 2>/dev/null \
-    || adduser --disabled-password --gecos "" --uid "$APP_UID" --gid "$APP_GID" \
-               --home "$HOME_DIR" --shell "$ZSH_BIN" "$APP_USER" 2>/dev/null || true
-fi
-# Blank the app account password so SSH can log in with no key and no password
-# (local-dev convenience; the port is published on 127.0.0.1 only).
-passwd -d "$APP_USER" 2>/dev/null || usermod -p '' "$APP_USER" 2>/dev/null || true
-mkdir -p "$HOME_DIR"
-
-# --- Seed home from the mounted project home (copy, not bind) ----------------
-if [ -d /seed ]; then
-  cp -a /seed/. "$HOME_DIR"/ 2>/dev/null || cp -R /seed/. "$HOME_DIR"/ 2>/dev/null || true
-fi
-
-# --- Make the shared profile + shell config available to every zsh -----------
-# .zshenv is sourced for login and non-login shells alike.
+# --- Shared profile + shell config available to every zsh --------------------
+# .zshenv is sourced for login and non-login shells alike. $PROFILE etc. are
+# baked in at write time; \$HOME / \$NIXENV_* stay literal for zsh to evaluate.
 cat > "$HOME_DIR/.zshenv" <<EOF
 export PROFILE="$PROFILE"
-export PATH="$PROFILE/bin:\$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export NIXENV_PROJECT="${NIXENV_PROJECT:-}"
+export NIXENV_EXTRA_PROFILE="${NIXENV_EXTRA_PROFILE:-}"
+# The per-project profile (extra tooling) goes first when it exists, then base.
+_nixenv_extra=""
+[ -n "\$NIXENV_EXTRA_PROFILE" ] && [ -d "\$NIXENV_EXTRA_PROFILE/bin" ] && _nixenv_extra="\$NIXENV_EXTRA_PROFILE/bin:"
+export PATH="\${_nixenv_extra}$PROFILE/bin:\$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export ZSH="$PROFILE/share/oh-my-zsh"
 export ZSH_CACHE_DIR="\$HOME/.cache/omz"
 export SSL_CERT_FILE="$PROFILE/etc/ssl/certs/ca-bundle.crt"
 export NIX_SSL_CERT_FILE="$PROFILE/etc/ssl/certs/ca-bundle.crt"
-export NIXENV_PROJECT="${NIXENV_PROJECT:-}"
 export EDITOR=vim
 export LANG=C.UTF-8
 EOF
-mkdir -p "$HOME_DIR/.cache/omz"
-
-# --- Build authorized_keys from any *.pub if absent (for inbound SSH) --------
-if [ -d "$HOME_DIR/.ssh" ] && [ ! -f "$HOME_DIR/.ssh/authorized_keys" ]; then
-  for pub in "$HOME_DIR"/.ssh/*.pub; do
-    [ -f "$pub" ] || continue
-    cat "$pub" >> "$HOME_DIR/.ssh/authorized_keys"
-  done
-fi
-
-# --- Ownership + strict SSH perms --------------------------------------------
-chown -R "$APP_UID:$APP_GID" "$HOME_DIR"
-if [ -d "$HOME_DIR/.ssh" ]; then
-  chmod 700 "$HOME_DIR/.ssh"
-  find "$HOME_DIR/.ssh" -type f -exec chmod 600 {} \; 2>/dev/null || true
-fi
-
-# Give the app user ownership of its working copy (the project's app volume).
-# Disable with APP_CHOWN_REPO=0 if you don't want ownership changed.
-if [ "${APP_CHOWN_REPO:-1}" = "1" ] && [ -d /app ]; then
-  chown -R "$APP_UID:$APP_GID" /app 2>/dev/null || true
-fi
 
 # =============================================================================
-# Command mode: run the given command as the app user, then exit.
+# Command mode: run the given command as the (already non-root) user, then exit.
 # =============================================================================
 if [ "$#" -gt 0 ]; then
-  if command -v runuser >/dev/null 2>&1; then
-    exec runuser -u "$APP_USER" -- "$ZSH_BIN" -lc 'exec "$@"' zsh "$@"
-  else
-    exec su "$APP_USER" -s "$ZSH_BIN" -c "exec $*"
-  fi
+  export PATH="$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  exec "$ZSH_BIN" -lc 'exec "$@"' zsh "$@"
 fi
 
 # =============================================================================
-# Service mode: configure sshd + runit, then hand PID 1 to runsvdir so the
-# container stays up and you can SSH into it. sshd listens on 22 inside the
-# container; the host-side port mapping is done by `docker run -p`.
+# Service mode: unprivileged sshd under runit. All paths live under the writable
+# HOME so nothing needs root. sshd runs as this user; only this user can log in,
+# so no setuid/privsep is required.
 # =============================================================================
 SSHD="$PROFILE/bin/sshd";             [ -x "$SSHD" ]      || SSHD="$(command -v sshd || true)"
 SSHKEYGEN="$PROFILE/bin/ssh-keygen";  [ -x "$SSHKEYGEN" ] || SSHKEYGEN="$(command -v ssh-keygen || true)"
-RUNSVDIR="$PROFILE/bin/runsvdir";     [ -x "$RUNSVDIR" ]  || RUNSVDIR="$(command -v runsvdir || true)"
-[ -n "$SSHD" ]     || { echo "nixenv: sshd not found in profile"; exit 1; }
-[ -n "$RUNSVDIR" ] || { echo "nixenv: runsvdir (runit) not found in profile"; exit 1; }
+RUNSV="$PROFILE/bin/runsv";           [ -x "$RUNSV" ]     || RUNSV="$(command -v runsv || true)"
+[ -n "$SSHD" ]  || { echo "nixenv: sshd not found in profile"; exit 1; }
+[ -n "$RUNSV" ] || { echo "nixenv: runsv (runit) not found in profile"; exit 1; }
 
-# sshd needs a privilege-separation user and an empty, root-owned 0711 dir.
-id sshd >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin sshd 2>/dev/null \
-  || adduser --system --no-create-home --shell /usr/sbin/nologin sshd 2>/dev/null || true
-mkdir -p /var/empty /run/sshd && chmod 711 /var/empty
-mkdir -p /etc/ssh
+SSHRUN="$HOME_DIR/.nixenv-sshd"
+mkdir -p "$SSHRUN/service/sshd"
 
-# Host keys (into a writable dir; the Nix sysconfdir is read-only).
+# Host keys in the writable HOME.
 for t in ed25519 rsa; do
-  f="/etc/ssh/ssh_host_${t}_key"
+  f="$HOME_DIR/.ssh/ssh_host_${t}_key"
   [ -f "$f" ] || "$SSHKEYGEN" -t "$t" -f "$f" -N "" -q
 done
 
-# Optional sftp subsystem.
+# Build authorized_keys from any *.pub the project provided (optional — login is
+# open via the empty-password 'none' method too).
+if [ ! -f "$HOME_DIR/.ssh/authorized_keys" ]; then
+  for pub in "$HOME_DIR"/.ssh/*.pub; do
+    [ -f "$pub" ] || continue
+    cat "$pub" >> "$HOME_DIR/.ssh/authorized_keys" 2>/dev/null || true
+  done
+fi
+
 SFTP="$(ls "$PROFILE"/libexec/sftp-server 2>/dev/null || ls "$PROFILE"/libexec/openssh/sftp-server 2>/dev/null || true)"
 
 {
-  echo "Port 22"
-  echo "HostKey /etc/ssh/ssh_host_ed25519_key"
-  echo "HostKey /etc/ssh/ssh_host_rsa_key"
-  echo "PidFile /run/sshd.pid"
+  echo "Port $SSHD_PORT"
+  echo "HostKey $HOME_DIR/.ssh/ssh_host_ed25519_key"
+  echo "HostKey $HOME_DIR/.ssh/ssh_host_rsa_key"
+  echo "PidFile $SSHRUN/sshd.pid"
   echo "PermitRootLogin no"
-  # Open local-dev login: no key and no password required. The app account has a
-  # blank password and sshd permits empty passwords, so the SSH 'none' method
-  # succeeds and you connect with no prompt. Pubkey still works if keys present.
+  # Open local-dev login: no key and no password. The app account has an empty
+  # password (mounted /etc/shadow) and sshd permits empty passwords, so the SSH
+  # 'none' method succeeds. Pubkey still works if keys are present.
   echo "PubkeyAuthentication yes"
   echo "PasswordAuthentication yes"
   echo "PermitEmptyPasswords yes"
@@ -363,26 +338,23 @@ SFTP="$(ls "$PROFILE"/libexec/sftp-server 2>/dev/null || ls "$PROFILE"/libexec/o
   echo "AuthorizedKeysFile .ssh/authorized_keys"
   echo "AllowUsers $APP_USER"
   echo "UsePAM no"
+  echo "StrictModes no"          # bind-mounted HOME perms vary; don't reject keys
   echo "PrintMotd no"
-  echo "AcceptEnv LANG LC_*"
+  echo "AcceptEnv LANG LC_* ZELLIJ_SESSION NIXENV_NO_ZELLIJ"
   [ -n "$SFTP" ] && echo "Subsystem sftp $SFTP"
-} > /etc/ssh/sshd_config
+} > "$SSHRUN/sshd_config"
 
-# runit service tree: one supervised sshd.
-SVDIR=/etc/service
-mkdir -p "$SVDIR/sshd"
-cat > "$SVDIR/sshd/run" <<RUN
+cat > "$SSHRUN/service/sshd/run" <<RUN
 #!/bin/sh
-exec "$SSHD" -D -e -f /etc/ssh/sshd_config
+exec "$SSHD" -D -e -f "$SSHRUN/sshd_config"
 RUN
-chmod +x "$SVDIR/sshd/run"
+chmod +x "$SSHRUN/service/sshd/run"
 
-echo "nixenv: sshd ready — open login as '$APP_USER' (no key/password needed)"
+echo "nixenv: unprivileged sshd ready on :$SSHD_PORT as '$APP_USER' (no key/password)"
 
-# runsvdir spawns its `runsv` children via PATH, so the profile bin must be on
-# PATH or no service starts (you'd see a defunct runsvdir child and no sshd).
+# Hand PID 1 to runit's per-service supervisor (absolute path, no PATH lookup).
 export PATH="$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-exec "$RUNSVDIR" "$SVDIR"
+exec "$RUNSV" "$SSHRUN/service/sshd"
 NIXENV_ENTRYPOINT
 
   cat > "$c/home-skel/.zshrc" <<'NIXENV_ZSHRC'
@@ -393,6 +365,23 @@ NIXENV_ENTRYPOINT
 # store mounted read-only at /nix. Only writable, per-container state (cache,
 # zcompdump) lives in the mounted project home / tmp.
 # =============================================================================
+
+# --- Auto-start zellij in a named session that survives reconnects ---
+# When this is an interactive tty and we're not already inside zellij, attach to
+# (or create) a named session. Name: $ZELLIJ_SESSION, else the project name,
+# else "main". Reconnecting re-attaches the same session.
+# Disable for a session with NIXENV_NO_ZELLIJ=1 (the `--safe` flag sets this).
+# NIXENV_ZELLIJ_STARTED guards against nesting/looping: it's exported before the
+# exec, so zellij's panes (and any fallback shell if the exec fails) never retry.
+if [[ $- == *i* ]] \
+   && [[ -z "${ZELLIJ:-}" ]] \
+   && [[ -z "${NIXENV_ZELLIJ_STARTED:-}" ]] \
+   && [[ -z "${NIXENV_NO_ZELLIJ:-}" ]] \
+   && [ -t 0 ] && [ -t 1 ] && command -v zellij >/dev/null 2>&1; then
+  export NIXENV_ZELLIJ_STARTED=1
+  ZELLIJ_SESSION="${ZELLIJ_SESSION:-${NIXENV_PROJECT:-main}}"
+  exec zellij attach --create "$ZELLIJ_SESSION"
+fi
 
 # --- Oh My Zsh (from the shared Nix store) ---
 export ZSH="${ZSH:-$PROFILE/share/oh-my-zsh}"
@@ -485,7 +474,9 @@ NIXENV_STARSHIP
 theme "default"
 default_shell "zsh"
 pane_frames true
-default_layout "compact"
+// "default" layout keeps the status/keybinding hint bar visible
+// (use "compact" to hide it).
+default_layout "default"
 NIXENV_ZELLIJ
 
   cat > "$c/home-skel/.tmux.conf" <<'NIXENV_TMUX'
@@ -579,6 +570,12 @@ require_engine() {
   "$ENGINE" info >/dev/null 2>&1 || die "$ENGINE not reachable (is the daemon running?)"
 }
 
+# Rootless podman remaps uids; --userns=keep-id makes the container see your real
+# host uid (so bind-mounted files stay writable). No-op for docker.
+engine_userns() {
+  [ "$ENGINE" = podman ] && printf '%s' "--userns=keep-id"
+}
+
 # ── Volume helpers ───────────────────────────────────────────────────────────
 volume_exists()  { "$ENGINE" volume inspect "$NIX_VOLUME" >/dev/null 2>&1; }
 ensure_volume()  {
@@ -598,8 +595,31 @@ store_is_populated() {
 }
 
 # ── Project helpers ──────────────────────────────────────────────────────────
-project_dir()    { printf '%s/%s' "$PROJECTS_DIR" "$1"; }
-repo_volume()    { printf '%s_app' "$1"; }                 # named volume backing /app
+project_dir()     { printf '%s/%s' "$PROJECTS_DIR" "$1"; }
+repo_dir()        { printf '%s/%s/repo' "$PROJECTS_DIR" "$1"; }       # host dir bind-mounted at /app
+project_profile() { printf '/nix/var/nix/profiles/proj-%s' "$1"; }   # per-project extra tooling
+
+# Generate the /etc/passwd, /etc/group, /etc/shadow that the container runs with.
+# The container runs as the host uid/gid; these files give that id the name
+# 'app' (home /home/app, shell = shared zsh) and an EMPTY password so the open
+# SSH 'none' method works. They are bind-mounted read-only into the container.
+write_passwd_files() {
+  local pdir="$1" uid gid sh="$PROFILE/bin/zsh"
+  uid="$(id -u)"; gid="$(id -g)"
+  cat > "$pdir/passwd" <<EOF
+root:x:0:0:root:/root:/bin/sh
+$APP_USER:x:$uid:$gid:$APP_USER:/home/$APP_USER:$sh
+EOF
+  cat > "$pdir/group" <<EOF
+root:x:0:
+$APP_USER:x:$gid:
+EOF
+  cat > "$pdir/shadow" <<EOF
+root:*:19000:0:99999:7:::
+$APP_USER::19000:0:99999:7:::
+EOF
+  chmod 644 "$pdir/passwd" "$pdir/group" "$pdir/shadow"
+}
 container_name() { printf '%s-%s' "$CONTAINER_PREFIX" "$1"; }
 container_exists()  { "$ENGINE" ps -a --format '{{.Names}}' | grep -qx "$1"; }
 container_running() { "$ENGINE" ps    --format '{{.Names}}' | grep -qx "$1"; }
@@ -727,53 +747,67 @@ GITCRED
   ok "stored HTTPS credentials for $host (user '$user') in home/.git-credentials"
 }
 
-# Clone a git repo into the project's app volume (must be empty). Uses the
-# debian runtime image with the shared Nix store mounted, so the clone runs with
-# the store's git and the project's SSH keys (via the entrypoint), writing
-# straight into the volume — no extra image to pull.
+# Clone a git repo into the project's repo dir (must be empty). Runs the debian
+# runtime image as the non-root user with the shared store + project home, so it
+# uses the store's git and the project's SSH keys; the bind-mounted repo dir ends
+# up owned by your host uid.
 clone_repo() {
   local url="$1" name="$2"
   require_engine
-  local pdir vol; pdir="$(project_dir "$name")"; vol="$(repo_volume "$name")"
+  local pdir rdir; pdir="$(project_dir "$name")"; rdir="$(repo_dir "$name")"
+  mkdir -p "$rdir"
 
   if ! store_is_populated; then
     warn "shared store not built yet — skipping clone"
-    warn "run '$0 build', then '$0 init $name $url' to clone into the volume"
+    warn "run '$0 build', then '$0 init $name $url' to clone"
     return 0
   fi
-  if [ -n "$("$ENGINE" run --rm -v "$vol":/app "$(img "$RUNTIME_IMAGE")" sh -c 'ls -A /app' 2>/dev/null)" ]; then
-    warn "volume '$vol' not empty — skipping clone"
+  if [ -n "$(ls -A "$rdir" 2>/dev/null)" ]; then
+    warn "repo dir not empty ($rdir) — skipping clone"
     return 0
   fi
 
-  log "Cloning $url → volume '$vol' (/app) via $RUNTIME_IMAGE + shared git"
+  write_passwd_files "$pdir"
+  log "Cloning $url → $rdir via $RUNTIME_IMAGE + shared git"
   "$ENGINE" run --rm \
+    --user "$(id -u):$(id -g)" \
+    $(engine_userns) \
     -v "$NIX_VOLUME":/nix:ro \
-    -v "$pdir/home":/seed:ro \
-    -v "$vol":/app \
+    -v "$pdir/home":/home/"$APP_USER" \
+    -v "$rdir":/app \
+    -v "$pdir/passwd":/etc/passwd:ro \
+    -v "$pdir/group":/etc/group:ro \
     -v "$ENTRYPOINT_FILE":/usr/local/bin/nixenv-entrypoint:ro \
     -w /app \
+    -e HOME=/home/"$APP_USER" \
     -e PROFILE="$PROFILE" \
     -e APP_USER="$APP_USER" \
-    -e APP_UID="$(id -u)" \
-    -e APP_GID="$(id -g)" \
     -e GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" \
     "$(img "$RUNTIME_IMAGE")" \
     sh /usr/local/bin/nixenv-entrypoint git clone "$url" /app
-  ok "cloned into volume '$vol'"
+  ok "cloned into $rdir"
 }
 
 # Scaffold <name>/home + app volume, seed home/, set git identity, optional clone.
 #   usage: init <project> [git-repo-url]
 cmd_init() {
   local name="${1:-}"
-  [ -n "$name" ] || die "usage: $0 init <project> [git-repo-url]"
+  [ -n "$name" ] || die "usage: $0 init <project> [git-repo-url] [--build]"
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
-  local git_url="${2:-}"
+  shift
+
+  local git_url="" do_build=0 a
+  for a in "$@"; do
+    case "$a" in
+      --build) do_build=1;;
+      --*) die "unknown option: $a (usage: $0 init <project> [git-repo-url] [--build])";;
+      *) [ -z "$git_url" ] && git_url="$a" || die "unexpected argument: $a";;
+    esac
+  done
 
   local pdir; pdir="$(project_dir "$name")"
   log "Initialising project '$name' at $pdir"
-  mkdir -p "$pdir/home"
+  mkdir -p "$pdir/home" "$pdir/repo"
 
   # Seed home from the skeleton WITHOUT clobbering existing files.
   if [ -d "$HOME_SKEL" ]; then
@@ -797,8 +831,11 @@ cmd_init() {
 
   ok "Project '$name' ready"
   echo "   home → /home/$APP_USER  ($pdir/home — drop SSH keys in home/.ssh)"
-  echo "   repo → /app             (docker volume $(repo_volume "$name"))"
-  echo "   ssh  → host port $port  (add your public key to home/.ssh/authorized_keys)"
+  echo "   repo → /app             ($pdir/repo)"
+  echo "   ssh  → host port $port  (connects as '$APP_USER', no key/password)"
+
+  # --build: also build the project's own flake (if the repo has one).
+  [ "$do_build" = 1 ] && cmd_build_project "$name"
 }
 
 # Auto-scaffold a project if missing.
@@ -814,6 +851,9 @@ ensure_project() {
 # build — download all flake deps into the standalone volume
 # =============================================================================
 cmd_build() {
+  # `build <project>` builds the project's own flake; `build` builds the base.
+  if [ -n "${1:-}" ]; then cmd_build_project "$1"; return $?; fi
+
   require_engine
   [ -f "$FLAKE_DIR/flake.nix" ] || die "no flake.nix in $FLAKE_DIR"
   ensure_volume
@@ -850,6 +890,60 @@ cmd_build() {
 }
 
 # =============================================================================
+# build <project> — build the project's OWN flake (from its repo) into a
+# per-project profile in the same store, layered on top of the base toolchain.
+# The repo's flake.nix (+ flake.lock) is read from the project's repo dir; it must
+# expose packages.<system>.$PROJECT_ATTR (default: default), typically a buildEnv
+# of the extra tools. Limitation: only the flake files are copied for the build,
+# so a flake that references other local repo files won't build this way.
+# =============================================================================
+cmd_build_project() {
+  local name="$1"
+  case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  require_engine
+  volume_exists || die "shared store missing — run '$0 build' first"
+  store_is_populated || warn "base profile not built yet — run '$0 build' for the shared toolchain"
+
+  local rdir pdir prof fdir
+  rdir="$(repo_dir "$name")"
+  pdir="$(project_dir "$name")"
+  prof="$(project_profile "$name")"
+  fdir="$pdir/flake"
+
+  # Copy the repo flake (host dir) into a clean build dir (flake files only).
+  if [ ! -f "$rdir/flake.nix" ]; then
+    warn "no flake.nix in the project repo ($rdir) — nothing to build"; return 0
+  fi
+  mkdir -p "$fdir"
+  cp "$rdir/flake.nix" "$fdir/"
+  [ -f "$rdir/flake.lock" ] && cp "$rdir/flake.lock" "$fdir/" || true
+
+  log "Building project flake ('#$PROJECT_ATTR') into $prof"
+  "$ENGINE" run --rm \
+    -v "$NIX_VOLUME":/nix \
+    -v "$fdir":/flake \
+    -w /flake \
+    -e NIX_CONFIG=$'experimental-features = nix-command flakes\nmax-jobs = auto' \
+    "$(img "$BUILDER_IMAGE")" \
+    sh -euc '
+      mkdir -p /nix/var/nix/profiles
+      echo "--- resetting project profile ---"
+      rm -f "'"$prof"'" "'"$prof"'"-*-link 2>/dev/null || true
+      echo "--- nix profile install (project extras) ---"
+      nix profile install "path:/flake#'"$PROJECT_ATTR"'" \
+        --profile "'"$prof"'" \
+        --accept-flake-config \
+        --print-build-logs
+      nix store optimise || true
+      echo "--- project tooling on PATH ---"
+      ls -1 "'"$prof"'/bin" 2>/dev/null | head -n 40 || true
+    '
+
+  ok "Project '$name' extra tooling built → $prof"
+  log "It loads ahead of the base toolchain on the next 'run'/'ssh'/'shell' of '$name'"
+}
+
+# =============================================================================
 # run — start the project's background service (sshd under runit)
 #   usage: run <project>
 # =============================================================================
@@ -864,25 +958,27 @@ cmd_run() {
   store_is_populated || die "shared profile not found in volume — run '$0 build' first"
   ensure_project "$name"
 
-  local pdir; pdir="$(project_dir "$name")"
-  [ -f "$ENTRYPOINT_FILE" ] || die "missing entrypoint at $ENTRYPOINT_FILE"
-
-  # Match the in-container app user to the host uid/gid so the app volume stays
-  # writable on Linux (harmless/permissive on Docker Desktop).
-  local host_uid host_gid app_vol cname
-  host_uid="$(id -u)"; host_gid="$(id -g)"
-  app_vol="$(repo_volume "$name")"
+  local pdir rdir cname; pdir="$(project_dir "$name")"; rdir="$(repo_dir "$name")"
   cname="$(container_name "$name")"
+  [ -f "$ENTRYPOINT_FILE" ] || die "missing entrypoint at $ENTRYPOINT_FILE"
   [ "$#" -eq 0 ] || die "run takes no command — use '$0 shell $name' or '$0 ssh $name'"
-  prepare_claude_share   # shared Claude creds + global config, mounted rw
 
-  # --- Start a detached container running sshd under runit -------------------
+  mkdir -p "$rdir" "$pdir/home/.ssh"
+  prepare_claude_share          # shared Claude creds + global config, mounted rw
+  write_passwd_files "$pdir"    # /etc/passwd|group|shadow giving our uid the name 'app'
+
+  # Pre-create the Claude mountpoints INSIDE the bind-mounted home, so Docker
+  # Desktop (virtiofs) doesn't have to create them (which fails for nested mounts).
+  mkdir -p "$pdir/home/.claude"
+  [ -e "$pdir/home/.claude.json" ] || : > "$pdir/home/.claude.json"
+
+  # --- Start a detached container: unprivileged sshd under runit -------------
   local port; port="$(project_port "$name")"
 
-  # Published ports: ssh (loopback) + any specs from <project>/ports.
-  # Each non-comment line: "8080" → 127.0.0.1:8080:8080, or a full docker spec
-  # like "3000:3000", "0.0.0.0:8080:80", "127.0.0.1:5173:5173".
-  local pub; pub=(-p "127.0.0.1:$port:22")
+  # Published ports: ssh (loopback) → in-container $SSHD_PORT, + <project>/ports.
+  # Each ports line: "8080" → 127.0.0.1:8080:8080, or a full spec like
+  # "3000:3000", "0.0.0.0:8080:80", "127.0.0.1:5173:5173".
+  local pub; pub=(-p "127.0.0.1:$port:$SSHD_PORT")
   if [ -f "$pdir/ports" ]; then
     local _line _spec
     while IFS= read -r _line || [ -n "$_line" ]; do
@@ -899,22 +995,28 @@ cmd_run() {
     ok "Project '$name' already running as '$cname'"
   else
     container_exists "$cname" && "$ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
-    log "Starting service '$cname' ($RUNTIME_IMAGE) — sshd on 127.0.0.1:$port, repo volume '$app_vol' → /app"
+    log "Starting service '$cname' ($RUNTIME_IMAGE) as uid $(id -u) — sshd on 127.0.0.1:$port, $rdir → /app"
     "$ENGINE" run -d \
       --name "$cname" \
+      --user "$(id -u):$(id -g)" \
+      $(engine_userns) \
       "${pub[@]}" \
       -v "$NIX_VOLUME":/nix:ro \
-      -v "$pdir/home":/seed:ro \
-      -v "$app_vol":/app \
+      -v "$pdir/home":/home/"$APP_USER" \
+      -v "$rdir":/app \
+      -v "$pdir/passwd":/etc/passwd:ro \
+      -v "$pdir/group":/etc/group:ro \
+      -v "$pdir/shadow":/etc/shadow:ro \
       -v "$CLAUDE_DIR":/home/"$APP_USER"/.claude \
       -v "$CLAUDE_JSON":/home/"$APP_USER"/.claude.json \
       -v "$ENTRYPOINT_FILE":/usr/local/bin/nixenv-entrypoint:ro \
       -w /app \
+      -e HOME=/home/"$APP_USER" \
       -e PROFILE="$PROFILE" \
       -e APP_USER="$APP_USER" \
-      -e APP_UID="$host_uid" \
-      -e APP_GID="$host_gid" \
+      -e SSHD_PORT="$SSHD_PORT" \
       -e NIXENV_PROJECT="$name" \
+      -e NIXENV_EXTRA_PROFILE="$(project_profile "$name")" \
       "$(img "$RUNTIME_IMAGE")" \
       sh /usr/local/bin/nixenv-entrypoint >/dev/null
     ok "Started '$cname'"
@@ -1006,14 +1108,34 @@ cmd_up() {
 # =============================================================================
 cmd_shell() {
   require_engine
-  local name="${1:-}"; [ -n "$name" ] || die "usage: $0 shell <project>"
+  local name="${1:-}"; [ -n "$name" ] || die "usage: $0 shell <project> [--session=NAME]"
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  shift
+
+  local session="" safe=0
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --session=*) session="${a#--session=}";;
+      --session)   die "use --session=NAME";;
+      --safe)      safe=1;;
+      *) die "unknown option: $a (usage: $0 shell <project> [--session=NAME] [--safe])";;
+    esac
+  done
+
   local cname; cname="$(container_name "$name")"
   container_running "$cname" || cmd_run "$name"
-  exec "$ENGINE" exec -it -u "$APP_USER" -w /app \
-    -e HOME="/home/$APP_USER" \
-    -e TERM="${TERM:-xterm-256color}" \
-    "$cname" "$PROFILE/bin/zsh" -l
+
+  # The container's .zshrc auto-attaches zellij to $ZELLIJ_SESSION (defaults to
+  # the project name). --session=NAME overrides it; --safe skips zellij entirely
+  # (plain zsh) so you can still get a shell if zellij is misbehaving.
+  # No -u: the container already runs as our uid, so exec inherits it. (Passing
+  # -u app would need 'app' resolvable in the daemon's view of /etc/passwd, which
+  # a bind-mounted passwd isn't, reliably.)
+  local envs; envs=(-e HOME="/home/$APP_USER" -e TERM="${TERM:-xterm-256color}")
+  [ -n "$session" ] && envs+=(-e ZELLIJ_SESSION="$session")
+  [ "$safe" = 1 ]   && envs+=(-e NIXENV_NO_ZELLIJ=1)
+  exec "$ENGINE" exec -it -w /app "${envs[@]}" "$cname" "$PROFILE/bin/zsh" -l
 }
 
 # =============================================================================
@@ -1021,18 +1143,32 @@ cmd_shell() {
 # =============================================================================
 cmd_ssh() {
   require_engine
-  local name="${1:-}"; [ -n "$name" ] || die "usage: $0 ssh <project>"
+  local name="${1:-}"; [ -n "$name" ] || die "usage: $0 ssh <project> [--session=NAME] [--safe]"
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  shift
+
+  local session="" safe=0 a
+  for a in "$@"; do
+    case "$a" in
+      --session=*) session="${a#--session=}";;
+      --session)   die "use --session=NAME";;
+      --safe)      safe=1;;
+      *) die "unknown option: $a (usage: $0 ssh <project> [--session=NAME] [--safe])";;
+    esac
+  done
+
   command -v ssh >/dev/null 2>&1 || die "host 'ssh' client not found"
   local cname port; cname="$(container_name "$name")"
   container_running "$cname" || cmd_run "$name"
   port="$(project_port "$name")"
   sleep 1   # give sshd a moment to come up on first start
+
+  # --session / --safe are forwarded as env (sshd AcceptEnv allows them).
+  local opts; opts=(-p "$port" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null)
+  [ -n "$session" ] && opts+=(-o "SetEnv=ZELLIJ_SESSION=$session")
+  [ "$safe" = 1 ]   && opts+=(-o "SetEnv=NIXENV_NO_ZELLIJ=1")
   log "Connecting to '$name' on port $port"
-  exec ssh -p "$port" \
-    -o StrictHostKeyChecking=accept-new \
-    -o UserKnownHostsFile=/dev/null \
-    "$APP_USER@127.0.0.1"
+  exec ssh "${opts[@]}" "$APP_USER@127.0.0.1"
 }
 
 # =============================================================================
@@ -1056,22 +1192,25 @@ cmd_delete() {
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
   resolve_engine || true   # host files can be removed even without an engine
 
-  local pdir vol cname
+  local pdir cname prof legacy_vol have_vol=0
   pdir="$(project_dir "$name")"
-  vol="$(repo_volume "$name")"
   cname="$(container_name "$name")"
+  prof="$(project_profile "$name")"
+  legacy_vol="${name}_app"   # named volume from the old (root) layout, if any
+  [ -n "$ENGINE" ] && "$ENGINE" volume inspect "$legacy_vol" >/dev/null 2>&1 && have_vol=1
 
-  [ -d "$pdir" ] || warn "no project home at $pdir (will still try its container/volume)"
+  [ -d "$pdir" ] || warn "no project dir at $pdir (will still try its container)"
 
   log "This will PERMANENTLY delete project '$name' by running:"
   if [ -n "$ENGINE" ]; then
     echo "    $ENGINE rm -f $cname"
-    echo "    $ENGINE volume rm $vol"
+    [ "$have_vol" = 1 ] && echo "    $ENGINE volume rm $legacy_vol   (legacy code volume)"
+    echo "    rm -f $prof*   (its extra-tooling profile, inside the store)"
   else
     warn "no container engine detected — its container/volume won't be removed"
   fi
-  echo "    rm -rf $pdir"
-  warn "This cannot be undone (code volume, SSH keys, stored git credentials, port)."
+  echo "    rm -rf $pdir   (repo, home, SSH keys, stored git credentials, port)"
+  warn "This cannot be undone."
 
   printf 'Proceed? [y/N] '
   local ans=""; read -r ans || true
@@ -1082,7 +1221,9 @@ cmd_delete() {
 
   if [ -n "$ENGINE" ]; then
     "$ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
-    "$ENGINE" volume rm "$vol" >/dev/null 2>&1 || true
+    [ "$have_vol" = 1 ] && "$ENGINE" volume rm "$legacy_vol" >/dev/null 2>&1 || true
+    volume_exists && "$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" \
+      sh -c "rm -f '$prof' '$prof'-*-link" >/dev/null 2>&1 || true
   fi
   rm -rf "$pdir"
   ok "Deleted project '$name'"
@@ -1205,13 +1346,21 @@ skeleton) is written to \$CONTEXT_DIR and the build runs from there.
 Commands:
   build                     (Re)write context, then download all flake deps
                             into the volume '$NIX_VOLUME'
-  init <project> [git-url]  Scaffold <project>/home + the <project>_app volume;
-                            prompts for git name/email; clones git-url into the
-                            app volume if given
+  build <project>           Build the project's OWN flake (from its repo) into a
+                            per-project profile, layered on top of the base
+  init <project> [git-url] [--build]
+                            Scaffold <project>/home + the <project>_app volume;
+                            prompts for git name/email; clones git-url if given;
+                            --build also builds the project's flake
   run <project>             Start the project as a background service (sshd under
                             runit); prints the SSH port
-  ssh <project>             SSH into the running service (auto-starts it)
-  shell <project>           Interactive zsh via the engine's 'exec' (no SSH key)
+  ssh <project> [--session=NAME] [--safe]
+                            SSH into the running service (auto-starts it)
+  shell <project> [--session=NAME] [--safe]
+                            Interactive shell via the engine's 'exec' (no SSH key)
+                            Both open/attach a named zellij session (default: the
+                            project name). --session=NAME picks another; --safe
+                            skips zellij (plain zsh) if it's misbehaving.
   expose <project> <port>…  Publish extra port(s) (e.g. 8080 or 3000:3000),
                             stored in <project>/ports; restarts to apply
   up <project>              build if needed, then start the service
