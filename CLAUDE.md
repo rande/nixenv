@@ -24,8 +24,8 @@ single-quoted heredocs in the `materialize_context()` function:
 - `Dockerfile` — reference only, not used by the build (`NIXENV_DOCKERFILE`)
 - `entrypoint.sh` — runtime container entrypoint (`NIXENV_ENTRYPOINT`)
 - `home-skel/*` — the per-project home template (`.zshrc`, `.gitconfig`,
-  `.config/starship.toml`, `.config/zellij/config.kdl`, `.tmux.conf`, `.vimrc`,
-  `.ssh/config`)
+  `.config/starship.toml`, `.config/nvim/init.lua` (AstroNvim bootstrap),
+  `.tmux.conf`, `.vimrc`, `.ssh/config`)
 
 On every command run, `materialize_context()` writes these into `$CONTEXT_DIR`
 (default `~/.nixenv/context`) and the build runs from there. There are **no
@@ -52,15 +52,22 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   `nix profile install` so flake changes actually take effect.
 - The runtime container runs **entirely non-root**: `run` passes
   `--user $(id -u):$(id -g)` (+ `--userns=keep-id` for podman, via
-  `engine_userns`). The login user `app` comes from generated `passwd`/`group`/
-  `shadow` files (`write_passwd_files`, in `<project>/`) bind-mounted at
-  `/etc/passwd|group|shadow`; `shadow` has an empty password for the open SSH
-  login. `home/` and `repo/` are **host bind-mounts** (`repo_dir`) at `/home/app`
-  and `/app`, owned by your uid so the non-root container can write them — named
-  volumes were dropped because a non-root container can't `chown` them. The
-  entrypoint does NO root ops (no useradd/chown); it writes `.zshenv`, sshd
-  config, host keys, and the runit service tree under the writable `$HOME`.
-  `init <git-url>` clones into `repo/` via the runtime image run as your uid.
+  `engine_userns`) and `--hostname <project>`. The login user `app` comes from
+  generated `passwd`/`group`/`shadow` files (`write_passwd_files`, in
+  `<project>/`) bind-mounted at `/etc/passwd|group|shadow`; `shadow` has an empty
+  password for the open SSH login. Code, home, and databases are **named
+  volumes** `nixenv_<project>_app` → `/app`, `nixenv_<project>_home` →
+  `/home/app`, `nixenv_<project>_databases` → `/databases`
+  (`app_volume`/`home_volume`/`db_volume`). `ensure_volumes` only creates
+  MISSING volumes and **chowns ONLY the freshly-created ones** to your uid via a
+  one-time throwaway root helper (`-u 0 … chown`) — existing volumes are never
+  mounted by the helper, so their data is never touched. A fresh home volume is
+  seeded (copy, non-destructive) from the host seed dir `<project>/home`.
+  `/databases` is empty per-project storage for DB data files. This is
+  what lets a non-root container use named volumes. The entrypoint does NO root
+  ops; it writes `.zshenv`, sshd config, host keys, and the runit tree under the
+  writable `$HOME`. `init <git-url>` clones into the app volume via the runtime
+  image run as your uid. `build <project>` extracts the flake from the app volume.
 - Git identity is per project in `home/.gitconfig.identity`, included by the
   project `.gitconfig`. `init` prompts for it (or uses `GIT_USER_NAME` /
   `GIT_USER_EMAIL`).
@@ -84,14 +91,15 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
 - Extra published ports live one-per-line in `<project>/ports` (helper: `expose`
   / read in `cmd_run`). A bare number maps `127.0.0.1:N:N`; a `:`-spec is passed
   to `docker -p` verbatim. The SSH port is always published on `127.0.0.1`.
-- Per-project tooling: `build <project>` (`cmd_build_project`) extracts the
-  repo's `flake.nix`/`flake.lock` from the app volume into `<project>/flake/` and
+- Per-project tooling: `build <project> [--dir=<path>]` (`cmd_build_project`)
+  copies the project flake into `<project>/flake/` and
   `nix profile install path:/flake#$PROJECT_ATTR` into `/nix/var/nix/profiles/proj-<name>`
-  (`project_profile`) in the same store. `run` passes that path as
-  `NIXENV_EXTRA_PROFILE`; `.zshenv` prepends its `bin` to `PATH` (ahead of the
-  base) when the dir exists. `delete` removes the profile; `init --build` runs it
-  after scaffolding. Only flake files are extracted, so repo flakes referencing
-  other local files won't build this way.
+  (`project_profile`) in the same store. Default copies just `flake.nix`/`.lock`
+  from `repo/`; `--dir=<path>` (relative to repo, or absolute) copies a WHOLE
+  folder so a flake with local file references resolves. `run` passes the profile
+  path as `NIXENV_EXTRA_PROFILE`; `.zshenv` prepends its `bin` to `PATH` (ahead of
+  base) when present. `delete` removes the profile; `init --build` runs the
+  default mode after scaffolding.
 - The Claude CLI (`claude-code` from `nixpkgs-unstable`) is on the shared
   profile. Two shared paths are bind-mounted **rw** into every container so one
   login + config is shared: `$HOME/.nixenv/claude` → `/home/app/.claude`
@@ -99,12 +107,18 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   (`CLAUDE_JSON`). `.claude.json` lives in the home root (not inside `.claude`),
   so it's shared as its own file; `prepare_claude_share` seeds it (restoring the
   newest `.claude/backups/` if present) before each `run`.
-- Interactive logins auto-attach a named **zellij** session (the embedded
-  `.zshrc` `exec`s `zellij attach --create $ZELLIJ_SESSION`, default the project
-  name). `NIXENV_ZELLIJ_STARTED` (exported before the exec) blocks nesting;
-  `NIXENV_NO_ZELLIJ=1` disables it. `ssh`/`shell` accept `--session=NAME` and
-  `--safe`; for `ssh` they ride over `SetEnv` (sshd `AcceptEnv` allows
-  `ZELLIJ_SESSION`/`NIXENV_NO_ZELLIJ`).
+- Terminal session persistence uses **zmx** (github:neurosnap/zmx), installed in
+  the base flake as a **prebuilt static-musl binary** (`builtins.fetchTarball` +
+  `runCommand`) because its source build needs bubblewrap/user namespaces the
+  builder container can't create. The base build therefore runs `--impure`
+  (fetchTarball has no pinned hash); `BUILDER_PRIVILEGED=1` is the fallback for
+  other source builds that need bwrap. `write_host_ssh_config` writes
+  `<project>/ssh/config` (Host
+  `<name>`/`<name>.*` → 127.0.0.1:port, `RemoteCommand zmx attach %k`,
+  `ControlMaster`), and `ssh-config --install` adds the `Include` glob to
+  `~/.ssh/config` so `ssh <project>` works. `nixenv ssh`/`shell` connect directly
+  (plain zsh, no zmx). The prompt (starship) shows `$NIXENV_PROJECT`,
+  `$ZMX_SESSION`, and the hostname (= project name). No zellij anywhere.
 - `run <project>` (no cmd) starts a **detached** service container named
   `<prefix>-<project>` with `-p <project-port>:22`. `ssh`/`shell` auto-start it;
   `shell` uses `docker exec` (no key needed), `ssh` uses the host `ssh` client.
@@ -113,9 +127,9 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
 ## Commands
 
 `build [project]`, `init <project> [git-url] [--build]`, `run <project>`,
-`ssh <project>`, `shell <project>`, `expose <project> <port>…`, `up`, `stop`,
-`logs`, `delete`/`rm`, `projects`, `update`, `status`, `clean`, `install`,
-`uninstall`. See `./nixenv.sh --help` and
+`ssh <project>`, `ssh-config [--install]`, `shell <project>`,
+`expose <project> <port>…`, `up`, `stop`, `logs`, `delete`/`rm`, `projects`,
+`update`, `status`, `clean`, `install`, `uninstall`. See `./nixenv.sh --help` and
 `README.md`. `delete` prints the commands (container/volume/home removal) and
 prompts before running; `resolve_engine` returns non-zero (not `die`) when no
 engine is found so host-file deletion still works.

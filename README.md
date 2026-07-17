@@ -15,15 +15,16 @@ every project shares the same pinned toolchain.
    `nixenv.sh`. On every run it writes these into `$CONTEXT_DIR`
    (default `~/.nixenv/context`) and builds from there. You can copy just
    `nixenv.sh` anywhere and it recreates its own context.
-2. **Standalone volume.** A named Docker volume (`nixos-store`) holds `/nix`.
+2. **Standalone volume.** A named Docker volume (`nixenv__nixos_store`) holds `/nix`.
 3. **Builder container.** A short-lived `nixos/nix` container realises every
    dependency from the flake into the volume and installs them into a shared
    profile (`/nix/var/nix/profiles/shared`) that also lives in the volume.
 4. **Runtime container.** A lightweight `debian:stable-slim` container mounts the
-   volume read-only at `/nix` and runs **entirely as your (non-root) host user**
-   — `--user $(id -u):$(id -g)`. The login user `app` is supplied via a
-   bind-mounted `/etc/passwd`, and an unprivileged `sshd` (on port 2222 inside
-   the container) runs under the `runit` supervisor so you can SSH in. Nothing in
+   store read-only at `/nix` and runs **entirely as your (non-root) host user**
+   — `--user $(id -u):$(id -g)`, hostname set to the project name. The login user
+   `app` is supplied via a bind-mounted `/etc/passwd`, code and home come from
+   per-project named volumes (chown'd to your uid), and an unprivileged `sshd`
+   (port 2222) runs under the `runit` supervisor so you can SSH in. Nothing in
    the container runs as root. Nix binaries reference their own loader/libs by
    absolute `/nix` path, so the slim base's libc is irrelevant.
 
@@ -79,9 +80,10 @@ interactive `zsh` via `docker exec` (no SSH key needed).
 ## Commands
 
 - `build` — (re)write context, then download all flake deps into the volume.
-- `build <project>` — build the project's **own** flake (from its repo) into a
-  per-project profile, layered on the base (see
-  [Per-project tooling](#per-project-tooling)).
+- `build <project> [--dir=<path>]` — build the project's **own** flake into a
+  per-project profile, layered on the base. Default reads `flake.nix` from the
+  repo root; `--dir=<path>` copies a whole folder (flake + local files it
+  references). See [Per-project tooling](#per-project-tooling).
 - `init <project> [git-url] [--build]` — scaffold the project, prompt for git
   name/email, assign a stable random SSH port, and optionally clone `git-url`
   into the app volume. `--build` also builds the project's flake afterwards. For
@@ -89,10 +91,11 @@ interactive `zsh` via `docker exec` (no SSH key needed).
   stores them (see [HTTPS credentials](#https-credentials)).
 - `run <project>` — start the project as a background service (`sshd` under
   `runit`) and print its SSH port.
-- `ssh <project>` — SSH into the running service (auto-starts it).
-- `shell <project> [--session=NAME]` — interactive shell via `docker exec` (no
-  SSH key needed); opens/attaches a named zellij session (see
-  [Terminal sessions](#terminal-sessions)).
+- `ssh <project>` — SSH into the running service (auto-starts it). For
+  persistent zmx sessions, use `ssh <project>` via your `~/.ssh/config` (see
+  [Terminal sessions](#terminal-sessions-zmx-via-ssh-project)).
+- `shell <project>` — interactive zsh via `docker exec` (no SSH key needed).
+- `ssh-config [--install]` — wire `ssh <project>` into your `~/.ssh/config`.
 - `expose <project> <port>…` — publish extra port(s) (see
   [Exposing ports](#exposing-ports)).
 - `up <project>` — build if needed, then start the service.
@@ -131,22 +134,29 @@ from the network. Root login is disabled.
 > later want key-only access, drop your public key into `home/.ssh/authorized_keys`
 > and ask to re-enable `AuthenticationMethods publickey`.
 
-## Terminal sessions
+## Terminal sessions (zmx) via `ssh <project>`
 
-`ssh` and `shell` drop you into a **zellij** session by default, named after the
-project. Because the session lives in the container, your panes/layout survive
-disconnects — reconnecting with `nixenv ssh <project>` (or `shell`) re-attaches
-the same session instead of starting fresh.
+Each project gets a generated **host** ssh config at
+`~/.nixenv/projects/<name>/ssh/config`. Add one Include line to your
+`~/.ssh/config` and you can `ssh <project>` directly:
 
 ```sh
-nixenv ssh myapp                     # attaches the "myapp" session (creates it once)
-nixenv shell myapp --session=debug   # a second, independent session
-nixenv ssh myapp --safe              # plain zsh, no zellij (if it's misbehaving)
+nixenv ssh-config --install     # adds: Include ~/.nixenv/projects/*/ssh/config
+ssh wealth                      # persistent zmx session 'wealth'
+ssh wealth.api                  # a second session 'wealth.api'
 ```
 
-`--session=NAME` opens/attaches a differently-named session; `--safe` skips
-zellij entirely for that connection (equivalent to `NIXENV_NO_ZELLIJ=1`). Nesting
-is prevented via an internal env var, so panes inside zellij never re-trigger it.
+The generated config uses [`zmx`](https://github.com/neurosnap/zmx) (bundled in
+the base toolchain) for re-attachable terminal sessions over ssh, with
+`ControlMaster` multiplexing — the same pattern zmx documents. The session name
+comes from the ssh host, so `ssh wealth` / `ssh wealth.api` give you distinct,
+persistent sessions you can detach from and re-attach later. Edit the per-project
+file freely (it's only created when missing); swap the `RemoteCommand` for a
+plain shell if you prefer.
+
+`nixenv ssh <project>` and `nixenv shell <project>` connect directly (plain zsh,
+no zmx) — handy as an escape hatch. The prompt shows the project name (the
+container's hostname is set to it), plus the zmx session when you're in one.
 
 ## Exposing ports
 
@@ -184,22 +194,33 @@ export `GIT_HTTP_USER` / `GIT_HTTP_TOKEN`.
 
 ## Project layout
 
-Projects always live under `~/.nixenv/projects/`, all on the host:
+Each project's code and home live in **named Docker volumes**:
 
 ```
-~/.nixenv/projects/<name>/home   → bind-mounted at /home/app  (.ssh, .zshrc, .gitconfig, configs)
-~/.nixenv/projects/<name>/repo   → bind-mounted at /app       (your code; the WORKDIR)
+volume nixenv_<name>_app        → /app          (your code; the WORKDIR)
+volume nixenv_<name>_home       → /home/<user>  (.ssh, .zshrc, .gitconfig, configs)
+volume nixenv_<name>_databases  → /databases    (persistent DB data: pgsql, redis, …)
 ```
 
-Each project also has a `port` file (its assigned SSH port) created on `init`,
-and small generated `passwd`/`group`/`shadow` files (the container's user db).
+`/databases` is an empty, writable, per-project volume for database *data files*.
+Point your services at it — e.g. Postgres `PGDATA=/databases/pgsql`, Redis
+`dir /databases/redis` — so the data survives container recreation (run the DBs
+themselves as [startup services](#terminal-sessions-zmx-via-ssh-project) via
+supervisord, or by hand).
 
-A new project's `home/` is seeded from the embedded home skeleton. Both `home/`
-and `repo/` are host bind-mounts owned by your uid, so the **non-root** container
-can write to them directly — named volumes are root-owned and a non-root
-container can't `chown` them, which is why these are host dirs. Drop your SSH
-keys into `~/.nixenv/projects/<name>/home/.ssh/`, and put code in `repo/` (or
-pass a git URL to `init` to clone it there).
+The volumes are created and **chown'd to your uid** (via a one-time throwaway
+root helper container) so the non-root runtime container can write them — that's
+the trick that lets us use fast named volumes while staying non-root. On macOS
+Docker Desktop this is much faster than host bind-mounts for heavy file I/O
+(`node_modules`, installs, git).
+
+Host-side, `~/.nixenv/projects/<name>/` keeps only small state: `home/` (the
+**seed** the home volume is populated from on first run — skeleton + git config),
+the generated `passwd`/`group`/`shadow` (the container's user db), `port`, and
+`ssh/config`. Because the code and home are in volumes, they're not directly
+editable from the host — you work through the container (`nixenv ssh` /
+Remote-SSH / VS Code). Populate the code volume by passing a git URL to `init`,
+or by cloning/working inside the container at `/app`.
 
 Git identity is stored per project in `home/.gitconfig.identity`, which the
 project's `.gitconfig` includes — so re-running `init` never duplicates the
@@ -242,19 +263,44 @@ base, so the project sees base ∪ its extras (and can shadow a base tool with a
 pinned version). Rebuild after changing the repo flake; `delete` removes the
 profile too.
 
-Limitation: only the flake files are extracted, so a repo flake that references
-*other* local files in the repo (relative paths, or building the repo itself)
-won't build this way — keep the project flake to declaring dependencies.
+By default only `flake.nix` (+ `flake.lock`) is copied, so a flake that
+references *other* local files won't resolve. For that case, put the flake and
+its local files in a folder and point at it:
+
+```sh
+nixenv build myapp --dir=nix        # copies the whole repo/nix/ folder
+nixenv build myapp --dir=/abs/path  # or an absolute host path
+```
+
+`--dir` copies the entire folder into the build, so relative references inside it
+(overlays, a vendored package, `./.`-style local inputs) work.
 
 ## Toolchain
 
 The shared profile includes git, zsh + oh-my-zsh + starship, OpenSSH, runit, the
-Claude CLI (`claude`), common CLI tools (ripgrep, fd, fzf, bat, jq, delta,
-lazygit, tmux, zellij, …), a build toolchain (gnumake, gcc, binutils,
-pkg-config, cmake, autoconf, automake, libtool), and language runtimes: Node 22
+Claude CLI (`claude`), zmx (terminal session persistence), common CLI tools
+(curl, wget, ping, host/dig, ripgrep,
+fd, fzf, bat, jq, delta, lazygit, tmux, …), a build toolchain (gnumake, gcc, binutils,
+pkg-config, cmake, autoconf, automake, libtool), language runtimes: Node 22
 (with `npx`), Go, Rust (rustup), PHP 8.5 + Composer, Python 3.12, and `uv` (with
-`uvx`). Edit the embedded `flake.nix` block in `nixenv.sh` and re-run `build` to
-change the set.
+`uvx`), and an editor — **Neovim + AstroNvim** with language servers for Go,
+TypeScript/JavaScript, Python, Rust, PHP, Ruby, Bash, and Lua (see
+[Editor](#editor-neovim--astronvim)). Edit the embedded `flake.nix` block in
+`nixenv.sh` and re-run `build` to change the set.
+
+## Editor (Neovim + AstroNvim)
+
+`nvim` launches [AstroNvim](https://astronvim.com) — a Neovim distribution with a
+VS Code-like feel: file tree, buffer tabs, statusline, LSP, completion, git
+signs, and a VS Code colorscheme. Language servers come from the base toolchain
+(`gopls`, `rust-analyzer`, `pyright`, `typescript-language-server`,
+`intelephense`, `ruby-lsp`, `bash-language-server`, `lua-language-server`), so
+they're on `PATH` and Mason won't download its own copies.
+
+The config lives at `~/.config/nvim/init.lua` (seeded from the skeleton, editable
+in the home volume). On the **first** `nvim` launch, `lazy.nvim` downloads the
+plugins (needs network; a one-time step that persists in the home volume). For
+the icons to render, use a **Nerd Font** in your terminal.
 
 ### Shared Claude credentials
 
@@ -279,7 +325,7 @@ Override via environment variables:
 
 - `CONTAINER_ENGINE` (`docker` or `podman`; auto-detects, asks if both present)
 - `CONTEXT_DIR` (default `~/.nixenv/context`)
-- `NIX_VOLUME` (default `nixos-store`)
+- `NIX_VOLUME` (default `nixenv__nixos_store`)
 - `BUILDER_IMAGE` (default `nixos/nix:2.32.8`)
 - `RUNTIME_IMAGE` (default `debian:stable-slim`)
 - `APP_USER` (default `app`)

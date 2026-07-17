@@ -112,6 +112,10 @@
               # shellcheck
               # hadolint
 
+              # --- Example: a process supervisor to run at container startup ---
+              # python3Packages.supervisor   # provides `supervisord` / `supervisorctl`
+              #   (see "RUNNING SERVICES AT STARTUP" at the bottom of this file)
+
               # A harmless placeholder so the env is non-empty and builds even
               # before you add anything. Remove once you add real deps.
               pkgs.hello
@@ -136,3 +140,38 @@
         });
     };
 }
+
+# =============================================================================
+# RUNNING SERVICES AT STARTUP (runit) — e.g. supervisord
+# =============================================================================
+# This flake only puts tools on PATH. To actually RUN a process when the project
+# container starts, add a runit service to your repo. nixenv supervises sshd via
+# `runit`, and at boot it picks up any service you define at:
+#
+#     <repo>/.nixenv/sv/<name>/run        (an executable shell script)
+#
+# Each `run` must exec a FOREGROUND (non-daemonising) process — runit restarts it
+# if it exits. The service runs as your container user, with this flake's tools
+# (and the base toolchain) on PATH.
+#
+# ── Example: run supervisord ────────────────────────────────────────────────
+# 1. Add the package above:   python3Packages.supervisor
+# 2. Create an executable run script in the repo:
+#
+#      mkdir -p .nixenv/sv/supervisord
+#      cat > .nixenv/sv/supervisord/run <<'SH'
+#      #!/bin/sh
+#      exec supervisord -n -c /app/supervisord.conf
+#      SH
+#      chmod +x .nixenv/sv/supervisord/run
+#
+#    (`-n` keeps supervisord in the foreground so runit can supervise it.)
+# 3. Commit your supervisord.conf at the repo root (it's mounted at /app).
+# 4. Build + (re)start the project:
+#
+#      nixenv build <project>      # so `supervisord` is on PATH
+#      nixenv stop <project> && nixenv run <project>
+#
+# Then `supervisorctl` (also on PATH) manages your supervisord-defined processes.
+# Add more services the same way: one <repo>/.nixenv/sv/<name>/run per service.
+# =============================================================================
