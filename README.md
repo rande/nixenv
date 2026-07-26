@@ -64,14 +64,21 @@ instead of `./nixenv.sh <command>`.
 ```sh
 ./nixenv.sh build                 # download all deps into the volume (slow once)
 ./nixenv.sh init myapp            # scaffold a project, prompts for git identity
-./nixenv.sh run myapp             # start the service (prints the SSH port)
+./nixenv.sh run myapp             # start the service (prints the SSH port;
+                                  # also auto-starts the shared HTTPS proxy)
 ./nixenv.sh ssh myapp             # SSH in as 'app'
 ```
 
-Clone a repo while initialising (cloned into the project's app volume):
+With the app listening on `:3000`, it's already reachable at
+`https://myapp-3000.nixenv.localhost/` (see
+[Reverse proxy](#reverse-proxy-httpsproject-portnixenvlocalhost)).
+
+Clone a repo while initialising (cloned into the project's app volume), and
+optionally pick where it mounts in the container:
 
 ```sh
 ./nixenv.sh init myapp git@github.com:me/app.git
+./nixenv.sh init web  git@github.com:me/web.git --app-path=/var/www/html
 ```
 
 Don't want to set up keys? `./nixenv.sh shell myapp` drops you straight into an
@@ -84,11 +91,15 @@ interactive `zsh` via `docker exec` (no SSH key needed).
   per-project profile, layered on the base. Default reads `flake.nix` from the
   repo root; `--dir=<path>` copies a whole folder (flake + local files it
   references). See [Per-project tooling](#per-project-tooling).
-- `init <project> [git-url] [--build]` — scaffold the project, prompt for git
-  name/email, assign a stable random SSH port, and optionally clone `git-url`
-  into the app volume. `--build` also builds the project's flake afterwards. For
-  an `http(s)` URL it also prompts for a username + Personal Access Token and
-  stores them (see [HTTPS credentials](#https-credentials)).
+- `init <project> [git-url] [--build] [--app-path=/path]` — scaffold the
+  project, prompt for git name/email, assign a stable random SSH port, and
+  optionally clone `git-url` into the app volume. `--build` also builds the
+  project's flake afterwards. `--app-path=/path` mounts the code volume at a
+  custom container path instead of `/app` (e.g. `/var/www/myapp`, to match
+  production); it's stored in `<project>/app_mount` and used by `run`, `shell`,
+  and the login `cd`. For an `http(s)` URL it also prompts for a username +
+  Personal Access Token and stores them (see
+  [HTTPS credentials](#https-credentials)).
 - `run <project>` — start the project as a background service (`sshd` under
   `runit`) and print its SSH port.
 - `ssh <project>` — SSH into the running service (auto-starts it). For
@@ -98,12 +109,18 @@ interactive `zsh` via `docker exec` (no SSH key needed).
 - `ssh-config [--install]` — wire `ssh <project>` into your `~/.ssh/config`.
 - `expose <project> <port>…` — publish extra port(s) (see
   [Exposing ports](#exposing-ports)).
+- `host <project> <name:ip>…` — add custom `/etc/hosts` entries (see
+  [Custom /etc/hosts](#custom-etchosts)).
+- `proxy [up|stop|status|logs|renew|remove-cert]` — shared HTTPS reverse proxy
+  for all projects (see [Reverse proxy](#reverse-proxy-httpsproject-portnixenvlocalhost)).
 - `up <project>` — build if needed, then start the service.
 - `stop <project>` — stop and remove the project's service container.
 - `logs <project>` — follow the service container logs.
 - `delete <project>` (alias `rm`) — permanently remove a project: its
-  container(s), code volume, and home dir. Prints the exact commands it will run
-  and asks for confirmation first.
+  container(s), the app/home/databases volumes, and its host dir. Prints the
+  exact commands it will run and asks for confirmation first.
+- `sync-home <project>` — refresh the home volume's dotfiles from the embedded
+  templates + per-project overrides (see [Updating dotfiles](#updating-dotfiles-sync-home)).
 - `projects` — list projects with their SSH port and running state.
 - `update` — refresh `flake.lock`, then rebuild into the volume.
 - `status` — show context, volume, and shared-profile state.
@@ -142,14 +159,14 @@ Each project gets a generated **host** ssh config at
 
 ```sh
 nixenv ssh-config --install     # adds: Include ~/.nixenv/projects/*/ssh/config
-ssh wealth                      # persistent zmx session 'wealth'
-ssh wealth.api                  # a second session 'wealth.api'
+ssh myapp                       # persistent zmx session 'myapp'
+ssh myapp.api                   # a second session 'myapp.api'
 ```
 
 The generated config uses [`zmx`](https://github.com/neurosnap/zmx) (bundled in
 the base toolchain) for re-attachable terminal sessions over ssh, with
 `ControlMaster` multiplexing — the same pattern zmx documents. The session name
-comes from the ssh host, so `ssh wealth` / `ssh wealth.api` give you distinct,
+comes from the ssh host, so `ssh myapp` / `ssh myapp.api` give you distinct,
 persistent sessions you can detach from and re-attach later. Edit the per-project
 file freely (it's only created when missing); swap the `RemoteCommand` for a
 plain shell if you prefer.
@@ -160,8 +177,16 @@ container's hostname is set to it), plus the zmx session when you're in one.
 
 ## Exposing ports
 
-Each project publishes its SSH port automatically. To expose more (a dev server,
-database, etc.), the easiest way is:
+> **Tip — for HTTP(S) services, prefer the
+> [Reverse proxy](#reverse-proxy-httpsproject-portnixenvlocalhost).** Any port
+> your app listens on is already reachable at
+> `https://<project>-<port>.nixenv.localhost/` with zero configuration — no
+> `expose`, no restart, no host-port conflicts between projects, and you get
+> HTTPS. `expose` is mainly for **non-HTTP** traffic (a database client on your
+> Mac, a raw TCP service) or when a tool needs a plain `127.0.0.1:<port>`.
+
+Each project publishes its SSH port automatically. To expose more directly (a
+database, raw TCP, etc.):
 
 ```sh
 ./nixenv.sh expose myapp 8080          # → 127.0.0.1:8080:8080
@@ -174,6 +199,88 @@ persist and you can also edit that file by hand. `expose` restarts the service
 to apply them; otherwise they take effect on the next `run`. A bare number binds
 to `127.0.0.1` (local only); pass a full `host:container` or
 `address:host:container` spec for anything else.
+
+## Reverse proxy (`https://<project>-<port>.nixenv.localhost/`)
+
+A single shared **Caddy** container (run from the Nix store — no extra image)
+routes pretty HTTPS URLs to any project by parsing the hostname:
+
+```
+https://<project>-<port>.nixenv.localhost/  →  container nixenv-<project>, port <port>
+e.g. https://myapp-3000.nixenv.localhost/   →  your dev server on :3000
+```
+
+Every project container automatically joins a shared network (`nixenv_net`) on
+`run`, and the proxy **auto-starts with the first project** (disable with
+`PROXY_AUTOSTART=0`), so usually there's nothing to do. Manage it explicitly
+with `./nixenv.sh proxy up | stop | status | logs`. New projects need no proxy
+configuration — the routing is dynamic. Your app must listen on `0.0.0.0` (not
+`127.0.0.1`) inside its container so the proxy can reach it.
+
+`*.localhost` resolves to `127.0.0.1` automatically in Chrome and Firefox;
+Safari needs an `/etc/hosts` line. The proxy sends the standard forwarded
+headers (`X-Forwarded-Proto: https`, `X-Forwarded-For/-Host/-Port`,
+`X-Real-IP`), so frameworks behind a trusted proxy generate correct `https://`
+URLs. Host ports default to 80/443 (`PROXY_HTTP_PORT`/`PROXY_HTTPS_PORT`; use
+8080/8443 for rootless Podman, which can't bind below 1024).
+
+### Trusted certificates (mkcert)
+
+Out of the box the proxy uses Caddy's internal CA, so browsers show a warning.
+If [`mkcert`](https://github.com/FiloSottile/mkcert) is installed, an explicit
+`proxy up` issues a trusted wildcard cert for `*.nixenv.localhost` instead:
+
+```sh
+brew install mkcert nss     # nss = Firefox trust
+./nixenv.sh proxy up        # issues the wildcard cert (one-time 'mkcert -install')
+```
+
+The one-time `mkcert -install` adds mkcert's local CA to your OS/browser trust
+stores and may ask for your password — the script **explains exactly what it
+does before running it**, and only runs it when the CA isn't already installed.
+Prefer manual control? Run `mkcert -install` yourself first, or skip trusting
+entirely with `PROXY_MKCERT_INSTALL=0` (HTTPS still works, with a warning). The
+auto-start on `run` never runs `mkcert -install`, so it can never surprise you
+with a prompt. `proxy renew` reissues the cert; `proxy remove-cert` deletes
+nixenv's cert (falling back to the internal CA) without touching mkcert's CA.
+
+## Custom /etc/hosts
+
+The container's `/etc/hosts` is rebuilt by the entrypoint on every start from
+base entries plus two optional sources, in order:
+
+1. **Declared in the project flake** (versioned, team-shared): ship an
+   `etc/hosts.extra` in the project profile via
+   `pkgs.writeTextDir "etc/hosts.extra" ''…''` added to `buildEnv.paths` — see
+   [`templates/flake.nix`](templates/flake.nix). Apply with
+   `nixenv build <project>` + restart.
+2. **Host-side, local-only**: `~/.nixenv/projects/<name>/hosts.extra`, native
+   `/etc/hosts` format (`ip<TAB>name`). Edit it by hand, or append entries with:
+
+```sh
+./nixenv.sh host myapp db:10.0.0.5 api.local:127.0.0.1
+```
+
+Entries apply on the next container start (`host` restarts a running project
+for you). This is file-driven rather than `--add-host` so it's declarative,
+idempotent, and works with the non-root container.
+
+## Updating dotfiles (`sync-home`)
+
+The home volume is seeded from the skeleton **once**, so template updates (a new
+git default, an AstroNvim pin, …) don't propagate to existing projects on their
+own. Refresh them with:
+
+```sh
+./nixenv.sh sync-home myapp
+```
+
+This layers the embedded skeleton first, then per-project overrides committed in
+the repo at `<repo>/.nixenv/home/` (mirroring `$HOME` paths — e.g.
+`.nixenv/home/.config/nvim/lua/plugins/extra.lua`), which win over the skeleton.
+Every file it overwrites is backed up inside the volume at
+`~/.nixenv/home-backups/<timestamp>`, and it never touches installed nvim
+plugins, shell history, or your git identity/credentials.
 
 ## HTTPS credentials
 
@@ -197,7 +304,8 @@ export `GIT_HTTP_USER` / `GIT_HTTP_TOKEN`.
 Each project's code and home live in **named Docker volumes**:
 
 ```
-volume nixenv_<name>_app        → /app          (your code; the WORKDIR)
+volume nixenv_<name>_app        → /app          (your code; the WORKDIR — customisable
+                                                 via init --app-path=/path)
 volume nixenv_<name>_home       → /home/<user>  (.ssh, .zshrc, .gitconfig, configs)
 volume nixenv_<name>_databases  → /databases    (persistent DB data: pgsql, redis, …)
 ```
@@ -205,8 +313,8 @@ volume nixenv_<name>_databases  → /databases    (persistent DB data: pgsql, re
 `/databases` is an empty, writable, per-project volume for database *data files*.
 Point your services at it — e.g. Postgres `PGDATA=/databases/pgsql`, Redis
 `dir /databases/redis` — so the data survives container recreation (run the DBs
-themselves as [startup services](#terminal-sessions-zmx-via-ssh-project) via
-supervisord, or by hand).
+themselves as runit startup services — `<repo>/.nixenv/sv/<name>/run`, documented
+in [`templates/flake.nix`](templates/flake.nix) — or by hand).
 
 The volumes are created and **chown'd to your uid** (via a one-time throwaway
 root helper container) so the non-root runtime container can write them — that's
@@ -216,11 +324,13 @@ Docker Desktop this is much faster than host bind-mounts for heavy file I/O
 
 Host-side, `~/.nixenv/projects/<name>/` keeps only small state: `home/` (the
 **seed** the home volume is populated from on first run — skeleton + git config),
-the generated `passwd`/`group`/`shadow` (the container's user db), `port`, and
-`ssh/config`. Because the code and home are in volumes, they're not directly
+the generated `passwd`/`group`/`shadow` (the container's user db), `port`,
+`ports`, `app_mount` (custom code-volume path, if set), `hosts.extra`
+(local `/etc/hosts` entries, if any), and `ssh/config`. Because the code and home are in volumes, they're not directly
 editable from the host — you work through the container (`nixenv ssh` /
 Remote-SSH / VS Code). Populate the code volume by passing a git URL to `init`,
-or by cloning/working inside the container at `/app`.
+or by cloning/working inside the container at the app mount (`/app` by default,
+or your `--app-path`).
 
 Git identity is stored per project in `home/.gitconfig.identity`, which the
 project's `.gitconfig` includes — so re-running `init` never duplicates the
@@ -277,10 +387,11 @@ nixenv build myapp --dir=/abs/path  # or an absolute host path
 
 ## Toolchain
 
-The shared profile includes git, zsh + oh-my-zsh + starship, OpenSSH, runit, the
+The shared profile includes git, zsh + oh-my-zsh + starship, OpenSSH, runit,
+Caddy (for the shared reverse proxy), the
 Claude CLI (`claude`), zmx (terminal session persistence), common CLI tools
 (curl, wget, ping, host/dig, ripgrep,
-fd, fzf, bat, jq, delta, lazygit, tmux, …), a build toolchain (gnumake, gcc, binutils,
+fd, fzf, bat, jq, delta, lazygit, …), a build toolchain (gnumake, gcc, binutils,
 pkg-config, cmake, autoconf, automake, libtool), language runtimes: Node 22
 (with `npx`), Go, Rust (rustup), PHP 8.5 + Composer, Python 3.12, and `uv` (with
 `uvx`), and an editor — **Neovim + AstroNvim** with language servers for Go,
@@ -334,12 +445,23 @@ Override via environment variables:
 - `GIT_USER_NAME` / `GIT_USER_EMAIL` — skip the interactive git identity prompt.
 - `GIT_HTTP_USER` / `GIT_HTTP_TOKEN` — skip the interactive HTTPS credentials
   prompt (for `init` with an `http(s)` URL).
+- `APP_MOUNT` — default code-volume mount path for `init` (same as
+  `--app-path`).
+- `PROXY_DOMAIN` (default `nixenv.localhost`), `PROXY_NET` (default
+  `nixenv_net`), `PROXY_HTTP_PORT` / `PROXY_HTTPS_PORT` (default 80/443; use
+  8080/8443 for rootless Podman), `PROXY_AUTOSTART` (default 1; 0 = don't start
+  the proxy on `run`), `PROXY_MKCERT_INSTALL` (0 = never run `mkcert -install`).
 
 Projects always live in `~/.nixenv/projects` (not configurable).
 
 ## Notes
 
-- `~/.nixenv/projects/<name>/` holds SSH keys, per-project home state, and the
-  code (`repo/`) — all on the host, owned by your uid.
+- Code, home, and databases live in named volumes and survive `stop`/`run` and
+  rebuilds; only `delete <project>` (with confirmation) and `clean` remove data.
+  `~/.nixenv/projects/<name>/` on the host holds only small state (home seed,
+  SSH config, git credentials, port).
 - The Nix store volume persists across runs; `clean` is the only thing that
   removes it.
+- The `.gitconfig` seeded into each home ships sensible modern defaults
+  (histogram diff, `push.autoSetupRemote`, `rerere`, `rebase.autoStash`, …),
+  largely from [how Git core devs configure Git](https://blog.gitbutler.com/how-git-core-devs-configure-git#tldr).

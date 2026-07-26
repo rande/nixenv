@@ -86,7 +86,21 @@
       # what you want to pin to a specific version.
       # -----------------------------------------------------------------------
       packages = forAllSystems (system:
-        let pkgs = pkgsFor system;
+        let
+          pkgs = pkgsFor system;
+
+          # --- Custom /etc/hosts entries (optional) ---------------------------
+          # nixenv merges a file shipped by this profile at etc/hosts.extra into
+          # the container's /etc/hosts on every start. Declare the entries here in
+          # native /etc/hosts format ("<ip><TAB or spaces><name>"), one per line.
+          # `writeTextDir` produces a derivation containing exactly
+          # $out/etc/hosts.extra, which buildEnv (below) merges into the profile.
+          # Leave the list empty (or drop `hostsExtra` from `paths`) for none.
+          hostsExtra = pkgs.writeTextDir "etc/hosts.extra" ''
+            10.0.0.5      db
+            10.0.0.6      cache.internal
+            127.0.0.1     api.local
+          '';
         in {
           default = pkgs.buildEnv {
             name = "project-deps";
@@ -119,6 +133,11 @@
               # A harmless placeholder so the env is non-empty and builds even
               # before you add anything. Remove once you add real deps.
               pkgs.hello
+
+              # --- Custom /etc/hosts entries (see `hostsExtra` above) ---
+              # Ships etc/hosts.extra in the profile; nixenv merges it into the
+              # container's /etc/hosts at start. Remove this line to disable.
+              hostsExtra
 
               # --- Example using the optional unstable input (see inputs above) ---
               # unstable.some-bleeding-edge-tool
@@ -174,4 +193,46 @@
 #
 # Then `supervisorctl` (also on PATH) manages your supervisord-defined processes.
 # Add more services the same way: one <repo>/.nixenv/sv/<name>/run per service.
+# =============================================================================
+
+# =============================================================================
+# PER-PROJECT HOME OVERRIDES (<repo>/.nixenv/home/)
+# =============================================================================
+# The container's home (dotfiles: nvim, zsh, git, tmux, ssh config) comes from a
+# shared skeleton baked into nixenv. To customise it FOR THIS PROJECT, commit
+# files under <repo>/.nixenv/home/ mirroring their path in $HOME, e.g.:
+#
+#     .nixenv/home/.config/nvim/lua/plugins/extra.lua
+#     .nixenv/home/.zshrc                    # replaces the shared .zshrc
+#
+# Apply them into the project's home volume with:
+#
+#     nixenv sync-home <project>
+#
+# sync-home lays down the shared skeleton first, then these overrides on top
+# (yours win). It backs up any file it overwrites to
+# ~/.nixenv/home-backups/<timestamp> in the volume, and never touches installed
+# nvim plugins, shell history, or your git credentials. Re-run it whenever you
+# change these files or nixenv ships new defaults.
+# =============================================================================
+
+# =============================================================================
+# CUSTOM /etc/hosts ENTRIES (declared in this flake — see `hostsExtra` above)
+# =============================================================================
+# The container's /etc/hosts is non-root and engine-managed, so you can't edit it
+# in place. Instead nixenv rebuilds it at every container start from base entries
+# plus a file this flake ships in its profile: etc/hosts.extra.
+#
+# Declare the entries with `pkgs.writeTextDir "etc/hosts.extra" ''…''` (native
+# /etc/hosts format) and add the result to `buildEnv.paths` — both already shown
+# above. Then build + restart to apply:
+#
+#     nixenv build <project>
+#     nixenv stop <project> && nixenv run <project>
+#     getent hosts db          # -> 10.0.0.5  db
+#
+# Precedence: base localhost lines + "127.0.1.1 <hostname>", then this flake's
+# etc/hosts.extra, then the host-side ~/.nixenv/projects/<project>/hosts.extra
+# (a local-only override you can also manage with `nixenv host <project> …`).
+# Committing the entries here keeps them versioned and shared with your team.
 # =============================================================================

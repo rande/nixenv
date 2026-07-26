@@ -47,6 +47,15 @@ CONTAINER_ENGINE="${CONTAINER_ENGINE:-}"             # docker|podman; empty = au
 ENGINE_FILE="$HOME/.nixenv/engine"                   # remembered engine choice
 ENGINE=""                                            # resolved at runtime
 
+# --- Reverse proxy (nixenv proxy) --------------------------------------------
+PROXY_NET="${PROXY_NET:-nixenv_net}"                 # shared user network all projects join
+PROXY_NAME="${CONTAINER_PREFIX}-proxy"               # the Caddy proxy container name
+PROXY_DIR="$HOME/.nixenv/proxy"                       # Caddyfile + certs + caddy data
+PROXY_DOMAIN="${PROXY_DOMAIN:-nixenv.localhost}"     # base domain: <project>-<port>.<PROXY_DOMAIN>
+PROXY_HTTP_PORT="${PROXY_HTTP_PORT:-80}"             # host port → caddy 8080 (use 8080 for podman rootless)
+PROXY_HTTPS_PORT="${PROXY_HTTPS_PORT:-443}"          # host port → caddy 8443 (use 8443 for podman rootless)
+PROXY_AUTOSTART="${PROXY_AUTOSTART:-1}"              # auto-start the proxy on 'run' (0 to disable)
+
 # ── Pretty output ────────────────────────────────────────────────────────────
 c_blue='\033[1;34m'; c_green='\033[1;32m'; c_yellow='\033[1;33m'; c_red='\033[1;31m'; c_reset='\033[0m'
 log()  { printf "${c_blue}==>${c_reset} %s\n" "$*"; }
@@ -129,6 +138,7 @@ materialize_context() {
               wget
               iputils      # ping
               dnsutils     # host, dig, nslookup
+              caddy        # reverse proxy for the shared 'nixenv proxy' container
               rsync
               jq
               yq-go
@@ -138,7 +148,6 @@ materialize_context() {
               bat
               zoxide
               tree
-              tmux
               zmxPkg       # zmx — terminal session persistence (github:neurosnap/zmx)
               direnv
               starship
@@ -250,7 +259,7 @@ RUN set -eux \
         nixpkgs.zsh-autosuggestions nixpkgs.zsh-syntax-highlighting \
         nixpkgs.tig nixpkgs.delta nixpkgs.lazygit nixpkgs.curl nixpkgs.wget \
         nixpkgs.rsync nixpkgs.jq nixpkgs.yq-go nixpkgs.ripgrep nixpkgs.fd \
-        nixpkgs.fzf nixpkgs.bat nixpkgs.zoxide nixpkgs.tree nixpkgs.tmux \
+        nixpkgs.fzf nixpkgs.bat nixpkgs.zoxide nixpkgs.tree \
         nixpkgs.direnv nixpkgs.starship nixpkgs.tldr nixpkgs.ncdu \
         nixpkgs.unzip nixpkgs.gnused nixpkgs.gnugrep nixpkgs.gawk \
         nixpkgs.coreutils nixpkgs.findutils nixpkgs.less nixpkgs.openssh nixpkgs.cacert \
@@ -292,6 +301,7 @@ PROFILE="${PROFILE:-/nix/var/nix/profiles/shared}"
 ZSH_BIN="$PROFILE/bin/zsh"
 HOME_DIR="${HOME:-/home/$APP_USER}"
 SSHD_PORT="${SSHD_PORT:-2222}"
+APP_MOUNT="${NIXENV_APP_MOUNT:-/app}"   # where the code volume is mounted
 
 mkdir -p "$HOME_DIR/.cache/omz" "$HOME_DIR/.ssh" 2>/dev/null || true
 chmod 700 "$HOME_DIR/.ssh" 2>/dev/null || true
@@ -302,6 +312,7 @@ chmod 700 "$HOME_DIR/.ssh" 2>/dev/null || true
 cat > "$HOME_DIR/.zshenv" <<EOF
 export PROFILE="$PROFILE"
 export NIXENV_PROJECT="${NIXENV_PROJECT:-}"
+export NIXENV_APP_MOUNT="$APP_MOUNT"
 export NIXENV_EXTRA_PROFILE="${NIXENV_EXTRA_PROFILE:-}"
 # The per-project profile (extra tooling) goes first when it exists, then base.
 _nixenv_extra=""
@@ -314,6 +325,24 @@ export NIX_SSL_CERT_FILE="$PROFILE/etc/ssl/certs/ca-bundle.crt"
 export EDITOR=vim
 export LANG=C.UTF-8
 EOF
+
+# --- Custom /etc/hosts ------------------------------------------------------
+# If /etc/hosts is writable (nixenv bind-mounted one we own), rebuild it from
+# base entries + two optional extra sources, in order:
+#   1. the project flake's declared entries, shipped in its profile as
+#      $NIXENV_EXTRA_PROFILE/etc/hosts.extra (see the flake template);
+#   2. the host-side /etc/hosts.extra (local-only override, via the 'host' helper).
+# When /etc/hosts is the engine-managed root-owned default this is skipped (we
+# can't and needn't touch it). Regenerating (not appending) is idempotent.
+if [ -w /etc/hosts ]; then
+  {
+    printf '127.0.0.1\tlocalhost\n'
+    printf '::1\tlocalhost ip6-localhost ip6-loopback\n'
+    printf '127.0.1.1\t%s\n' "$(hostname 2>/dev/null || echo "${NIXENV_PROJECT:-localhost}")"
+    [ -n "${NIXENV_EXTRA_PROFILE:-}" ] && [ -f "$NIXENV_EXTRA_PROFILE/etc/hosts.extra" ] && cat "$NIXENV_EXTRA_PROFILE/etc/hosts.extra"
+    [ -f /etc/hosts.extra ] && cat /etc/hosts.extra
+  } > /etc/hosts 2>/dev/null || true
+fi
 
 # =============================================================================
 # Command mode: run the given command as the (already non-root) user, then exit.
@@ -391,8 +420,8 @@ chmod +x "$SVROOT/sshd/run"
 #   #!/bin/sh
 #   exec supervisord -n -c /app/supervisord.conf
 project_services=""
-if [ -d /app/.nixenv/sv ]; then
-  for d in /app/.nixenv/sv/*/; do
+if [ -d "$APP_MOUNT/.nixenv/sv" ]; then
+  for d in "$APP_MOUNT"/.nixenv/sv/*/; do
     [ -f "${d}run" ] || continue
     sname="$(basename "$d")"
     mkdir -p "$SVROOT/$sname"
@@ -440,8 +469,13 @@ ZSH_THEME="robbyrussell"
 plugins=(git z fzf docker rust golang node npm python pip)
 source "$ZSH/oh-my-zsh.sh"
 
-# --- Shared profile on PATH ---
-export PATH="$PROFILE/bin:$HOME/.cargo/bin:$PATH"
+# --- Profiles on PATH ---
+# Keep the per-project profile (extra tooling, e.g. a pinned PHP) AHEAD of the
+# base profile, matching the order .zshenv set — otherwise base tools shadow the
+# project's pinned versions. oh-my-zsh above may have reordered PATH, so re-assert.
+_nixenv_pp=""
+[ -n "${NIXENV_EXTRA_PROFILE:-}" ] && [ -d "$NIXENV_EXTRA_PROFILE/bin" ] && _nixenv_pp="$NIXENV_EXTRA_PROFILE/bin:"
+export PATH="${_nixenv_pp}$PROFILE/bin:$HOME/.cargo/bin:$PATH"
 
 # --- Integrations ---
 eval "$(fzf --zsh 2>/dev/null || true)"
@@ -456,8 +490,9 @@ source "$PROFILE/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh" 2>/d
 export EDITOR=vim
 export LANG="${LANG:-C.UTF-8}"
 
-# Jump into the mounted repo on login.
-[ -d /app ] && cd /app 2>/dev/null || true
+# Jump into the mounted repo on login (path set by the entrypoint's .zshenv).
+_nixenv_app="${NIXENV_APP_MOUNT:-/app}"
+[ -d "$_nixenv_app" ] && cd "$_nixenv_app" 2>/dev/null || true
 NIXENV_ZSHRC
 
   cat > "$c/home-skel/.gitconfig" <<'NIXENV_GITCONFIG'
@@ -465,10 +500,19 @@ NIXENV_ZSHRC
 	path = ~/.gitconfig.identity
 	path = ~/.gitconfig.credentials
 
+# Sensible modern defaults, mostly from how git's own core developers configure
+# git: https://blog.gitbutler.com/how-git-core-devs-configure-git#tldr
 [init]
 	defaultBranch = main
+[column]
+	ui = auto
+[branch]
+	sort = -committerdate
+[tag]
+	sort = version:refname
 [core]
 	pager = delta
+	excludesfile = ~/.gitignore
 [interactive]
 	diffFilter = delta --color-only
 [delta]
@@ -477,8 +521,40 @@ NIXENV_ZSHRC
 [merge]
 	conflictstyle = diff3
 [diff]
-	colorMoved = default
+	algorithm = histogram
+	colorMoved = plain
+	mnemonicPrefix = true
+	renames = true
+[push]
+	default = simple
+	autoSetupRemote = true
+	followTags = true
+[fetch]
+	prune = true
+	pruneTags = true
+	all = true
+[help]
+	autocorrect = prompt
+[commit]
+	verbose = true
+[rerere]
+	enabled = true
+	autoupdate = true
+[rebase]
+	autoSquash = true
+	autoStash = true
+	updateRefs = true
 NIXENV_GITCONFIG
+
+  cat > "$c/home-skel/.gitignore" <<'NIXENV_GITIGNORE'
+# Global gitignore (git core.excludesfile). Personal / OS / editor noise only —
+# project-specific ignores belong in each repo's own .gitignore.
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+NIXENV_GITIGNORE
 
   cat > "$c/home-skel/.config/starship.toml" <<'NIXENV_STARSHIP'
 [character]
@@ -528,12 +604,6 @@ symbol = "🐍 "
 symbol = "🐘 "
 NIXENV_STARSHIP
 
-  cat > "$c/home-skel/.tmux.conf" <<'NIXENV_TMUX'
-set -g mouse on
-set -g history-limit 50000
-set -g default-terminal "tmux-256color"
-NIXENV_TMUX
-
   cat > "$c/home-skel/.vimrc" <<'NIXENV_VIMRC'
 set nocompatible
 syntax on
@@ -564,10 +634,10 @@ end
 vim.opt.rtp:prepend(lazypath)
 
 require("lazy").setup({
-  -- Core: AstroNvim v4
+  -- Core: AstroNvim v6 (tracks the 6.x line; currently 6.0.5)
   {
     "AstroNvim/AstroNvim",
-    version = "^4",
+    version = "^6",
     import = "astronvim.plugins",
     opts = {
       mapleader = " ",
@@ -609,6 +679,26 @@ require("lazy").setup({
   install = { colorscheme = { "vscode", "astrodark" } },
   ui = { backdrop = 100 },
   performance = { rtp = { disabled_plugins = { "gzip", "tarPlugin", "tohtml", "zipPlugin" } } },
+})
+
+-- Clipboard over SSH via OSC 52. Yanks to "+"/"*" are relayed to the terminal
+-- as an OSC 52 escape, so they land on your LOCAL machine's clipboard even when
+-- nvim runs headless over ssh. Registered on VeryLazy so it runs AFTER
+-- AstroNvim's own (deferred) clipboard setup — otherwise AstroNvim overwrites it.
+vim.api.nvim_create_autocmd("User", {
+  pattern = "VeryLazy",
+  once = true,
+  callback = function()
+    vim.opt.clipboard = "unnamedplus"
+    local ok, osc52 = pcall(require, "vim.ui.clipboard.osc52")
+    if ok then
+      vim.g.clipboard = {
+        name = "OSC 52",
+        copy = { ["+"] = osc52.copy("+"), ["*"] = osc52.copy("*") },
+        paste = { ["+"] = osc52.paste("+"), ["*"] = osc52.paste("*") },
+      }
+    end
+  end,
 })
 NIXENV_NVIM
 
@@ -695,6 +785,32 @@ engine_userns() {
   [ "$ENGINE" = podman ] && printf '%s' "--userns=keep-id"
 }
 
+# Ensure the shared user network exists. Project containers and the proxy join it
+# so the proxy can reach each project by its container name (nixenv-<project>).
+# User-defined networks give container-name DNS on both docker and modern podman
+# (netavark). Idempotent.
+ensure_proxy_net() {
+  "$ENGINE" network inspect "$PROXY_NET" >/dev/null 2>&1 || \
+    "$ENGINE" network create "$PROXY_NET" >/dev/null 2>&1 || \
+    warn "could not create network '$PROXY_NET' (proxy routing may not work)"
+}
+
+# Start the shared proxy the first time a project runs (unless PROXY_AUTOSTART=0).
+# No-op when it's already running; non-fatal so a proxy failure never breaks 'run'
+# (the subshell contains any die from cmd_proxy).
+ensure_proxy_running() {
+  [ "$PROXY_AUTOSTART" = 1 ] || return 0
+  container_running "$PROXY_NAME" && return 0
+  log "Auto-starting shared proxy (PROXY_AUTOSTART=0 to disable)"
+  # Auto-start must never block on a password prompt: default to NOT running
+  # 'mkcert -install' here (explicit '$0 proxy up' installs it, with an
+  # explanation). A user who exported PROXY_MKCERT_INSTALL keeps their choice.
+  (
+    PROXY_MKCERT_INSTALL="${PROXY_MKCERT_INSTALL:-0}"
+    cmd_proxy up
+  ) || warn "proxy auto-start failed — start it with '$0 proxy up' (needs caddy: '$0 build')"
+}
+
 # --privileged for the nix builder so source builds using bwrap/user namespaces
 # (e.g. zmx) work inside the builder container. No-op when disabled.
 builder_priv() {
@@ -721,10 +837,19 @@ store_is_populated() {
 
 # ── Project helpers ──────────────────────────────────────────────────────────
 project_dir()     { printf '%s/%s' "$PROJECTS_DIR" "$1"; }
-app_volume()      { printf '%s_%s_app'  "$CONTAINER_PREFIX" "$1"; }   # e.g. nixenv_wealth_app       → /app
-home_volume()     { printf '%s_%s_home' "$CONTAINER_PREFIX" "$1"; }   # e.g. nixenv_wealth_home      → /home/app
-db_volume()       { printf '%s_%s_databases' "$CONTAINER_PREFIX" "$1"; } # e.g. nixenv_wealth_databases → /databases
+app_volume()      { printf '%s_%s_app'  "$CONTAINER_PREFIX" "$1"; }   # e.g. nixenv_myapp_app       → /app
+home_volume()     { printf '%s_%s_home' "$CONTAINER_PREFIX" "$1"; }   # e.g. nixenv_myapp_home      → /home/app
+db_volume()       { printf '%s_%s_databases' "$CONTAINER_PREFIX" "$1"; } # e.g. nixenv_myapp_databases → /databases
 project_profile() { printf '/nix/var/nix/profiles/proj-%s' "$1"; }   # per-project extra tooling
+# Where the app (code) volume is mounted INSIDE the container. Chosen at init
+# time, stored in <project>/app_mount; defaults to /app. Only the runtime
+# container and its entrypoint care about this path — the seed/clone/build/sync
+# helpers just read/write the volume via a throwaway mount, so the repo lands at
+# the volume root regardless and appears at this path when the runtime mounts it.
+project_app_mount() {
+  local f; f="$(project_dir "$1")/app_mount"
+  if [ -f "$f" ] && [ -s "$f" ]; then cat "$f"; else printf '/app'; fi
+}
 vol_exists()      { "$ENGINE" volume inspect "$1" >/dev/null 2>&1; }
 
 # Ensure the project's /app and /home volumes exist and are OWNED BY OUR UID, so
@@ -733,35 +858,40 @@ vol_exists()      { "$ENGINE" volume inspect "$1" >/dev/null 2>&1; }
 # the running container is non-root). A freshly-created home volume is seeded
 # from the host seed dir (<project>/home: skeleton + git identity/credentials).
 ensure_volumes() {
-  local name="$1" uid gid appv homev dbv hf=0 fresh_mounts="" fresh_paths=""
-  uid="$(id -u)"; gid="$(id -g)"
+  local name="$1" uid gid pdir appv homev dbv seedmount=""
+  uid="$(id -u)"; gid="$(id -g)"; pdir="$(project_dir "$name")"
   appv="$(app_volume "$name")"; homev="$(home_volume "$name")"; dbv="$(db_volume "$name")"
 
-  # Create ONLY missing volumes. Existing volumes (with their data) are left
-  # completely alone — not even mounted by the chown helper below.
-  if ! vol_exists "$appv";  then "$ENGINE" volume create "$appv"  >/dev/null; fresh_mounts="$fresh_mounts -v $appv:/app";          fresh_paths="$fresh_paths /app"; fi
-  if ! vol_exists "$homev"; then "$ENGINE" volume create "$homev" >/dev/null; fresh_mounts="$fresh_mounts -v $homev:/home";        fresh_paths="$fresh_paths /home"; hf=1; fi
-  if ! vol_exists "$dbv";   then "$ENGINE" volume create "$dbv"   >/dev/null; fresh_mounts="$fresh_mounts -v $dbv:/databases";     fresh_paths="$fresh_paths /databases"; fi
+  # Create any missing volume (existing ones are left as-is, with their data).
+  vol_exists "$appv"  || "$ENGINE" volume create "$appv"  >/dev/null
+  vol_exists "$homev" || "$ENGINE" volume create "$homev" >/dev/null
+  vol_exists "$dbv"   || "$ENGINE" volume create "$dbv"   >/dev/null
 
-  # chown ONLY the just-created volumes to our uid so the non-root container can
-  # write them (named volumes start root-owned). Never touches existing ones.
-  if [ -n "$fresh_paths" ]; then
-    log "Preparing ownership of new volume(s):$fresh_paths (uid $uid:$gid)"
-    "$ENGINE" rm -f "${CONTAINER_PREFIX}__chown-$name" >/dev/null 2>&1 || true
-    "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__chown-$name" -u 0 $fresh_mounts \
-      "$(img "$RUNTIME_IMAGE")" chown -R "$uid:$gid" $fresh_paths >/dev/null 2>&1 \
-      || warn "chown helper failed — a new volume may be unwritable by uid $uid"
-  fi
+  [ -d "$pdir/home" ] && seedmount="-v $pdir/home:/seed:ro"
 
-  if [ "$hf" = 1 ] && [ -d "$(project_dir "$name")/home" ]; then
-    log "Seeding home volume '$homev' from $(project_dir "$name")/home"
-    "$ENGINE" rm -f "${CONTAINER_PREFIX}__seed-$name" >/dev/null 2>&1 || true
-    "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__seed-$name" --user "$uid:$gid" $(engine_userns) \
-      -v "$(project_dir "$name")/home":/seed:ro -v "$homev":/home \
-      "$(img "$RUNTIME_IMAGE")" \
-      sh -c 'cp -a /seed/. /home/ 2>/dev/null || cp -R /seed/. /home/ 2>/dev/null || true' \
-      >/dev/null 2>&1 || true
-  fi
+  # One ROOT helper: (1) seed the home volume ONLY if it's empty (never clobbers
+  # existing data); (2) fix ownership of any volume whose root isn't our uid —
+  # this self-heals volumes left root-owned by an interrupted run. The `chown -R`
+  # fires ONLY when the owner is wrong, so a populated, correctly-owned volume
+  # (e.g. /databases) is read but never modified.
+  "$ENGINE" rm -f "${CONTAINER_PREFIX}__initvol-$name" >/dev/null 2>&1 || true
+  "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__initvol-$name" -u 0 \
+    -v "$appv":/app -v "$homev":/home -v "$dbv":/databases $seedmount \
+    -e NIXUID="$uid" -e NIXGID="$gid" \
+    "$(img "$RUNTIME_IMAGE")" sh -c '
+      if [ -d /seed ] && [ -z "$(ls -A /home 2>/dev/null)" ]; then
+        cp -a /seed/. /home/ 2>/dev/null || cp -R /seed/. /home/ 2>/dev/null || true
+      fi
+      # Docker Desktop resets an EMPTY named volume back to root on the next
+      # mount, wiping our chown. Drop a .keep so the volume is non-empty and its
+      # ownership sticks. (clone_repo removes /app/.keep before cloning.)
+      [ -z "$(ls -A /app 2>/dev/null)" ]       && : > /app/.keep       2>/dev/null || true
+      [ -z "$(ls -A /databases 2>/dev/null)" ] && : > /databases/.keep 2>/dev/null || true
+      for d in /app /home /databases; do
+        cur=$(stat -c %u "$d" 2>/dev/null || echo -1)
+        [ "$cur" = "$NIXUID" ] || chown -R "$NIXUID:$NIXGID" "$d"
+      done
+    ' >/dev/null 2>&1 || warn "volume init/ownership helper failed for '$name'"
 }
 
 # Generate the /etc/passwd, /etc/group, /etc/shadow that the container runs with.
@@ -951,8 +1081,9 @@ GITCRED
 clone_repo() {
   local url="$1" name="$2"
   require_engine
-  local pdir appv homev; pdir="$(project_dir "$name")"
+  local pdir appv homev appmnt; pdir="$(project_dir "$name")"
   appv="$(app_volume "$name")"; homev="$(home_volume "$name")"
+  appmnt="$(project_app_mount "$name")"   # mount the volume here so git's message matches
 
   if ! store_is_populated; then
     warn "shared store not built yet — skipping clone"
@@ -960,29 +1091,31 @@ clone_repo() {
     return 0
   fi
   ensure_volumes "$name"
-  if [ -n "$("$ENGINE" run --rm -v "$appv":/app "$(img "$RUNTIME_IMAGE")" sh -c 'ls -A /app' 2>/dev/null)" ]; then
+  # Consider the volume empty if it holds nothing but our .keep marker.
+  if [ -n "$("$ENGINE" run --rm -v "$appv":"$appmnt" -e NIXENV_APP_MOUNT="$appmnt" "$(img "$RUNTIME_IMAGE")" sh -c 'ls -A "$NIXENV_APP_MOUNT" | grep -vx .keep' 2>/dev/null)" ]; then
     warn "app volume '$appv' not empty — skipping clone"
     return 0
   fi
 
   write_passwd_files "$pdir"
-  log "Cloning $url → volume '$appv' via $RUNTIME_IMAGE + shared git"
+  log "Cloning $url → volume '$appv' (mounts at $appmnt) via $RUNTIME_IMAGE + shared git"
   "$ENGINE" run --rm \
     --user "$(id -u):$(id -g)" \
     $(engine_userns) \
     -v "$NIX_VOLUME":/nix:ro \
     -v "$homev":/home/"$APP_USER" \
-    -v "$appv":/app \
+    -v "$appv":"$appmnt" \
     -v "$pdir/passwd":/etc/passwd:ro \
     -v "$pdir/group":/etc/group:ro \
     -v "$ENTRYPOINT_FILE":/usr/local/bin/nixenv-entrypoint:ro \
-    -w /app \
+    -w "$appmnt" \
     -e HOME=/home/"$APP_USER" \
     -e PROFILE="$PROFILE" \
     -e APP_USER="$APP_USER" \
+    -e NIXENV_APP_MOUNT="$appmnt" \
     -e GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" \
     "$(img "$RUNTIME_IMAGE")" \
-    sh /usr/local/bin/nixenv-entrypoint git clone "$url" /app
+    sh /usr/local/bin/nixenv-entrypoint sh -c 'rm -f "$NIXENV_APP_MOUNT/.keep" 2>/dev/null; exec git clone "$1" "$NIXENV_APP_MOUNT"' _ "$url"
   ok "cloned into volume '$appv'"
 }
 
@@ -990,15 +1123,16 @@ clone_repo() {
 #   usage: init <project> [git-repo-url]
 cmd_init() {
   local name="${1:-}"
-  [ -n "$name" ] || die "usage: $0 init <project> [git-repo-url] [--build]"
+  [ -n "$name" ] || die "usage: $0 init <project> [git-repo-url] [--build] [--app-path=/path]"
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
   shift
 
-  local git_url="" do_build=0 a
+  local git_url="" do_build=0 app_mount="${APP_MOUNT:-}" a
   for a in "$@"; do
     case "$a" in
       --build) do_build=1;;
-      --*) die "unknown option: $a (usage: $0 init <project> [git-repo-url] [--build])";;
+      --app-path=*) app_mount="${a#*=}";;
+      --*) die "unknown option: $a (usage: $0 init <project> [git-repo-url] [--build] [--app-path=/path])";;
       *) [ -z "$git_url" ] && git_url="$a" || die "unexpected argument: $a";;
     esac
   done
@@ -1006,6 +1140,21 @@ cmd_init() {
   local pdir; pdir="$(project_dir "$name")"
   log "Initialising project '$name' at $pdir"
   mkdir -p "$pdir/home"   # host seed for the home volume (skeleton + git config)
+
+  # Custom code-volume mount path (default /app). Validate it's absolute and not
+  # colliding with a reserved mount, then remember it in <project>/app_mount.
+  if [ -n "$app_mount" ]; then
+    case "$app_mount" in
+      /*) ;;
+      *) die "--app-path must be an absolute path (got '$app_mount')";;
+    esac
+    case "$app_mount" in
+      /|/home|/home/*|/databases|/databases/*|/nix|/nix/*|/etc|/etc/*|/tmp|/tmp/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/root/*|/usr/local/bin*)
+        die "--app-path '$app_mount' collides with a reserved mount — pick another";;
+    esac
+    printf '%s' "$app_mount" > "$pdir/app_mount"
+    ok "code volume will mount at '$app_mount' (not /app)"
+  fi
 
   # Seed home from the skeleton WITHOUT clobbering existing files.
   if [ -d "$HOME_SKEL" ]; then
@@ -1030,7 +1179,7 @@ cmd_init() {
 
   ok "Project '$name' ready"
   echo "   home → /home/$APP_USER  (volume $(home_volume "$name"); seed: $pdir/home)"
-  echo "   repo → /app             (volume $(app_volume "$name"))"
+  echo "   repo → $(project_app_mount "$name")             (volume $(app_volume "$name"))"
   echo "   db   → /databases       (volume $(db_volume "$name"))"
   echo "   ssh  → host port $port  (connects as '$APP_USER', no key/password)"
   echo "   alias→ ssh $name        (after: $0 ssh-config --install)"
@@ -1187,9 +1336,10 @@ cmd_run() {
   store_is_populated || die "shared profile not found in volume — run '$0 build' first"
   ensure_project "$name"
 
-  local pdir cname appv homev dbv; pdir="$(project_dir "$name")"
+  local pdir cname appv homev dbv appmnt; pdir="$(project_dir "$name")"
   cname="$(container_name "$name")"
   appv="$(app_volume "$name")"; homev="$(home_volume "$name")"; dbv="$(db_volume "$name")"
+  appmnt="$(project_app_mount "$name")"
   [ -f "$ENTRYPOINT_FILE" ] || die "missing entrypoint at $ENTRYPOINT_FILE"
   [ "$#" -eq 0 ] || die "run takes no command — use '$0 shell $name' or '$0 ssh $name'"
 
@@ -1201,6 +1351,10 @@ cmd_run() {
 
   # --- Start a detached container: unprivileged sshd under runit -------------
   local port; port="$(project_port "$name")"
+
+  # Join the shared proxy network so 'nixenv proxy' can route to this container by
+  # name (nixenv-<project>). Created if missing; harmless when the proxy is unused.
+  ensure_proxy_net
 
   # Published ports: ssh (loopback) → in-container $SSHD_PORT, + <project>/ports.
   # Each ports line: "8080" → 127.0.0.1:8080:8080, or a full spec like
@@ -1218,21 +1372,35 @@ cmd_run() {
     done < "$pdir/ports"
   fi
 
+  # Custom /etc/hosts: give the container a writable /etc/hosts we own (a host
+  # file created here), so the non-root entrypoint can rebuild it on every start
+  # as base lines + hostname + two optional sources it merges in-container:
+  #   * the project flake's declared entries (its profile's etc/hosts.extra) —
+  #     read from the per-project profile already on NIXENV_EXTRA_PROFILE;
+  #   * <project>/hosts.extra (host-side, local-only) — bind-mounted here if present.
+  # With neither source it's just the base entries (equivalent to the default).
+  local hostsmount
+  touch "$pdir/etc-hosts"   # writable placeholder owned by us; entrypoint fills it
+  hostsmount="-v $pdir/etc-hosts:/etc/hosts"
+  [ -f "$pdir/hosts.extra" ] && hostsmount="$hostsmount -v $pdir/hosts.extra:/etc/hosts.extra:ro"
+
   if container_running "$cname"; then
     ok "Project '$name' already running as '$cname'"
   else
     container_exists "$cname" && "$ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
-    log "Starting service '$cname' ($RUNTIME_IMAGE) as uid $(id -u) — sshd on 127.0.0.1:$port, volumes $appv → /app, $homev → /home/$APP_USER"
+    log "Starting service '$cname' ($RUNTIME_IMAGE) as uid $(id -u) — sshd on 127.0.0.1:$port, volumes $appv → $appmnt, $homev → /home/$APP_USER"
     "$ENGINE" run -d \
       --name "$cname" \
       --hostname "$name" \
+      --network "$PROXY_NET" \
       --user "$(id -u):$(id -g)" \
       $(engine_userns) \
       --sysctl net.ipv4.ping_group_range="0 2147483647" \
       "${pub[@]}" \
+      $hostsmount \
       -v "$NIX_VOLUME":/nix:ro \
       -v "$homev":/home/"$APP_USER" \
-      -v "$appv":/app \
+      -v "$appv":"$appmnt" \
       -v "$dbv":/databases \
       -v "$pdir/passwd":/etc/passwd:ro \
       -v "$pdir/group":/etc/group:ro \
@@ -1240,21 +1408,29 @@ cmd_run() {
       -v "$CLAUDE_DIR":/home/"$APP_USER"/.claude \
       -v "$CLAUDE_JSON":/home/"$APP_USER"/.claude.json \
       -v "$ENTRYPOINT_FILE":/usr/local/bin/nixenv-entrypoint:ro \
-      -w /app \
+      -w "$appmnt" \
       -e HOME=/home/"$APP_USER" \
       -e PROFILE="$PROFILE" \
       -e APP_USER="$APP_USER" \
       -e SSHD_PORT="$SSHD_PORT" \
       -e NIXENV_PROJECT="$name" \
+      -e NIXENV_APP_MOUNT="$appmnt" \
       -e NIXENV_EXTRA_PROFILE="$(project_profile "$name")" \
       "$(img "$RUNTIME_IMAGE")" \
       sh /usr/local/bin/nixenv-entrypoint >/dev/null
     ok "Started '$cname'"
   fi
+  ensure_proxy_running   # bring the shared proxy up on first project start
   echo "   ssh:    ssh -p $port $APP_USER@127.0.0.1   (or: $0 ssh $name)"
   echo "   shell:  $0 shell $name   ($ENGINE exec, no key needed)"
+  if [ "$PROXY_AUTOSTART" = 1 ] && container_running "$PROXY_NAME"; then
+    echo "   proxy:  https://$name-<port>.$PROXY_DOMAIN/   (via '$PROXY_NAME')"
+  fi
   if [ -f "$pdir/ports" ] && grep -q '[^[:space:]]' "$pdir/ports" 2>/dev/null; then
     echo "   ports:  $(grep -v '^[[:space:]]*#' "$pdir/ports" | tr -s '[:space:]' ' ')"
+  fi
+  if [ -f "$pdir/hosts.extra" ] && grep -q '[^[:space:]]' "$pdir/hosts.extra" 2>/dev/null; then
+    echo "   hosts:  merged /etc/hosts.extra ($(grep -vc '^[[:space:]]*#' "$pdir/hosts.extra") entries)"
   fi
   echo "   stop:   $0 stop $name"
 }
@@ -1294,6 +1470,217 @@ cmd_expose() {
   else
     log "ports saved — they apply on the next '$0 run $name'"
   fi
+}
+
+# =============================================================================
+# host — convenience: append /etc/hosts entries to <project>/hosts.extra (native
+#        /etc/hosts format), then restart to apply. You can equally edit the file
+#        by hand — the entrypoint merges it into /etc/hosts on every start.
+#        Each <entry> is "name:ip" (converted to "ip<TAB>name"). Examples:
+#   db:10.0.0.5        →  10.0.0.5   db
+#   api.local:127.0.0.1
+# =============================================================================
+cmd_host() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: $0 host <project> <name:ip>..."
+  case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  shift
+  [ "$#" -gt 0 ] || die "give at least one 'name:ip' entry"
+  local pdir; pdir="$(project_dir "$name")"
+  [ -d "$pdir" ] || die "unknown project '$name' — run '$0 init $name' first"
+
+  local hf="$pdir/hosts.extra" h nm ip line
+  touch "$hf"
+  for h in "$@"; do
+    h="$(printf '%s' "$h" | tr -d '[:space:]')"
+    [ -n "$h" ] || continue
+    case "$h" in *:*) ;; *) die "invalid entry '$h' — expected name:ip";; esac
+    nm="${h%%:*}"; ip="${h#*:}"
+    [ -n "$nm" ] && [ -n "$ip" ] || die "invalid entry '$h' — expected name:ip"
+    line="$(printf '%s\t%s' "$ip" "$nm")"
+    if grep -qxF "$line" "$hf" 2>/dev/null; then
+      warn "already listed: $line"
+    else
+      printf '%s\n' "$line" >> "$hf"; ok "added host: $ip $nm"
+    fi
+  done
+
+  if resolve_engine 2>/dev/null && container_running "$(container_name "$name")"; then
+    warn "restarting '$name' to apply the new hosts"
+    cmd_stop "$name" >/dev/null 2>&1 || true
+    cmd_run "$name"
+  else
+    log "hosts saved — they apply on the next '$0 run $name'"
+  fi
+}
+
+# =============================================================================
+# proxy — a shared Caddy reverse proxy for all projects. Routes
+#   https://<project>-<port>.<PROXY_DOMAIN>/  →  nixenv-<project>:<port>
+# over the shared user network. TLS uses a trusted wildcard cert when `mkcert`
+# is installed, else Caddy's internal CA. Caddy binds 8080/8443 in-container
+# (non-root); the host publish maps PROXY_HTTP_PORT/PROXY_HTTPS_PORT onto them.
+# =============================================================================
+
+# Issue a trusted wildcard cert with mkcert if available (into $PROXY_DIR/certs).
+# Returns 0 when a cert is ready, 1 to signal "use Caddy internal CA".
+#
+# The only step that can prompt for a password is 'mkcert -install', which adds
+# mkcert's local CA to your OS/browser trust stores. We ONLY run it when the CA
+# isn't already installed, and we print exactly what it does first. Skip it with
+# PROXY_MKCERT_INSTALL=0 (HTTPS still works, browser shows a warning). The
+# auto-start on 'run' defaults PROXY_MKCERT_INSTALL=0 so 'run' never prompts.
+proxy_make_cert() {
+  have mkcert || {
+    log "mkcert not found — using Caddy's internal CA (browsers warn until trusted)"
+    log "  for trusted certs:  brew install mkcert nss, then re-run '$0 proxy up'"
+    return 1
+  }
+  mkdir -p "$PROXY_DIR/certs"
+
+  # Only touch trust stores (the part that may ask for a password) when mkcert's
+  # local CA doesn't exist yet. If it's already there, -install is a silent no-op.
+  local caroot; caroot="$(mkcert -CAROOT 2>/dev/null || true)"
+  if [ -n "$caroot" ] && [ -f "$caroot/rootCA.pem" ]; then
+    :   # CA already installed — no prompt, nothing to explain
+  elif [ "${PROXY_MKCERT_INSTALL:-1}" = 1 ]; then
+    echo
+    warn "About to run 'mkcert -install' — a ONE-TIME step that may ask for your password."
+    log  "What it does (nothing leaves this machine):"
+    log  "  • creates a local Certificate Authority under ${caroot:-the mkcert CA dir}"
+    log  "  • adds that CA to your OS trust store (macOS keychain / Linux ca-certificates)"
+    log  "    and to Firefox/Chrome — THIS is the step that may prompt for sudo/keychain"
+    log  "  • lets your browser trust https://*.$PROXY_DOMAIN with no warning"
+    log  "Don't want the script to do it? Any of these instead:"
+    log  "  • press Ctrl-C now, run 'mkcert -install' yourself, then re-run '$0 proxy up'"
+    log  "  • run:  PROXY_MKCERT_INSTALL=0 $0 proxy up   (skip trusting; HTTPS still works,"
+    log  "    with a browser warning — or Caddy's internal CA if no cert is made)"
+    echo
+    mkcert -install || warn "mkcert -install failed — the cert may be untrusted"
+  else
+    log "PROXY_MKCERT_INSTALL=0 — not installing mkcert's CA (HTTPS will be untrusted)"
+  fi
+
+  if mkcert -cert-file "$PROXY_DIR/certs/wildcard.pem" -key-file "$PROXY_DIR/certs/wildcard-key.pem" \
+       "*.$PROXY_DOMAIN" "$PROXY_DOMAIN" >/dev/null 2>&1; then
+    ok "issued wildcard cert for *.$PROXY_DOMAIN (mkcert)"; return 0
+  fi
+  warn "mkcert could not issue the wildcard cert — falling back to Caddy internal CA"; return 1
+}
+
+# Write $PROXY_DIR/Caddyfile. $1=1 → use the mkcert wildcard cert, else internal.
+write_caddyfile() {
+  local tls_line dom_re
+  mkdir -p "$PROXY_DIR"
+  dom_re="$(printf '%s' "$PROXY_DOMAIN" | sed 's/\./\\./g')"
+  if [ "${1:-0}" = 1 ]; then
+    tls_line="tls /certs/wildcard.pem /certs/wildcard-key.pem"
+  else
+    tls_line="tls internal"
+  fi
+  # Unquoted heredoc: $vars expand; Caddy's {re.route.N}/{host} have no $ so stay
+  # literal; \. and \$ are preserved/reduced to regex-correct forms.
+  cat > "$PROXY_DIR/Caddyfile" <<CADDY
+{
+	http_port 8080
+	https_port 8443
+}
+
+*.$PROXY_DOMAIN {
+	$tls_line
+	@route header_regexp route Host ^(.+)-([0-9]+)\.$dom_re(:[0-9]+)?\$
+	handle @route {
+		reverse_proxy nixenv-{re.route.1}:{re.route.2} {
+			# Caddy already adds X-Forwarded-For/Proto/Host; make the TLS-terminated
+			# scheme explicit (443 is mapped to caddy's 8443) and add a couple more
+			# so backends (e.g. Symfony behind trusted_proxies) generate https URLs.
+			header_up X-Forwarded-Proto https
+			header_up X-Forwarded-Port 443
+			header_up X-Real-IP {http.request.remote.host}
+		}
+	}
+	handle {
+		respond "nixenv proxy: no route for {host} — use <project>-<port>.$PROXY_DOMAIN" 502
+	}
+}
+CADDY
+}
+
+cmd_proxy() {
+  require_engine
+  local sub="${1:-up}"
+  case "$sub" in
+    up|start|restart)
+      volume_exists && store_is_populated || die "shared store not built — run '$0 build' first (caddy comes from it)"
+      ensure_proxy_net
+      mkdir -p "$PROXY_DIR/data"
+      local cert=0; proxy_make_cert && cert=1 || cert=0
+      write_caddyfile "$cert"
+      local certmount=""
+      [ "$cert" = 1 ] && certmount="-v $PROXY_DIR/certs:/certs:ro"
+      "$ENGINE" rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
+      log "Starting proxy '$PROXY_NAME' — *.$PROXY_DOMAIN on 127.0.0.1:$PROXY_HTTP_PORT/$PROXY_HTTPS_PORT"
+      "$ENGINE" run -d \
+        --name "$PROXY_NAME" \
+        --network "$PROXY_NET" \
+        --user "$(id -u):$(id -g)" \
+        $(engine_userns) \
+        -p "127.0.0.1:$PROXY_HTTP_PORT:8080" \
+        -p "127.0.0.1:$PROXY_HTTPS_PORT:8443" \
+        -v "$NIX_VOLUME":/nix:ro \
+        -v "$PROXY_DIR/Caddyfile":/etc/caddy/Caddyfile:ro \
+        $certmount \
+        -v "$PROXY_DIR/data":/data \
+        -e HOME=/data -e XDG_DATA_HOME=/data -e XDG_CONFIG_HOME=/data/config \
+        -w /data \
+        "$(img "$RUNTIME_IMAGE")" \
+        "$PROFILE/bin/caddy" run --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null \
+        || die "failed to start proxy container"
+      ok "proxy running as '$PROXY_NAME'"
+      echo "   scheme: https://<project>-<port>.$PROXY_DOMAIN/   (e.g. https://myapp-3000.$PROXY_DOMAIN/)"
+      if [ "$cert" = 1 ]; then echo "   tls:    trusted wildcard cert via mkcert"
+      else echo "   tls:    Caddy internal CA (browser warning until you install/trust mkcert)"; fi
+      echo "   net:    $PROXY_NET  (projects auto-join on '$0 run')"
+      echo "   note:   *.localhost auto-resolves to 127.0.0.1 in Chrome/Firefox (Safari needs an /etc/hosts line)"
+      ;;
+    stop|down)
+      "$ENGINE" rm -f "$PROXY_NAME" >/dev/null 2>&1 && ok "proxy stopped" || log "proxy not running"
+      ;;
+    status)
+      if container_running "$PROXY_NAME"; then ok "proxy running as '$PROXY_NAME'"
+      else warn "proxy not running — start with '$0 proxy up'"; fi
+      echo "   domain: *.$PROXY_DOMAIN → nixenv-<project>:<port>"
+      echo "   net:    $PROXY_NET"
+      if [ -f "$PROXY_DIR/certs/wildcard.pem" ]; then
+        echo "   tls:    mkcert wildcard cert at $PROXY_DIR/certs/wildcard.pem"
+      else
+        echo "   tls:    Caddy internal CA (no mkcert wildcard cert present)"
+      fi
+      "$ENGINE" ps --filter "network=$PROXY_NET" --format '   on-net: {{.Names}}' 2>/dev/null || true
+      ;;
+    renew)
+      # Reissue the wildcard cert: drop the old files and let 'up' regenerate +
+      # reload. The CA is already installed, so this does NOT prompt.
+      rm -f "$PROXY_DIR/certs/wildcard.pem" "$PROXY_DIR/certs/wildcard-key.pem"
+      log "removed the old wildcard cert — reissuing and reloading the proxy"
+      cmd_proxy up
+      ;;
+    remove-cert|rm-cert)
+      # Remove just nixenv's cert files → next 'up' falls back to Caddy internal CA.
+      # This does NOT touch mkcert's CA (which may sign your other certs).
+      rm -f "$PROXY_DIR/certs/wildcard.pem" "$PROXY_DIR/certs/wildcard-key.pem"
+      ok "removed nixenv's wildcard cert from $PROXY_DIR/certs"
+      log "run '$0 proxy up' to restart on Caddy's internal CA"
+      if have mkcert; then
+        log "to ALSO remove mkcert's local CA from your trust stores (affects ALL your"
+        log "mkcert certs, may ask for your password), run yourself:  mkcert -uninstall"
+      fi
+      ;;
+    logs)
+      exec "$ENGINE" logs -f "$PROXY_NAME"
+      ;;
+    *) die "usage: $0 proxy [up|stop|status|logs|renew|remove-cert]";;
+  esac
 }
 
 # =============================================================================
@@ -1367,13 +1754,14 @@ cmd_shell() {
   local name="${1:-}"; [ -n "$name" ] || die "usage: $0 shell <project>"
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
 
-  local cname; cname="$(container_name "$name")"
+  local cname appmnt; cname="$(container_name "$name")"
+  appmnt="$(project_app_mount "$name")"
   container_running "$cname" || cmd_run "$name"
 
   # No -u: the container already runs as our uid, so exec inherits it. (Passing
   # -u app would need 'app' resolvable in the daemon's view of /etc/passwd, which
   # a bind-mounted passwd isn't, reliably.)
-  exec "$ENGINE" exec -it -w /app \
+  exec "$ENGINE" exec -it -w "$appmnt" \
     -e HOME="/home/$APP_USER" -e TERM="${TERM:-xterm-256color}" \
     "$cname" "$PROFILE/bin/zsh" -l
 }
@@ -1456,6 +1844,84 @@ cmd_delete() {
   fi
   rm -rf "$pdir"
   ok "Deleted project '$name'"
+}
+
+# =============================================================================
+# sync-home — refresh a project's home config into an EXISTING home volume.
+#   Layers, in order, WITHOUT touching installed nvim plugins, shell history, or
+#   the generated git identity/credentials:
+#     1. the embedded skeleton (nvim init.lua, .zshrc, .gitconfig, starship.toml,
+#        .vimrc, .ssh/config) — the shared defaults;
+#     2. project-specific overrides committed in the repo at <repo>/.nixenv/home/
+#        (e.g. .nixenv/home/.config/nvim/init.lua), which win over the skeleton.
+#   Any file it overwrites is backed up in the volume at
+#   ~/.nixenv/home-backups/<timestamp> first. Also refreshes the host seed so a
+#   future from-empty re-seed carries the same skeleton.
+# =============================================================================
+cmd_sync_home() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: $0 sync-home <project>"
+  case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  resolve_engine
+
+  local pdir homev appv
+  pdir="$(project_dir "$name")"; homev="$(home_volume "$name")"; appv="$(app_volume "$name")"
+  [ -d "$pdir" ]      || die "unknown project '$name' — run '$0 init $name' first"
+  [ -d "$HOME_SKEL" ] || die "no home skeleton at $HOME_SKEL"
+
+  # 1. Refresh the HOST seed (overwrite managed dotfiles; git identity/creds are
+  #    NOT part of the skeleton, so they're left alone).
+  cp -R "$HOME_SKEL/." "$pdir/home/" 2>/dev/null || true
+  chmod 700 "$pdir/home/.ssh" 2>/dev/null || true
+  find "$pdir/home/.ssh" -type f -exec chmod 600 {} \; 2>/dev/null || true
+
+  log "This refreshes '$name' home config, layering:"
+  echo "   1. embedded skeleton:"
+  ( cd "$HOME_SKEL" && find . -type f | sed 's#^\./#        ~/#' | sort )
+  echo "   2. per-project overrides from <repo>/.nixenv/home/  (if present, win over 1)"
+  warn "Matching files in the home volume will be OVERWRITTEN (backed up first)."
+  warn "Installed nvim plugins, shell history, and git credentials are untouched."
+  printf 'Proceed? [y/N] '
+  local ans=""; read -r ans || true
+  case "$ans" in [yY]|[yY][eE][sS]) ;; *) warn "Aborted — nothing changed"; return 0 ;; esac
+
+  ensure_volumes "$name"   # create + seed if the volume is new/empty
+
+  # 2. Layer skeleton then repo overrides into the volume via a ROOT helper:
+  #    back up each file we're about to overwrite (original version, once), copy
+  #    each source in order, then chown the written paths (and backup) to our uid.
+  #    The app volume is mounted read-only so /app/.nixenv/home/ can override.
+  local uid gid ts; uid="$(id -u)"; gid="$(id -g)"; ts="$(date +%Y%m%d-%H%M%S)"
+  "$ENGINE" rm -f "${CONTAINER_PREFIX}__synchome-$name" >/dev/null 2>&1 || true
+  "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__synchome-$name" -u 0 \
+    -v "$homev":/home -v "$HOME_SKEL":/seed:ro -v "$appv":/app:ro \
+    -e NIXUID="$uid" -e NIXGID="$gid" -e TS="$ts" \
+    "$(img "$RUNTIME_IMAGE")" sh -c '
+      set -e
+      bk="/home/.nixenv/home-backups/$TS"
+      for src in /seed /app/.nixenv/home; do
+        [ -d "$src" ] || continue
+        ( cd "$src" && find . -type f ) | while IFS= read -r f; do
+          rel=${f#./}
+          # Back up the ORIGINAL file once (skip if an earlier layer already did).
+          if [ -e "/home/$rel" ] && [ ! -e "$bk/$rel" ]; then
+            mkdir -p "$bk/$(dirname "$rel")"
+            cp -a "/home/$rel" "$bk/$rel" 2>/dev/null || true
+          fi
+        done
+        cp -a "$src"/. /home/
+        find "$src" -mindepth 1 | while IFS= read -r f; do
+          rel=${f#"$src"/}
+          chown "$NIXUID:$NIXGID" "/home/$rel" 2>/dev/null || true
+        done
+      done
+      [ -d "$bk" ] && chown -R "$NIXUID:$NIXGID" /home/.nixenv 2>/dev/null || true
+      :
+    ' >/dev/null 2>&1 || die "home sync helper failed for '$name'"
+
+  ok "Home config refreshed for '$name'"
+  echo "   backup of overwritten files → ~/.nixenv/home-backups/$ts  (in the home volume)"
+  echo "   open a new shell / relaunch 'nvim' to pick up the changes"
 }
 
 # =============================================================================
@@ -1580,16 +2046,32 @@ Commands:
                             profile, layered on top of the base. Default reads
                             flake.nix from the repo root; --dir=P copies a whole
                             folder (flake.nix + local deps it references)
-  init <project> [git-url] [--build]
+  init <project> [git-url] [--build] [--app-path=/path]
                             Scaffold <project>/home + the <project>_app volume;
                             prompts for git name/email; clones git-url if given;
-                            --build also builds the project's flake
+                            --build also builds the project's flake.
+                            --app-path=/path mounts the code volume there instead
+                            of /app (stored in <project>/app_mount)
   run <project>             Start the project as a background service (sshd under
                             runit); prints the SSH port
   ssh <project>             SSH into the running service (auto-starts it)
   shell <project>           Interactive zsh via the engine's 'exec' (no SSH key)
   expose <project> <port>…  Publish extra port(s) (e.g. 8080 or 3000:3000),
                             stored in <project>/ports; restarts to apply
+  host <project> <name:ip>… Append /etc/hosts entries (e.g. db:10.0.0.5) to
+                            <project>/hosts.extra; the entrypoint merges that file
+                            into /etc/hosts at start. Edit the file by hand too.
+                            Restarts a running project to apply
+  proxy [up|stop|status|logs|renew|remove-cert]
+                            Shared Caddy reverse proxy. 'up' starts it and routes
+                            https://<project>-<port>.$PROXY_DOMAIN → nixenv-<project>:<port>
+                            over network '$PROXY_NET' (projects auto-join on 'run').
+                            Auto-starts on the first 'run' (PROXY_AUTOSTART=0 to skip).
+                            Uses a trusted mkcert wildcard if mkcert is installed
+                            (explains before 'mkcert -install'; PROXY_MKCERT_INSTALL=0
+                            to skip trusting), else Caddy's internal CA.
+                            'renew' reissues the cert; 'remove-cert' deletes it
+                            (falls back to the internal CA)
   ssh-config [--install]    Print (or install) the ~/.ssh/config Include so
                             'ssh <project>' works via each <project>/ssh/config
   up <project>              build if needed, then start the service
@@ -1597,6 +2079,10 @@ Commands:
   logs <project>            Follow the service container logs
   delete <project>          Permanently remove a project (container, code volume,
                             home dir) — prints the commands and asks to confirm
+  sync-home <project>       Refresh home dotfiles into the existing home volume:
+                            embedded templates first, then per-project overrides
+                            from <repo>/.nixenv/home/; backs up overwritten files,
+                            keeps plugins/history/creds
   projects                  List projects with their SSH port and state
   update                    Refresh flake.lock, then rebuild into the volume
   status                    Show context + volume + shared-profile state
@@ -1606,9 +2092,13 @@ Commands:
 
 Per-project (runtime runs as non-root user '$APP_USER'):
   volume <project>_home → /home/$APP_USER  (seeded from <project>/home)
-  volume <project>_app  → /app             (your code; WORKDIR)
+  volume <project>_app  → /app (or <project>/app_mount) — your code; WORKDIR
   <project>/home        → host seed for the home volume (.ssh, .zshrc, configs)
+  <project>/app_mount   → custom container path for the code volume (opt; --app-path)
   <project>/port        → the project's stable random host SSH port
+  <project>/ports       → extra published ports (one per line; via 'expose')
+  <project>/hosts.extra → extra /etc/hosts lines (native "ip name" format), merged
+                          into /etc/hosts at container start (edit by hand or 'host')
 
 SSH: each project gets a random host port (stored once in <project>/port). The
 container runs an unprivileged sshd (port 2222) via runit as '$APP_USER', open
@@ -1627,6 +2117,13 @@ Environment overrides:
   APP_USER=$APP_USER
   INSTALL_DIR=${INSTALL_DIR:-/usr/local/bin}   (install/uninstall target dir)
   INSTALL_NAME=${INSTALL_NAME:-nixenv}         (installed command name)
+  PROXY_DOMAIN=$PROXY_DOMAIN            (base domain for the proxy)
+  PROXY_NET=$PROXY_NET                  (shared user network)
+  PROXY_HTTP_PORT=$PROXY_HTTP_PORT / PROXY_HTTPS_PORT=$PROXY_HTTPS_PORT   (host ports; use 8080/8443 for podman rootless)
+  PROXY_AUTOSTART=$PROXY_AUTOSTART                     (auto-start the proxy on 'run'; 0 to disable)
+  PROXY_MKCERT_INSTALL                        (1=run 'mkcert -install' on explicit 'proxy up';
+                                               0=never trust — HTTPS works with a warning.
+                                               Auto-start on 'run' defaults to 0)
 
 Projects always live in $PROJECTS_DIR.
 
@@ -1634,9 +2131,12 @@ Examples:
   $0 build                                  # populate the volume once
   $0 init myapp                             # scaffold + prompt for git identity
   $0 init myapp git@github.com:me/app.git   # also clone into the app volume
+  $0 init web git@github.com:me/web.git --app-path=/var/www/html   # custom mount
   $0 run myapp                              # start the service (prints SSH port)
   $0 ssh myapp                              # SSH in as 'app'
   $0 shell myapp                            # interactive zsh via engine exec
+  $0 proxy up                               # start the shared reverse proxy
+  # then browse https://myapp-3000.$PROXY_DOMAIN/  (app listening on :3000)
   $0 stop myapp                             # stop the service
 
 Skip the git prompt by exporting GIT_USER_NAME / GIT_USER_EMAIL before init.
@@ -1663,9 +2163,12 @@ main() {
     ssh)      cmd_ssh "$@";;
     ssh-config) cmd_ssh_config "$@";;
     expose)   cmd_expose "$@";;
+    host)     cmd_host "$@";;
+    proxy)    cmd_proxy "$@";;
     stop)     cmd_stop "$@";;
     logs)     cmd_logs "$@";;
     delete|rm) cmd_delete "$@";;
+    sync-home) cmd_sync_home "$@";;
     projects) cmd_projects "$@";;
     update)   cmd_update "$@";;
     status)   cmd_status "$@";;

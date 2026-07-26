@@ -25,7 +25,7 @@ single-quoted heredocs in the `materialize_context()` function:
 - `entrypoint.sh` — runtime container entrypoint (`NIXENV_ENTRYPOINT`)
 - `home-skel/*` — the per-project home template (`.zshrc`, `.gitconfig`,
   `.config/starship.toml`, `.config/nvim/init.lua` (AstroNvim bootstrap),
-  `.tmux.conf`, `.vimrc`, `.ssh/config`)
+  `.vimrc`, `.gitignore`, `.ssh/config`)
 
 On every command run, `materialize_context()` writes these into `$CONTEXT_DIR`
 (default `~/.nixenv/context`) and the build runs from there. There are **no
@@ -58,12 +58,23 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   password for the open SSH login. Code, home, and databases are **named
   volumes** `nixenv_<project>_app` → `/app`, `nixenv_<project>_home` →
   `/home/app`, `nixenv_<project>_databases` → `/databases`
-  (`app_volume`/`home_volume`/`db_volume`). `ensure_volumes` only creates
-  MISSING volumes and **chowns ONLY the freshly-created ones** to your uid via a
-  one-time throwaway root helper (`-u 0 … chown`) — existing volumes are never
-  mounted by the helper, so their data is never touched. A fresh home volume is
-  seeded (copy, non-destructive) from the host seed dir `<project>/home`.
-  `/databases` is empty per-project storage for DB data files. This is
+  (`app_volume`/`home_volume`/`db_volume`). The app volume's container mount path
+  is customisable per project: `init --app-path=/path` (or `APP_MOUNT=`) stores it
+  in `<project>/app_mount` and `project_app_mount` reads it (default `/app`). ONLY
+  the runtime container and its entrypoint honour it — `cmd_run` mounts the volume
+  there (`-v $appv:$appmnt`, `-w $appmnt`, `-e NIXENV_APP_MOUNT`), the entrypoint
+  exports `NIXENV_APP_MOUNT` into `.zshenv` (so ssh/zmx shells `cd` there and
+  service discovery reads `$APP_MOUNT/.nixenv/sv`), and `cmd_shell` uses it as its
+  workdir. The seed/clone/build/sync helpers keep mounting the volume at a
+  throwaway `/app` because the repo lands at the volume root regardless of mount
+  path. `ensure_volumes` creates any missing
+  volume, then a one-time root helper (`-u 0`) seeds a fresh/empty home from
+  `<project>/home`, drops a `.keep` into empty `/app`/`/databases`, and chowns to
+  your uid ONLY when the root isn't already yours (self-heals wrong-owned volumes;
+  correctly-owned data is untouched). The `.keep` matters: **Docker Desktop resets
+  an EMPTY named volume's ownership to root on the next mount**, wiping the chown —
+  a non-empty volume keeps it. `clone_repo` removes `/app/.keep` before cloning and
+  ignores it in the empty-check. `/databases` is empty per-project storage. This is
   what lets a non-root container use named volumes. The entrypoint does NO root
   ops; it writes `.zshenv`, sshd config, host keys, and the runit tree under the
   writable `$HOME`. `init <git-url>` clones into the app volume via the runtime
@@ -91,6 +102,21 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
 - Extra published ports live one-per-line in `<project>/ports` (helper: `expose`
   / read in `cmd_run`). A bare number maps `127.0.0.1:N:N`; a `:`-spec is passed
   to `docker -p` verbatim. The SSH port is always published on `127.0.0.1`.
+- Custom `/etc/hosts` is file-driven, not `--add-host` (which can't change on a
+  live container and, with a bind-mounted `/etc/hosts`, the engine ignores).
+  `cmd_run` always bind-mounts a writable `$pdir/etc-hosts` at `/etc/hosts` (a
+  host file we own) so the non-root **entrypoint** can rebuild it on every start
+  (guarded by `[ -w /etc/hosts ]`). The rebuild = base localhost lines +
+  `127.0.1.1 <hostname>` + two optional sources, in order: (1) the project
+  flake's declared entries, shipped in its profile as
+  `$NIXENV_EXTRA_PROFILE/etc/hosts.extra` (the template uses
+  `pkgs.writeTextDir "etc/hosts.extra" ''…''` in `buildEnv.paths`); (2) the
+  host-side `<project>/hosts.extra` (local-only), bind-mounted at
+  `/etc/hosts.extra:ro` when present. Rebuild-not-append keeps it idempotent, but
+  it does replace the engine's dynamic container-IP line (we substitute
+  `127.0.1.1 <hostname>`). The `host <project> <name:ip>…` helper appends
+  converted `ip<TAB>name` lines to the host-side `hosts.extra`; flake entries are
+  the versioned/team-shared path. `$hostsmount` is an empty-guarded unquoted var.
 - Per-project tooling: `build <project> [--dir=<path>]` (`cmd_build_project`)
   copies the project flake into `<project>/flake/` and
   `nix profile install path:/flake#$PROJECT_ATTR` into `/nix/var/nix/profiles/proj-<name>`
@@ -116,23 +142,62 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   `<project>/ssh/config` (Host
   `<name>`/`<name>.*` → 127.0.0.1:port, `RemoteCommand zmx attach %k`,
   `ControlMaster`), and `ssh-config --install` adds the `Include` glob to
-  `~/.ssh/config` so `ssh <project>` works. `nixenv ssh`/`shell` connect directly
+  `~/.ssh/config` so `ssh <project>` works. `./nixenv.sh ssh`/`shell` connect directly
   (plain zsh, no zmx). The prompt (starship) shows `$NIXENV_PROJECT`,
   `$ZMX_SESSION`, and the hostname (= project name). No zellij anywhere.
 - `run <project>` (no cmd) starts a **detached** service container named
   `<prefix>-<project>` with `-p <project-port>:22`. `ssh`/`shell` auto-start it;
   `shell` uses `docker exec` (no key needed), `ssh` uses the host `ssh` client.
   `stop` removes the container; `logs` follows it.
+- Shared reverse proxy (`cmd_proxy`, `nixenv proxy up|stop|status|logs`): a single
+  `${PREFIX}-proxy` Caddy container (caddy is in the base flake, run from the store)
+  on a shared user network `PROXY_NET` (`nixenv_net`) that every project container
+  auto-joins (`ensure_proxy_net` + `--network` in `cmd_run`). Caddy serves
+  `*.PROXY_DOMAIN` (`nixenv.localhost`), regex-parses `Host` =
+  `<project>-<port>.<domain>` and `reverse_proxy nixenv-{re.route.1}:{re.route.2}`
+  by container name (docker/podman-netavark DNS). It binds 8080/8443 in-container
+  (non-root); host publish maps `PROXY_HTTP_PORT`/`PROXY_HTTPS_PORT` (default 80/443;
+  use 8080/8443 for podman rootless). TLS: `proxy_make_cert` uses `mkcert` ONLY if
+  the binary is present (`have mkcert` → wildcard `*.PROXY_DOMAIN` into
+  `~/.nixenv/proxy/certs`), else `write_caddyfile` emits `tls internal`. It only runs
+  `mkcert -install` (the step that may prompt for a password) when the CA isn't
+  already present, and prints exactly what that does first; `PROXY_MKCERT_INSTALL=0`
+  skips trusting, and the `run` auto-start path forces it to `0` so `run` never
+  prompts (explicit `proxy up` defaults to `1`). `proxy renew` reissues the cert;
+  `proxy remove-cert` deletes nixenv's cert (falls back to internal CA) and prints
+  the `mkcert -uninstall` command rather than running it (it affects all your certs). Caddy data
+  (incl. internal CA) persists in `~/.nixenv/proxy/data`. `*.localhost` auto-resolves
+  to 127.0.0.1 in Chrome/Firefox; Safari needs a hosts line. `cmd_run` auto-starts
+  the proxy on the first project `run` via `ensure_proxy_running` (`PROXY_AUTOSTART=1`
+  default; wrapped in a subshell so a `cmd_proxy` `die` can't fail `run`; no-op when
+  already running).
 
 ## Commands
 
+**Always invoke the tool as `./nixenv.sh <command>` from the repo — not the
+installed `nixenv`.** The installed `/usr/local/bin/nixenv` is a snapshot from
+the last `./nixenv.sh install`; while iterating on `nixenv.sh` it will be stale,
+so all examples and instructions must use `./nixenv.sh`.
+
 `build [project]`, `init <project> [git-url] [--build]`, `run <project>`,
 `ssh <project>`, `ssh-config [--install]`, `shell <project>`,
-`expose <project> <port>…`, `up`, `stop`, `logs`, `delete`/`rm`, `projects`,
-`update`, `status`, `clean`, `install`, `uninstall`. See `./nixenv.sh --help` and
-`README.md`. `delete` prints the commands (container/volume/home removal) and
-prompts before running; `resolve_engine` returns non-zero (not `die`) when no
-engine is found so host-file deletion still works.
+`expose <project> <port>…`, `host <project> <name:ip>…`,
+`proxy [up|stop|status|logs]`, `up`, `stop`, `logs`, `delete`/`rm`,
+`sync-home <project>`, `projects`, `update`, `status`, `clean`, `install`,
+`uninstall`. See `./nixenv.sh --help` and `README.md`. `delete` prints the
+commands (container/volume/home removal) and prompts before running;
+`resolve_engine` returns non-zero (not `die`) when no engine is found so
+host-file deletion still works.
+
+`sync-home <project>` (`cmd_sync_home`) refreshes the home volume's dotfiles
+into an EXISTING volume (the seed→volume copy is otherwise one-time, so template
+edits like the AstroNvim pin don't propagate on their own). It layers, via a root
+helper, the embedded `home-skel` first, then per-project overrides committed at
+`<repo>/.nixenv/home/` (which win), backing up overwritten files to
+`~/.nixenv/home-backups/<ts>` in the volume and leaving nvim plugins, shell
+history, and git identity/credentials untouched. It also refreshes the host seed
+(`<project>/home`) so a from-empty re-seed carries the same skeleton. Mounts the
+app volume read-only to read the repo overrides; asks for confirmation first.
 
 `install`/`uninstall` copy the single self-contained script to `INSTALL_DIR`
 (default `/usr/local/bin`) as `INSTALL_NAME` (default `nixenv`); they run before
