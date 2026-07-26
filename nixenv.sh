@@ -14,9 +14,10 @@
 #   4. A BASIC runtime container (debian:stable-slim) mounts the volume read-only
 #      at /nix, creates a non-root `app` user, and starts zsh + starship.
 #
-# Per-project layout:
-#   <project>/home        → copied into /home/app (.ssh, .zshrc, configs)
-#   docker volume <name>_app → mounted at /app (your code; WORKDIR)
+# Per-project layout (named volumes; <project>/home is only the one-time seed):
+#   volume <prefix>_<name>_app       → /app or <project>/app_mount (code; WORKDIR)
+#   volume <prefix>_<name>_home      → /home/app (dotfiles, nvim, shell history)
+#   volume <prefix>_<name>_databases → /databases (persistent DB data)
 # =============================================================================
 
 set -euo pipefail
@@ -413,12 +414,12 @@ RUN
 chmod +x "$SVROOT/sshd/run"
 
 # --- Project services -------------------------------------------------------
-# A project can ship runit services in its repo at /app/.nixenv/sv/<name>/run
-# (an executable run script that exec's a FOREGROUND process). Each is wrapped
-# into a supervised service that runs as this user, next to sshd. Example for
-# supervisord: /app/.nixenv/sv/supervisord/run containing
+# A project can ship runit services in its repo at <repo>/.nixenv/sv/<name>/run
+# (an executable run script that exec's a FOREGROUND process), discovered at
+# $APP_MOUNT/.nixenv/sv. Each is wrapped into a supervised service that runs as
+# this user, next to sshd. Example for supervisord:
 #   #!/bin/sh
-#   exec supervisord -n -c /app/supervisord.conf
+#   exec supervisord -n -c "$NIXENV_APP_MOUNT/supervisord.conf"
 project_services=""
 if [ -d "$APP_MOUNT/.nixenv/sv" ]; then
   for d in "$APP_MOUNT"/.nixenv/sv/*/; do
@@ -836,6 +837,17 @@ store_is_populated() {
 }
 
 # ── Project helpers ──────────────────────────────────────────────────────────
+# Validate a project name once, at creation: it becomes a container name, volume
+# names, a hostname, and a proxy subdomain, so keep it to a safe charset. Also
+# reserve 'proxy' (its container name would collide with the shared proxy).
+valid_project_name() {
+  case "$1" in
+    proxy) warn "'proxy' is reserved (container name '$PROXY_NAME' is the shared proxy)"; return 1;;
+    ""|*[!a-zA-Z0-9_-]*) warn "project names may only contain letters, digits, '-' and '_'"; return 1;;
+    -*) warn "project names may not start with '-'"; return 1;;
+  esac
+  return 0
+}
 project_dir()     { printf '%s/%s' "$PROJECTS_DIR" "$1"; }
 app_volume()      { printf '%s_%s_app'  "$CONTAINER_PREFIX" "$1"; }   # e.g. nixenv_myapp_app       → /app
 home_volume()     { printf '%s_%s_home' "$CONTAINER_PREFIX" "$1"; }   # e.g. nixenv_myapp_home      → /home/app
@@ -858,7 +870,7 @@ vol_exists()      { "$ENGINE" volume inspect "$1" >/dev/null 2>&1; }
 # the running container is non-root). A freshly-created home volume is seeded
 # from the host seed dir (<project>/home: skeleton + git identity/credentials).
 ensure_volumes() {
-  local name="$1" uid gid pdir appv homev dbv seedmount=""
+  local name="$1" uid gid pdir appv homev dbv
   uid="$(id -u)"; gid="$(id -g)"; pdir="$(project_dir "$name")"
   appv="$(app_volume "$name")"; homev="$(home_volume "$name")"; dbv="$(db_volume "$name")"
 
@@ -867,7 +879,9 @@ ensure_volumes() {
   vol_exists "$homev" || "$ENGINE" volume create "$homev" >/dev/null
   vol_exists "$dbv"   || "$ENGINE" volume create "$dbv"   >/dev/null
 
-  [ -d "$pdir/home" ] && seedmount="-v $pdir/home:/seed:ro"
+  # Array (not a word-split string) so a $HOME with spaces survives quoting.
+  local seedmount; seedmount=()
+  [ -d "$pdir/home" ] && seedmount=(-v "$pdir/home:/seed:ro")
 
   # One ROOT helper: (1) seed the home volume ONLY if it's empty (never clobbers
   # existing data); (2) fix ownership of any volume whose root isn't our uid —
@@ -876,7 +890,8 @@ ensure_volumes() {
   # (e.g. /databases) is read but never modified.
   "$ENGINE" rm -f "${CONTAINER_PREFIX}__initvol-$name" >/dev/null 2>&1 || true
   "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__initvol-$name" -u 0 \
-    -v "$appv":/app -v "$homev":/home -v "$dbv":/databases $seedmount \
+    -v "$appv":/app -v "$homev":/home -v "$dbv":/databases \
+    ${seedmount[@]+"${seedmount[@]}"} \
     -e NIXUID="$uid" -e NIXGID="$gid" \
     "$(img "$RUNTIME_IMAGE")" sh -c '
       if [ -d /seed ] && [ -z "$(ls -A /home 2>/dev/null)" ]; then
@@ -1124,7 +1139,7 @@ clone_repo() {
 cmd_init() {
   local name="${1:-}"
   [ -n "$name" ] || die "usage: $0 init <project> [git-repo-url] [--build] [--app-path=/path]"
-  case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  valid_project_name "$name" || die "invalid project name: '$name'"
   shift
 
   local git_url="" do_build=0 app_mount="${APP_MOUNT:-}" a
@@ -1328,7 +1343,7 @@ cmd_build_project() {
 cmd_run() {
   require_engine
   local name="${1:-}"
-  [ -n "$name" ] || die "usage: $0 run <project> [cmd...]"
+  [ -n "$name" ] || die "usage: $0 run <project>"
   shift
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
 
@@ -1381,8 +1396,8 @@ cmd_run() {
   # With neither source it's just the base entries (equivalent to the default).
   local hostsmount
   touch "$pdir/etc-hosts"   # writable placeholder owned by us; entrypoint fills it
-  hostsmount="-v $pdir/etc-hosts:/etc/hosts"
-  [ -f "$pdir/hosts.extra" ] && hostsmount="$hostsmount -v $pdir/hosts.extra:/etc/hosts.extra:ro"
+  hostsmount=(-v "$pdir/etc-hosts:/etc/hosts")
+  [ -f "$pdir/hosts.extra" ] && hostsmount+=(-v "$pdir/hosts.extra:/etc/hosts.extra:ro")
 
   if container_running "$cname"; then
     ok "Project '$name' already running as '$cname'"
@@ -1397,7 +1412,7 @@ cmd_run() {
       $(engine_userns) \
       --sysctl net.ipv4.ping_group_range="0 2147483647" \
       "${pub[@]}" \
-      $hostsmount \
+      "${hostsmount[@]}" \
       -v "$NIX_VOLUME":/nix:ro \
       -v "$homev":/home/"$APP_USER" \
       -v "$appv":"$appmnt" \
@@ -1495,8 +1510,14 @@ cmd_host() {
     h="$(printf '%s' "$h" | tr -d '[:space:]')"
     [ -n "$h" ] || continue
     case "$h" in *:*) ;; *) die "invalid entry '$h' — expected name:ip";; esac
-    nm="${h%%:*}"; ip="${h#*:}"
+    nm="${h%%:*}"; ip="${h#*:}"   # ip = everything after the FIRST ':' (IPv6-safe)
     [ -n "$nm" ] && [ -n "$ip" ] || die "invalid entry '$h' — expected name:ip"
+    # The ip part must be a literal address: IPv4 (digits/dots) or IPv6 (has ':').
+    # Names like 'host-gateway' are --add-host magic — invalid in a hosts file.
+    case "$ip" in
+      *:*) ;;                                  # IPv6
+      *[!0-9.]*) die "'$ip' is not an IP address (hosts.extra needs literal IPs)";;
+    esac
     line="$(printf '%s\t%s' "$ip" "$nm")"
     if grep -qxF "$line" "$hf" 2>/dev/null; then
       warn "already listed: $line"
@@ -1616,8 +1637,8 @@ cmd_proxy() {
       mkdir -p "$PROXY_DIR/data"
       local cert=0; proxy_make_cert && cert=1 || cert=0
       write_caddyfile "$cert"
-      local certmount=""
-      [ "$cert" = 1 ] && certmount="-v $PROXY_DIR/certs:/certs:ro"
+      local certmount; certmount=()
+      [ "$cert" = 1 ] && certmount=(-v "$PROXY_DIR/certs:/certs:ro")
       "$ENGINE" rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
       log "Starting proxy '$PROXY_NAME' — *.$PROXY_DOMAIN on 127.0.0.1:$PROXY_HTTP_PORT/$PROXY_HTTPS_PORT"
       "$ENGINE" run -d \
@@ -1629,7 +1650,7 @@ cmd_proxy() {
         -p "127.0.0.1:$PROXY_HTTPS_PORT:8443" \
         -v "$NIX_VOLUME":/nix:ro \
         -v "$PROXY_DIR/Caddyfile":/etc/caddy/Caddyfile:ro \
-        $certmount \
+        ${certmount[@]+"${certmount[@]}"} \
         -v "$PROXY_DIR/data":/data \
         -e HOME=/data -e XDG_DATA_HOME=/data -e XDG_CONFIG_HOME=/data/config \
         -w /data \
@@ -1732,12 +1753,12 @@ cmd_projects() {
 
 # =============================================================================
 # up — build (if needed) then run a project
-#   usage: up <project> [cmd...]
+#   usage: up <project>
 # =============================================================================
 cmd_up() {
   require_engine
   local name="${1:-}"
-  [ -n "$name" ] || die "usage: $0 up <project> [cmd...]"
+  [ -n "$name" ] || die "usage: $0 up <project>"
   if store_is_populated 2>/dev/null; then
     ok "Store already populated — skipping build"
   else
@@ -1791,7 +1812,7 @@ cmd_stop() {
   require_engine
   local name="${1:-}"; [ -n "$name" ] || die "usage: $0 stop <project>"
   local cname; cname="$(container_name "$name")"
-  container_exists "$cname" || { warn "'$cname' is not running"; return 0; }
+  container_exists "$cname" || { warn "no container '$cname' (already stopped)"; return 0; }
   "$ENGINE" rm -f "$cname" >/dev/null && ok "Stopped '$cname'"
 }
 
@@ -1821,7 +1842,7 @@ cmd_delete() {
   log "This will PERMANENTLY delete project '$name' by running:"
   if [ -n "$ENGINE" ]; then
     echo "    $ENGINE rm -f $cname"
-    [ -n "$vols" ] && echo "    $ENGINE volume rm$vols   (code + home volumes)"
+    [ -n "$vols" ] && echo "    $ENGINE volume rm$vols   (app + home + databases volumes)"
     echo "    rm -f $prof*   (its extra-tooling profile, inside the store)"
   else
     warn "no container engine detected — its container/volumes won't be removed"
@@ -2077,8 +2098,9 @@ Commands:
   up <project>              build if needed, then start the service
   stop <project>            Stop & remove the project's service container
   logs <project>            Follow the service container logs
-  delete <project>          Permanently remove a project (container, code volume,
-                            home dir) — prints the commands and asks to confirm
+  delete <project>          Permanently remove a project (container; app, home and
+                            databases volumes; host dir) — prints the commands and
+                            asks to confirm
   sync-home <project>       Refresh home dotfiles into the existing home volume:
                             embedded templates first, then per-project overrides
                             from <repo>/.nixenv/home/; backs up overwritten files,
