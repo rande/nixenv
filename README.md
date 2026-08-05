@@ -111,6 +111,9 @@ interactive `zsh` via `docker exec` (no SSH key needed).
   [Exposing ports](#exposing-ports)).
 - `host <project> <name:ip>…` — add custom `/etc/hosts` entries (see
   [Custom /etc/hosts](#custom-etchosts)).
+- `restrict <project> [on|off]` / `allow <project> <host>…` /
+  `egress <project> [-f]` — egress restriction to validated hosts only, ON by
+  default (see [Egress restriction](#egress-restriction-default-validated-hosts-only)).
 - `proxy [up|stop|status|logs|renew|remove-cert]` — shared HTTPS reverse proxy
   for all projects (see [Reverse proxy](#reverse-proxy-httpsproject-portnixenvlocalhost)).
 - `up <project>` — build if needed, then start the service.
@@ -264,6 +267,101 @@ base entries plus two optional sources, in order:
 Entries apply on the next container start (`host` restarts a running project
 for you). This is file-driven rather than `--add-host` so it's declarative,
 idempotent, and works with the non-root container.
+
+## Egress restriction (default): validated hosts only
+
+Every project's **outbound** network is locked down **by default** to a
+validated set of hosts — deny-everything-else. The forge domain from the clone
+URL is validated automatically at `init`, so git keeps working out of the box:
+
+```sh
+./nixenv.sh init myapp https://gitlab.example.com/team/app.git
+#   → gitlab.example.com auto-allowed; everything else denied
+./nixenv.sh restrict myapp off        # opt OUT (full internet access)
+./nixenv.sh restrict myapp on         # re-enable (the default)
+./nixenv.sh init open-project --unrestricted   # opt out at creation
+```
+
+How it works: the restricted project runs on its own **internal** network — the
+kernel gives it *no route to the internet at all* — and its only way out is a
+**squid** allowlist proxy (default-deny) running inside the shared proxy
+container. Enforcement is the missing route; squid is just policy, so nothing
+in the container can bypass the list. `HTTP(S)_PROXY` is exported automatically
+(npm, pip, composer, cargo, curl, git-https, the Claude CLI all honour it), and
+ssh is routed through the proxy's CONNECT tunnel via a `ProxyCommand` added to
+the container's `~/.ssh/config` — so `git@…` remotes to **validated** forges
+keep working. SSH into the project and its declared ports keep working too
+(they're relayed through the proxy container).
+
+The allowlist lives at `~/.nixenv/projects/<name>/allowed_hosts`, one entry per
+line. Matching is **exact** by default; prefix with a dot (or `*.`) to include
+subdomains, and bare IPs are also accepted:
+
+```
+gitlab.example.com      # exactly this host
+.yarnpkg.com          # yarnpkg.com AND every subdomain (classic.yarnpkg.com, …)
+10.0.0.5              # a literal IP
+```
+
+`init` **seeds the forge domain from the clone URL automatically**; projects
+created before this feature have an empty list, so `allow` their forge before
+pulling. Manage it from the host:
+
+```sh
+./nixenv.sh allow myapp registry.npmjs.org api.stripe.com   # add + reload
+./nixenv.sh egress myapp                                    # allowed vs DENIED domains
+./nixenv.sh egress myapp -f                                 # follow live
+```
+
+`egress` reads squid's access log, so the DENIED section is your worklist:
+run the project, watch what gets blocked, `allow` what's legitimate. Limits to
+know: UDP (QUIC) isn't proxied (tools fall back to TCP); DNS *resolution* still
+works for any name (data can't flow, but lookups aren't blocked); proxy-less
+raw-TCP clients can't reach external services (use ssh/CONNECT-capable paths);
+and the CONNECT ports are limited to 443/22/80/9418.
+
+### Allowlist cheatsheet (tools in the base toolchain + VS Code)
+
+Copy the lines for the package managers your project actually uses (replace
+`myapp`). All of these honour the proxy env automatically:
+
+```sh
+# git over HTTPS to GitHub (your own forge is seeded by init);
+# release-assets serves GitHub Releases downloads
+./nixenv.sh allow myapp github.com release-assets.githubusercontent.com
+
+# npm / npx / pnpm
+./nixenv.sh allow myapp registry.npmjs.org
+
+# yarn
+./nixenv.sh allow myapp registry.yarnpkg.com
+
+# Composer (PHP) — packagist metadata + GitHub-hosted dists
+./nixenv.sh allow myapp repo.packagist.org api.github.com codeload.github.com github.com
+
+# pip / uv (Python)
+./nixenv.sh allow myapp pypi.org files.pythonhosted.org
+
+# cargo (Rust) — sparse index + crate downloads; rustup toolchains
+./nixenv.sh allow myapp index.crates.io static.crates.io crates.io static.rust-lang.org
+
+# go modules
+./nixenv.sh allow myapp proxy.golang.org sum.golang.org
+
+# Claude CLI (platform.claude.com serves OAuth login/token refresh)
+./nixenv.sh allow myapp api.anthropic.com statsig.anthropic.com platform.claude.com
+
+# Neovim / AstroNvim first launch (lazy.nvim clones plugins from GitHub)
+./nixenv.sh allow myapp github.com
+
+# VS Code Remote-SSH — server download + extension marketplace
+./nixenv.sh allow myapp update.code.visualstudio.com vscode.download.prss.microsoft.com marketplace.visualstudio.com .vsassets.io
+```
+
+(VS Code alternative needing no allowlist: set
+`"remote.SSH.localServerDownload": "always"` so your local VS Code uploads the
+server over ssh.) For anything not listed, run the tool once and read the
+DENIED section of `./nixenv.sh egress myapp` — it names the exact domains.
 
 ## Updating dotfiles (`sync-home`)
 
@@ -427,7 +525,19 @@ container recreation):
 Both are created automatically on first `run`. `~/.claude.json` lives in the
 home root (not inside `.claude`), so it's shared as its own file; if it's ever
 missing, the newest backup from the shared `.claude/backups/` is restored
-automatically. (If you saw a "Claude configuration file not found" warning, it
+automatically.
+
+**Session transcripts are per-project**: while credentials/settings are shared,
+`.claude/projects` is overlaid with a per-project directory, so every session's
+JSONL transcript is reviewable on the host at
+
+```
+~/.nixenv/claude/projects/nixenv-<project>/<encoded-cwd>/<session-id>.jsonl
+```
+
+(without this, all projects using the same in-container path would interleave
+their transcripts in one folder). Transcripts are auto-pruned after ~30 days;
+raise `"cleanupPeriodDays"` in `~/.nixenv/claude/settings.json` to keep them. (If you saw a "Claude configuration file not found" warning, it
 was because only `.claude` was shared before — this resolves it.)
 
 ## Configuration
@@ -451,8 +561,35 @@ Override via environment variables:
   `nixenv_net`), `PROXY_HTTP_PORT` / `PROXY_HTTPS_PORT` (default 80/443; use
   8080/8443 for rootless Podman), `PROXY_AUTOSTART` (default 1; 0 = don't start
   the proxy on `run`), `PROXY_MKCERT_INSTALL` (0 = never run `mkcert -install`).
+- `EGRESS_PORT` (default 3128) — squid's port inside the proxy container (not
+  published; used by restricted projects).
 
 Projects always live in `~/.nixenv/projects` (not configurable).
+
+## Testing
+
+The test suite lives in `tests/` — **one bash file per test**, a shared
+`tests/lib.sh` harness, and a runner. Exit codes: 0 pass, 77 skip, else fail.
+
+```sh
+./tests/run.sh                    # unit tests — pure logic, no docker needed
+./tests/run.sh integration        # end-to-end against a real engine (DEDICATED env!)
+./tests/run.sh all                # both
+./tests/run-in-docker.sh          # the whole suite inside docker-in-docker —
+                                  # touches nothing on your machine
+NIXTEST_HEAVY=1 ./tests/run.sh integration   # include the slow flake-build test
+```
+
+Unit tests source `nixenv.sh` (functions only, nothing executes) and verify all
+pure logic: URL/name/ACL parsing, Caddyfile/squid/start.sh generation, the
+entrypoint's feature hooks, allowlist semantics. Integration tests exercise the
+real flows — init/volumes/run/ssh/app-path/hosts/proxy routing/egress
+deny+allow/sync-home/expose/delete — using an isolated prefix (`nxt-*`
+containers, volumes, networks) and isolated state dirs; they sweep everything
+prefixed before and after each test, and reuse the shared nix store volume
+(test `00` builds it if missing). `run-in-docker.sh` wraps all of that in a
+disposable privileged DinD container with a named cache volume
+(`nixenv-dind-cache`) so repeat runs skip the store build.
 
 ## Notes
 

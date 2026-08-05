@@ -98,7 +98,19 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   `runsv` (by **absolute** path) as PID 1. `flake.nix` includes `openssh` and
   `runit`. We use `runsv <dir>` rather than `runsvdir`, because `runsvdir` spawns
   its `runsv` children via `PATH` and that lookup fails here; exec'ing `runsv`
-  directly avoids it. `run` maps the project's random host port → 2222.
+  directly avoids it. Project services: the entrypoint refreshes repo-declared
+  `$APP_MOUNT/.nixenv/sv/*` into `$HOME/.nixenv-sv` (persistent, in the home
+  volume), then starts a background `runsv` for EVERY service dir present in the
+  tree (not just repo-discovered ones — a dir installed there directly, e.g. by a
+  project setup script, is supervised too). Remove a service by deleting its
+  `$HOME/.nixenv-sv/<name>` dir. **Startup hooks**: before the supervise scan (so
+  hooks can add services for the same boot), the entrypoint sources every hook
+  file that exists — `$NIXENV_EXTRA_PROFILE/etc/nixenv-hooks.sh` (flake-declared),
+  `$APP_MOUNT/.nixenv/hooks.sh` (repo), `$HOME/.nixenv-hooks.sh` (local) — then
+  calls `nixenv_pre_ssh_start` if defined. Failures warn, never block startup.
+  This is the ONLY way to run project code at container start: a flake build is
+  sandboxed to its `$out`, so it can't write `$HOME`/`$SVROOT` — declare the hook
+  at build time (`writeTextDir "etc/nixenv-hooks.sh"`), execute at runtime. `run` maps the project's random host port → 2222.
 - Extra published ports live one-per-line in `<project>/ports` (helper: `expose`
   / read in `cmd_run`). A bare number maps `127.0.0.1:N:N`; a `:`-spec is passed
   to `docker -p` verbatim. The SSH port is always published on `127.0.0.1`.
@@ -149,6 +161,40 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   `<prefix>-<project>` with `-p <project-port>:22`. `ssh`/`shell` auto-start it;
   `shell` uses `docker exec` (no key needed), `ssh` uses the host `ssh` client.
   `stop` removes the container; `logs` follows it.
+- Egress restriction (ON BY DEFAULT; opt-out per project): restriction applies
+  unless the `<project>/unrestricted` marker exists (`restrict <p> off` or
+  `init --unrestricted` create it; `restrict <p> on` removes it; `is_restricted`
+  = marker absent). `<project>/allowed_hosts` holds the validated hosts
+  (domains/IPs, one per line; `allow <p> <host>…` appends; `cmd_init` auto-seeds
+  the forge domain via `forge_host_from_url`, so git-to-forge works by default). A restricted project runs on its
+  own `--internal` network `nixenv_<p>_egress` (`internal_net`/`ensure_internal_net`)
+  — kernel-enforced no-route-out — with NO published ports (`-p` doesn't work on
+  internal networks); its ssh/extra ports are published by the PROXY container and
+  socat-relayed over the internal net. The only way out is a single shared
+  **squid** (in the base flake, running inside the proxy container on
+  `EGRESS_PORT` 3128, not published) with per-project ACLs keyed by the internal
+  net's subnet (`net_subnet` — docker `.IPAM.Config` / podman `.Subnets`),
+  default-deny, CONNECT limited to 443/22/80/9418, and denies to
+  loopback/RFC1918 so projects can't reach other containers through the proxy.
+  `write_egress_configs` generates `~/.nixenv/proxy/egress/{squid.conf,start.sh}`
+  (start.sh = squid + socat relays + exec caddy — the proxy container's cmd) and
+  fills `EGRESS_PUB`/`EGRESS_PROJECTS`; `cmd_proxy up` mounts it at `/etc/egress`,
+  publishes the relay ports, and `network connect`s the proxy to every restricted
+  project's internal net (so caddy ingress keeps working too). `cmd_run` passes
+  `-e NIXENV_EGRESS_PROXY=http://<proxy>:3128`; the **entrypoint** then exports
+  HTTP(S)_PROXY into `.zshenv` and appends a marker-guarded `ProxyCommand socat -
+  PROXY:…` block to `~/.ssh/config` (ssh/git-ssh tunnel via CONNECT to validated
+  hosts). Starting a restricted
+  project recreates the proxy (new relays/ports need a new container), but
+  `allow` HOT-reloads ACLs via `squid -k reconfigure` (no proxy recreate — which
+  is also why `write_egress_configs` must never `rm -rf` the bind-mounted egress
+  dir: replacing the dir inode would detach the mount and reloads would read
+  stale config). Squid's access log is host-visible at
+  `~/.nixenv/proxy/data/egress.log`; `egress <p> [-f]` summarises allowed vs
+  `TCP_DENIED` domains (filtered by the project's subnet). `delete` also removes
+  the internal network (disconnecting the proxy first). Known limits: DNS
+  resolution isn't blocked (only traffic), UDP/QUIC isn't proxied, and the
+  one-time `clone_repo` runs unrestricted (default bridge).
 - Shared reverse proxy (`cmd_proxy`, `nixenv proxy up|stop|status|logs`): a single
   `${PREFIX}-proxy` Caddy container (caddy is in the base flake, run from the store)
   on a shared user network `PROXY_NET` (`nixenv_net`) that every project container
@@ -182,9 +228,10 @@ so all examples and instructions must use `./nixenv.sh`.
 `build [project]`, `init <project> [git-url] [--build]`, `run <project>`,
 `ssh <project>`, `ssh-config [--install]`, `shell <project>`,
 `expose <project> <port>…`, `host <project> <name:ip>…`,
-`proxy [up|stop|status|logs]`, `up`, `stop`, `logs`, `delete`/`rm`,
-`sync-home <project>`, `projects`, `update`, `status`, `clean`, `install`,
-`uninstall`. See `./nixenv.sh --help` and `README.md`. `delete` prints the
+`proxy [up|stop|status|logs|renew|remove-cert]`, `restrict <project> [on|off]`,
+`allow <project> <host>…`, `egress <project> [-f]`, `up`, `stop`, `logs`,
+`delete`/`rm`, `sync-home <project>`, `projects`, `update`, `status`, `clean`,
+`install`, `uninstall`. See `./nixenv.sh --help` and `README.md`. `delete` prints the
 commands (container/volume/home removal) and prompts before running;
 `resolve_engine` returns non-zero (not `die`) when no engine is found so
 host-file deletion still works.
@@ -214,7 +261,25 @@ app volume read-only to read the repo overrides; asks for confirmation first.
 
 ## Verifying changes
 
-After editing `nixenv.sh`:
+After editing `nixenv.sh`, ALWAYS run the unit suite (fast, no docker):
+
+```sh
+./tests/run.sh                    # unit tests — must stay green
+```
+
+Test layout: one bash file per test in `tests/unit/` and `tests/integration/`,
+shared harness `tests/lib.sh` (exit 0 pass / 77 skip / else fail),
+`tests/run.sh [unit|integration|all|<files>]` runner. Integration needs a real
+engine and a DEDICATED environment (isolated `nxt-*` prefix + state dirs; sweeps
+by prefix; reuses the shared store volume). `tests/run-in-docker.sh` runs
+everything inside disposable docker-in-docker (cache volume
+`nixenv-dind-cache`). Unit tests SOURCE `nixenv.sh` — the script only executes
+`main` when run directly (`BASH_SOURCE` guard at the bottom); test-isolation env
+hooks: `NIXENV_PROJECTS_DIR`, `PROXY_DIR`, `CLAUDE_DIR`, `CLAUDE_JSON`,
+`CONTEXT_DIR`, `CONTAINER_PREFIX`. When adding a feature, add a unit test for
+its pure logic and (if it touches containers) an integration test file.
+
+Quick manual check without the suite:
 
 ```sh
 bash -n nixenv.sh                 # syntax check the script

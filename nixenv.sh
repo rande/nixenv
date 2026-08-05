@@ -41,9 +41,11 @@ PROJECT_ATTR="${PROJECT_ATTR:-default}"              # flake output attr install
 SSHD_PORT="${SSHD_PORT:-2222}"                       # unprivileged in-container sshd port (non-root)
 CONTAINER_PREFIX="${CONTAINER_PREFIX:-nixenv}"       # container name = <prefix>-<project>
 APP_USER="${APP_USER:-app}"                          # non-root user in the runtime container
-PROJECTS_DIR="$HOME/.nixenv/projects"                # all projects live here
-CLAUDE_DIR="$HOME/.nixenv/claude"                    # shared Claude CLI creds/config dir (~/.claude)
-CLAUDE_JSON="$HOME/.nixenv/claude.json"              # shared Claude global config file (~/.claude.json)
+# Projects always live in ~/.nixenv/projects. NIXENV_PROJECTS_DIR exists ONLY for
+# the test suite (isolation) — it is intentionally not a documented user setting.
+PROJECTS_DIR="${NIXENV_PROJECTS_DIR:-$HOME/.nixenv/projects}"
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.nixenv/claude}"     # shared Claude CLI creds/config dir (~/.claude)
+CLAUDE_JSON="${CLAUDE_JSON:-$HOME/.nixenv/claude.json}" # shared Claude global config file (~/.claude.json)
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-}"             # docker|podman; empty = auto-detect
 ENGINE_FILE="$HOME/.nixenv/engine"                   # remembered engine choice
 ENGINE=""                                            # resolved at runtime
@@ -51,11 +53,12 @@ ENGINE=""                                            # resolved at runtime
 # --- Reverse proxy (nixenv proxy) --------------------------------------------
 PROXY_NET="${PROXY_NET:-nixenv_net}"                 # shared user network all projects join
 PROXY_NAME="${CONTAINER_PREFIX}-proxy"               # the Caddy proxy container name
-PROXY_DIR="$HOME/.nixenv/proxy"                       # Caddyfile + certs + caddy data
+PROXY_DIR="${PROXY_DIR:-$HOME/.nixenv/proxy}"        # Caddyfile + certs + caddy data
 PROXY_DOMAIN="${PROXY_DOMAIN:-nixenv.localhost}"     # base domain: <project>-<port>.<PROXY_DOMAIN>
 PROXY_HTTP_PORT="${PROXY_HTTP_PORT:-80}"             # host port → caddy 8080 (use 8080 for podman rootless)
 PROXY_HTTPS_PORT="${PROXY_HTTPS_PORT:-443}"          # host port → caddy 8443 (use 8443 for podman rootless)
 PROXY_AUTOSTART="${PROXY_AUTOSTART:-1}"              # auto-start the proxy on 'run' (0 to disable)
+EGRESS_PORT="${EGRESS_PORT:-3128}"                   # squid egress port INSIDE the proxy container (not published)
 
 # ── Pretty output ────────────────────────────────────────────────────────────
 c_blue='\033[1;34m'; c_green='\033[1;32m'; c_yellow='\033[1;33m'; c_red='\033[1;31m'; c_reset='\033[0m'
@@ -139,7 +142,9 @@ materialize_context() {
               wget
               iputils      # ping
               dnsutils     # host, dig, nslookup
-              caddy        # reverse proxy for the shared 'nixenv proxy' container
+              caddy        # ingress reverse proxy for the shared 'nixenv proxy' container
+              squid        # egress allowlist proxy (restricted projects), runs in the proxy container
+              socat        # ssh-over-CONNECT ProxyCommand + tcp relays for restricted projects
               rsync
               jq
               yq-go
@@ -327,6 +332,78 @@ export EDITOR=vim
 export LANG=C.UTF-8
 EOF
 
+# --- Egress restriction (set only for restricted projects) ------------------
+# NIXENV_EGRESS_PROXY=http://<proxy-container>:<port>. The container has no
+# route to the internet (internal network); this proxy is the only way out.
+# 1. Export the proxy env vars every HTTP-family tool honours.
+# 2. Route ssh through the proxy's CONNECT tunnel (socat), so git-over-ssh and
+#    plain ssh to VALIDATED hosts work; everything else is denied by the proxy.
+if [ -n "${NIXENV_EGRESS_PROXY:-}" ]; then
+  # Internal traffic must NOT go through the proxy: sibling containers on the
+  # shared/internal networks, this project itself, and any name in /etc/hosts.
+  # (Squid denies RFC1918 by design, so proxying these would break them.)
+  # Private ranges cover container networks; hostnames cover DNS-by-name.
+  _noproxy="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.localhost,.local,.internal"
+  # Every declared /etc/hosts.extra name is internal by definition.
+  for _hf in "${NIXENV_EXTRA_PROFILE:-}/etc/hosts.extra" /etc/hosts.extra; do
+    [ -f "$_hf" ] || continue
+    while read -r _ip _nm _rest; do
+      case "$_ip" in \#*|"") continue;; esac
+      [ -n "$_nm" ] && _noproxy="$_noproxy,$_nm"
+    done < "$_hf"
+  done
+  # The project's own container name/hostname.
+  [ -n "${NIXENV_PROJECT:-}" ] && _noproxy="$_noproxy,$NIXENV_PROJECT,nixenv-$NIXENV_PROJECT"
+
+  # Export in THIS process too, so runit project services (php-fpm, workers, …)
+  # inherit the proxy env — they never source .zshenv.
+  export HTTP_PROXY="$NIXENV_EGRESS_PROXY"  HTTPS_PROXY="$NIXENV_EGRESS_PROXY"
+  export http_proxy="$NIXENV_EGRESS_PROXY"  https_proxy="$NIXENV_EGRESS_PROXY"
+  export NO_PROXY="$_noproxy" no_proxy="$_noproxy"
+  cat >> "$HOME_DIR/.zshenv" <<EOF
+export HTTP_PROXY="$NIXENV_EGRESS_PROXY"
+export HTTPS_PROXY="$NIXENV_EGRESS_PROXY"
+export http_proxy="$NIXENV_EGRESS_PROXY"
+export https_proxy="$NIXENV_EGRESS_PROXY"
+export NO_PROXY="$_noproxy"
+export no_proxy="$_noproxy"
+EOF
+  _ep="${NIXENV_EGRESS_PROXY#http://}"; _ep="${_ep%/}"
+  _ephost="${_ep%%:*}"; _epport="${_ep##*:}"
+  mkdir -p "$HOME_DIR/.ssh"; touch "$HOME_DIR/.ssh/config"
+  if ! grep -q '^# nixenv-egress' "$HOME_DIR/.ssh/config" 2>/dev/null; then
+    cat >> "$HOME_DIR/.ssh/config" <<EOF
+
+# nixenv-egress (auto-added on restricted projects; delete this block to opt out)
+# Internal names (sibling containers, *.local/*.internal) connect DIRECTLY;
+# everything else tunnels out through the egress proxy's CONNECT.
+Host * !localhost !127.0.0.1 !$_ephost !*.local !*.internal !*.localhost !nixenv-*
+    ProxyCommand $PROFILE/bin/socat - PROXY:$_ephost:%h:%p,proxyport=$_epport
+EOF
+    chmod 600 "$HOME_DIR/.ssh/config" 2>/dev/null || true
+  fi
+  # yarn 1.x ignores proxy ENV VARS entirely — it only reads .yarnrc/.npmrc.
+  # Write both (marker-guarded) so yarn/npm work under restriction.
+  if ! grep -q 'nixenv-egress' "$HOME_DIR/.yarnrc" 2>/dev/null; then
+    cat >> "$HOME_DIR/.yarnrc" <<EOF
+# nixenv-egress
+proxy "$NIXENV_EGRESS_PROXY"
+https-proxy "$NIXENV_EGRESS_PROXY"
+# yarn's self-update check bypasses proxy config entirely (hangs + retries on
+# an internal network) — and store-managed yarn can never self-update anyway.
+disable-self-update-check true
+EOF
+  fi
+  if ! grep -q 'nixenv-egress' "$HOME_DIR/.npmrc" 2>/dev/null; then
+    cat >> "$HOME_DIR/.npmrc" <<EOF
+# nixenv-egress
+proxy=$NIXENV_EGRESS_PROXY
+https-proxy=$NIXENV_EGRESS_PROXY
+noproxy=$_noproxy
+EOF
+  fi
+fi
+
 # --- Custom /etc/hosts ------------------------------------------------------
 # If /etc/hosts is writable (nixenv bind-mounted one we own), rebuild it from
 # base entries + two optional extra sources, in order:
@@ -420,22 +497,62 @@ chmod +x "$SVROOT/sshd/run"
 # this user, next to sshd. Example for supervisord:
 #   #!/bin/sh
 #   exec supervisord -n -c "$NIXENV_APP_MOUNT/supervisord.conf"
-project_services=""
+# 1. Refresh repo-declared services into the (persistent) service tree.
 if [ -d "$APP_MOUNT/.nixenv/sv" ]; then
   for d in "$APP_MOUNT"/.nixenv/sv/*/; do
     [ -f "${d}run" ] || continue
     sname="$(basename "$d")"
     mkdir -p "$SVROOT/$sname"
     cp "${d}run" "$SVROOT/$sname/run" && chmod +x "$SVROOT/$sname/run"
-    project_services="$project_services $sname"
   done
 fi
 
-# PATH for all services: project profile (extra tooling) first, then base, so a
-# service can use tools from the project flake (e.g. supervisord) or the base.
+# PATH for hooks AND all services: project profile (extra tooling) first, then
+# base — so a hook can call binaries the project flake ships (e.g. a
+# <project>-setup script) and a service can use e.g. supervisord. This MUST come
+# before the hooks below: they run in this process and inherit this PATH.
 _extra=""
 [ -n "${NIXENV_EXTRA_PROFILE:-}" ] && [ -d "$NIXENV_EXTRA_PROFILE/bin" ] && _extra="$NIXENV_EXTRA_PROFILE/bin:"
 export PATH="${_extra}$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# 1b. Startup hooks. Every hook file that exists is sourced, in order:
+#   $NIXENV_EXTRA_PROFILE/etc/nixenv-hooks.sh  (declared in the project flake)
+#   $APP_MOUNT/.nixenv/hooks.sh                (committed in the repo)
+#   $HOME/.nixenv-hooks.sh                     (local, in the home volume)
+# Files are SOURCED, so top-level code in them runs right away; additionally, if
+# the function `nixenv_pre_ssh_start` is defined, it is called after sourcing.
+# (Top-level = every hook file accumulates; the function = last definition wins,
+# so a repo/home hook can override the flake's. Never call `exit` at top level —
+# it would terminate the entrypoint; use `return` inside the function.)
+# Hooks run AFTER PATH is set (project profile first) and the service tree is
+# refreshed, but BEFORE any service (incl. sshd) starts — so they can call
+# binaries from the project flake and create $HOME/.nixenv-sv/<name>/run entries
+# that get supervised in this same boot, seed config, wait on a dependency, etc.
+# A failing hook warns but never blocks the container from starting.
+for _hook in "${NIXENV_EXTRA_PROFILE:-}/etc/nixenv-hooks.sh" \
+             "$APP_MOUNT/.nixenv/hooks.sh" \
+             "$HOME_DIR/.nixenv-hooks.sh"; do
+  [ -f "$_hook" ] || continue
+  echo "nixenv: sourcing hooks $_hook"
+  . "$_hook" || echo "nixenv: WARNING failed to source $_hook"
+done
+if command -v nixenv_pre_ssh_start >/dev/null 2>&1; then
+  echo "nixenv: running hook nixenv_pre_ssh_start"
+  nixenv_pre_ssh_start || echo "nixenv: WARNING nixenv_pre_ssh_start returned non-zero"
+fi
+
+# 2. Supervise EVERY service dir now present in $SVROOT (repo-declared, created
+# by a startup hook, or installed there directly by a project setup script) —
+# not just the ones discovered this boot. $SVROOT persists in the home volume;
+# mimic runsvdir semantics (which we can't use: it spawns runsv via PATH and
+# that lookup fails here). Remove a service by deleting its $SVROOT/<name> dir.
+project_services=""
+for d in "$SVROOT"/*/; do
+  [ -f "${d}run" ] || continue
+  sname="$(basename "$d")"
+  [ "$sname" = "sshd" ] && continue   # sshd is PID 1's own runsv below
+  project_services="$project_services $sname"
+done
 
 echo "nixenv: unprivileged sshd ready on :$SSHD_PORT as '$APP_USER' (no key/password)"
 [ -n "$project_services" ] && echo "nixenv: project services:$project_services"
@@ -818,6 +935,16 @@ builder_priv() {
   [ "$BUILDER_PRIVILEGED" = 1 ] && printf '%s' "--privileged"
 }
 
+# NIX_CONFIG for builder containers. Honours GITHUB_TOKEN: resolving un-locked
+# `github:` flake inputs hits api.github.com, which rate-limits anonymous IPs
+# (CI/docker-in-docker environments hit this quickly).
+nix_config() {
+  printf 'experimental-features = nix-command flakes\nmax-jobs = auto'
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    printf '\naccess-tokens = github.com=%s' "$GITHUB_TOKEN"
+  fi
+}
+
 # ── Volume helpers ───────────────────────────────────────────────────────────
 volume_exists()  { "$ENGINE" volume inspect "$NIX_VOLUME" >/dev/null 2>&1; }
 ensure_volume()  {
@@ -863,6 +990,51 @@ project_app_mount() {
   if [ -f "$f" ] && [ -s "$f" ]; then cat "$f"; else printf '/app'; fi
 }
 vol_exists()      { "$ENGINE" volume inspect "$1" >/dev/null 2>&1; }
+
+# ── Egress restriction (ON by default; opt-out per project) ──────────────────
+# A restricted project runs on its own --internal network (kernel-enforced: no
+# route to the internet), and reaches the outside ONLY through a single shared
+# squid (domain allowlist, default-deny, per-project ACLs by source subnet)
+# running inside the shared proxy container on port $EGRESS_PORT. Files in
+# <project>/:
+#   unrestricted   → opt-OUT marker: restriction disabled ('restrict <p> off')
+#   allowed_hosts  → validated domains, one per line ('allow' appends; init
+#                    seeds the forge domain from the clone URL)
+is_restricted()        { [ ! -f "$(project_dir "$1")/unrestricted" ]; }
+internal_net()         { printf '%s_%s_egress' "$CONTAINER_PREFIX" "$1"; }
+ensure_internal_net()  {
+  "$ENGINE" network inspect "$(internal_net "$1")" >/dev/null 2>&1 || \
+    "$ENGINE" network create --internal "$(internal_net "$1")" >/dev/null
+}
+
+# Subnet of a network (for squid's per-project source ACLs). Docker exposes it
+# under .IPAM.Config, podman (netavark) under .Subnets — try both.
+net_subnet() {
+  local s
+  s="$("$ENGINE" network inspect "$1" --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null | awk '{print $1}')"
+  [ -n "$s" ] || s="$("$ENGINE" network inspect "$1" --format '{{range .Subnets}}{{.Subnet}} {{end}}' 2>/dev/null | awk '{print $1}')"
+  printf '%s' "$s"
+}
+
+# Extract the forge hostname from a git clone URL (https/ssh/scp-like forms).
+forge_host_from_url() {
+  local url="$1" host=""
+  case "$url" in
+    http://*|https://*|ssh://*|git://*)
+      host="${url#*://}"; host="${host%%/*}"; host="${host##*@}"; host="${host%%:*}";;
+    *@*:*)   # scp-like: git@host:path
+      host="${url#*@}"; host="${host%%:*}";;
+  esac
+  printf '%s' "$host"
+}
+
+# Append a domain to <project>/allowed_hosts (deduplicated).
+add_allowed_host() {
+  local pdir domain="$2" f; pdir="$(project_dir "$1")"; f="$pdir/allowed_hosts"
+  [ -n "$domain" ] || return 0
+  mkdir -p "$pdir"; touch "$f"
+  grep -qxF "$domain" "$f" 2>/dev/null || { printf '%s\n' "$domain" >> "$f"; ok "allowed host: $domain"; }
+}
 
 # Ensure the project's /app and /home volumes exist and are OWNED BY OUR UID, so
 # the non-root runtime container can write them. Named volumes start root-owned;
@@ -1138,16 +1310,17 @@ clone_repo() {
 #   usage: init <project> [git-repo-url]
 cmd_init() {
   local name="${1:-}"
-  [ -n "$name" ] || die "usage: $0 init <project> [git-repo-url] [--build] [--app-path=/path]"
+  [ -n "$name" ] || die "usage: $0 init <project> [git-repo-url] [--build] [--unrestricted] [--app-path=/path]"
   valid_project_name "$name" || die "invalid project name: '$name'"
   shift
 
-  local git_url="" do_build=0 app_mount="${APP_MOUNT:-}" a
+  local git_url="" do_build=0 do_open=0 app_mount="${APP_MOUNT:-}" a
   for a in "$@"; do
     case "$a" in
       --build) do_build=1;;
+      --unrestricted|--open) do_open=1;;
       --app-path=*) app_mount="${a#*=}";;
-      --*) die "unknown option: $a (usage: $0 init <project> [git-repo-url] [--build] [--app-path=/path])";;
+      --*) die "unknown option: $a (usage: $0 init <project> [git-repo-url] [--build] [--unrestricted] [--app-path=/path])";;
       *) [ -z "$git_url" ] && git_url="$a" || die "unexpected argument: $a";;
     esac
   done
@@ -1172,14 +1345,33 @@ cmd_init() {
   fi
 
   # Seed home from the skeleton WITHOUT clobbering existing files.
+  # (Portable no-clobber: busybox cp has no -n, BSD/GNU differ — copy per file.)
   if [ -d "$HOME_SKEL" ]; then
-    cp -Rn "$HOME_SKEL/." "$pdir/home/" 2>/dev/null || true
+    ( cd "$HOME_SKEL" && find . -type f ) | while IFS= read -r _f; do
+      _rel="${_f#./}"
+      [ -e "$pdir/home/$_rel" ] && continue
+      mkdir -p "$pdir/home/$(dirname "$_rel")"
+      cp "$HOME_SKEL/$_rel" "$pdir/home/$_rel" || true
+    done
   fi
 
   # SSH needs strict perms or ssh/git refuse the keys.
   mkdir -p "$pdir/home/.ssh"
   chmod 700 "$pdir/home/.ssh"
   find "$pdir/home/.ssh" -type f -exec chmod 600 {} \; 2>/dev/null || true
+
+  # Egress: restriction is ON BY DEFAULT (default-deny). Record the forge domain
+  # in the allowlist so cloning/pulling works; --unrestricted opts out.
+  if [ -n "$git_url" ]; then
+    add_allowed_host "$name" "$(forge_host_from_url "$git_url")"
+  fi
+  touch "$pdir/allowed_hosts"
+  if [ "$do_open" = 1 ]; then
+    touch "$pdir/unrestricted"
+    warn "egress UNRESTRICTED (opt-out) — re-enable with: $0 restrict $name on"
+  else
+    ok "egress restricted (default-deny; validated hosts: $pdir/allowed_hosts)"
+  fi
 
   # Git identity (prompted) + optional HTTPS credentials + optional clone.
   configure_git_identity "$pdir"
@@ -1198,9 +1390,14 @@ cmd_init() {
   echo "   db   → /databases       (volume $(db_volume "$name"))"
   echo "   ssh  → host port $port  (connects as '$APP_USER', no key/password)"
   echo "   alias→ ssh $name        (after: $0 ssh-config --install)"
+  if is_restricted "$name"; then
+    echo "   egress→ RESTRICTED (default-deny; allowed: $(tr '\n' ' ' < "$pdir/allowed_hosts" 2>/dev/null))"
+  fi
 
   # --build: also build the project's own flake (if the repo has one).
-  [ "$do_build" = 1 ] && cmd_build_project "$name"
+  # (if/fi, NOT `[ ] && cmd`: the latter would make init's exit status 1
+  # whenever --build is absent — set -e then kills callers/scripts.)
+  if [ "$do_build" = 1 ]; then cmd_build_project "$name"; fi
 }
 
 # Auto-scaffold a project if missing.
@@ -1234,7 +1431,7 @@ cmd_build() {
     -v "$NIX_VOLUME":/nix \
     -v "$FLAKE_DIR":/flake \
     -w /flake \
-    -e NIX_CONFIG=$'experimental-features = nix-command flakes\nmax-jobs = auto' \
+    -e NIX_CONFIG="$(nix_config)" \
     "$(img "$BUILDER_IMAGE")" \
     sh -euc '
       echo "--- resetting shared profile (so flake changes take effect) ---"
@@ -1316,7 +1513,7 @@ cmd_build_project() {
     -v "$NIX_VOLUME":/nix \
     -v "$fdir":/flake \
     -w /flake \
-    -e NIX_CONFIG=$'experimental-features = nix-command flakes\nmax-jobs = auto' \
+    -e NIX_CONFIG="$(nix_config)" \
     "$(img "$BUILDER_IMAGE")" \
     sh -euc '
       mkdir -p /nix/var/nix/profiles
@@ -1361,6 +1558,11 @@ cmd_run() {
   mkdir -p "$pdir/home/.ssh"
   ensure_volumes "$name"        # create + chown (+ seed home) the app/home volumes
   prepare_claude_share          # shared Claude creds + global config, mounted rw
+  # Per-project Claude transcripts: creds/settings stay SHARED (.claude), but
+  # .claude/projects is overlaid with a per-project dir so session logs are
+  # reviewable per project at ~/.nixenv/claude/projects/nixenv-<name>/ instead
+  # of colliding in one cwd-encoded folder shared by every project.
+  mkdir -p "$CLAUDE_DIR/projects/nixenv-$name"
   write_passwd_files "$pdir"    # /etc/passwd|group|shadow giving our uid the name 'app'
   write_host_ssh_config "$name" # <project>/ssh/config for `ssh <project>`
 
@@ -1371,20 +1573,36 @@ cmd_run() {
   # name (nixenv-<project>). Created if missing; harmless when the proxy is unused.
   ensure_proxy_net
 
+  # Egress restriction: a restricted project runs on its own --internal network
+  # (kernel-enforced: no route out). Ports published on an internal network don't
+  # work, so its ssh/extra ports are published by the PROXY container and relayed
+  # (write_egress_configs); its only way out is squid in the proxy container.
+  local restricted=0 netarg="$PROXY_NET" egress_env; egress_env=()
+  if is_restricted "$name"; then
+    restricted=1
+    ensure_internal_net "$name"
+    netarg="$(internal_net "$name")"
+    egress_env=(-e NIXENV_EGRESS_PROXY="http://$PROXY_NAME:$EGRESS_PORT")
+  fi
+
   # Published ports: ssh (loopback) → in-container $SSHD_PORT, + <project>/ports.
   # Each ports line: "8080" → 127.0.0.1:8080:8080, or a full spec like
   # "3000:3000", "0.0.0.0:8080:80", "127.0.0.1:5173:5173".
-  local pub; pub=(-p "127.0.0.1:$port:$SSHD_PORT")
-  if [ -f "$pdir/ports" ]; then
-    local _line _spec
-    while IFS= read -r _line || [ -n "$_line" ]; do
-      _spec="$(printf '%s' "${_line%%#*}" | tr -d '[:space:]')"
-      [ -n "$_spec" ] || continue
-      case "$_spec" in
-        *:*) pub+=(-p "$_spec");;
-        *)   pub+=(-p "127.0.0.1:$_spec:$_spec");;
-      esac
-    done < "$pdir/ports"
+  # Restricted projects publish NOTHING here (relayed via the proxy instead).
+  local pub; pub=()
+  if [ "$restricted" = 0 ]; then
+    pub=(-p "127.0.0.1:$port:$SSHD_PORT")
+    if [ -f "$pdir/ports" ]; then
+      local _line _spec
+      while IFS= read -r _line || [ -n "$_line" ]; do
+        _spec="$(printf '%s' "${_line%%#*}" | tr -d '[:space:]')"
+        [ -n "$_spec" ] || continue
+        case "$_spec" in
+          *:*) pub+=(-p "$_spec");;
+          *)   pub+=(-p "127.0.0.1:$_spec:$_spec");;
+        esac
+      done < "$pdir/ports"
+    fi
   fi
 
   # Custom /etc/hosts: give the container a writable /etc/hosts we own (a host
@@ -1407,11 +1625,12 @@ cmd_run() {
     "$ENGINE" run -d \
       --name "$cname" \
       --hostname "$name" \
-      --network "$PROXY_NET" \
+      --network "$netarg" \
       --user "$(id -u):$(id -g)" \
       $(engine_userns) \
       --sysctl net.ipv4.ping_group_range="0 2147483647" \
-      "${pub[@]}" \
+      ${pub[@]+"${pub[@]}"} \
+      ${egress_env[@]+"${egress_env[@]}"} \
       "${hostsmount[@]}" \
       -v "$NIX_VOLUME":/nix:ro \
       -v "$homev":/home/"$APP_USER" \
@@ -1421,6 +1640,7 @@ cmd_run() {
       -v "$pdir/group":/etc/group:ro \
       -v "$pdir/shadow":/etc/shadow:ro \
       -v "$CLAUDE_DIR":/home/"$APP_USER"/.claude \
+      -v "$CLAUDE_DIR/projects/nixenv-$name":/home/"$APP_USER"/.claude/projects \
       -v "$CLAUDE_JSON":/home/"$APP_USER"/.claude.json \
       -v "$ENTRYPOINT_FILE":/usr/local/bin/nixenv-entrypoint:ro \
       -w "$appmnt" \
@@ -1435,9 +1655,21 @@ cmd_run() {
       sh /usr/local/bin/nixenv-entrypoint >/dev/null
     ok "Started '$cname'"
   fi
-  ensure_proxy_running   # bring the shared proxy up on first project start
+  if [ "$restricted" = 1 ]; then
+    # The proxy must (re)load this project's ACL, relays, and join its internal
+    # net — recreate it (quick; also serves as the ensure-running step).
+    log "Refreshing proxy (egress allowlist + ssh relay for '$name')"
+    ( PROXY_MKCERT_INSTALL="${PROXY_MKCERT_INSTALL:-0}"; cmd_proxy up ) \
+      || warn "proxy refresh failed — '$0 proxy up' manually (ssh relies on its relay)"
+  else
+    ensure_proxy_running   # bring the shared proxy up on first project start
+  fi
   echo "   ssh:    ssh -p $port $APP_USER@127.0.0.1   (or: $0 ssh $name)"
   echo "   shell:  $0 shell $name   ($ENGINE exec, no key needed)"
+  if [ "$restricted" = 1 ]; then
+    echo "   egress: RESTRICTED — allowed: $(tr '\n' ' ' < "$pdir/allowed_hosts" 2>/dev/null || echo '(none)')"
+    echo "           add hosts: $0 allow $name <domain>…   watch: $0 egress $name"
+  fi
   if [ "$PROXY_AUTOSTART" = 1 ] && container_running "$PROXY_NAME"; then
     echo "   proxy:  https://$name-<port>.$PROXY_DOMAIN/   (via '$PROXY_NAME')"
   fi
@@ -1536,6 +1768,129 @@ cmd_host() {
 }
 
 # =============================================================================
+# restrict — toggle egress restriction for a project. ON is the DEFAULT for
+#            every project; 'off' opts out (writes the <project>/unrestricted
+#            marker), 'on' re-enables.
+#   usage: restrict <project> [on|off]     (default: on)
+# =============================================================================
+cmd_restrict() {
+  local name="${1:-}" mode="${2:-on}"
+  [ -n "$name" ] || die "usage: $0 restrict <project> [on|off]"
+  case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  local pdir; pdir="$(project_dir "$name")"
+  [ -d "$pdir" ] || die "unknown project '$name' — run '$0 init $name' first"
+
+  case "$mode" in
+    on)
+      rm -f "$pdir/unrestricted"; touch "$pdir/allowed_hosts"
+      ok "egress restriction ON for '$name' (default-deny — this is the default)"
+      log "validated hosts file: $pdir/allowed_hosts  (add with: $0 allow $name <domain>…)"
+      ;;
+    off)
+      touch "$pdir/unrestricted"
+      warn "egress restriction OFF for '$name' — full internet access (allowed_hosts kept)"
+      ;;
+    *) die "usage: $0 restrict <project> [on|off]";;
+  esac
+
+  # Apply now if the project is running: recreate it on the right network, which
+  # also refreshes the proxy (ACLs, relays).
+  if resolve_engine 2>/dev/null && container_running "$(container_name "$name")"; then
+    warn "restarting '$name' to apply"
+    cmd_stop "$name" >/dev/null 2>&1 || true
+    cmd_run "$name"
+  else
+    log "applies on the next '$0 run $name'"
+  fi
+}
+
+# =============================================================================
+# allow — add validated egress host(s) to a project's allowlist and reload.
+#   usage: allow <project> <domain|ip>...
+# =============================================================================
+cmd_allow() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: $0 allow <project> <domain|ip>..."
+  case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  shift
+  [ "$#" -gt 0 ] || die "give at least one domain (e.g. registry.npmjs.org)"
+  local pdir d; pdir="$(project_dir "$name")"
+  [ -d "$pdir" ] || die "unknown project '$name' — run '$0 init $name' first"
+
+  for d in "$@"; do
+    d="$(printf '%s' "$d" | tr -d '[:space:]')"
+    [ -n "$d" ] || continue
+    case "$d" in \*.*) d=".${d#\*.}";; esac   # normalise *.foo → .foo
+    case "$d" in
+      *[!a-zA-Z0-9.-]*) die "invalid host '$d' (domain, .domain for subdomains, or IP — no schemes/ports/paths)";;
+    esac
+    add_allowed_host "$name" "$d"
+  done
+
+  if ! is_restricted "$name"; then
+    log "saved — note '$name' is NOT restricted (it opted out; enable: $0 restrict $name on)"
+    return 0
+  fi
+  # HOT-reload squid's ACLs — no proxy recreate, so relayed ssh/zmx sessions and
+  # ingress stay up. (write_egress_configs overwrites the bind-mounted config in
+  # place; 'squid -k reconfigure' re-reads it.) Falls back to a full 'proxy up'
+  # if squid isn't running in the proxy yet (e.g. proxy predates restriction).
+  if resolve_engine 2>/dev/null && container_running "$PROXY_NAME"; then
+    write_egress_configs
+    if "$ENGINE" exec "$PROXY_NAME" "$PROFILE/bin/squid" -f /etc/egress/squid.conf -k reconfigure >/dev/null 2>&1; then
+      ok "allowlist reloaded (hot — no proxy restart)"
+    else
+      warn "hot reload failed — recreating the proxy"
+      ( PROXY_MKCERT_INSTALL="${PROXY_MKCERT_INSTALL:-0}"; cmd_proxy up )
+    fi
+  else
+    log "applies when the proxy starts ('$0 proxy up' or next '$0 run $name')"
+  fi
+}
+
+# =============================================================================
+# egress — show a restricted project's egress log (squid): which domains were
+#          requested, what was allowed (TCP_TUNNEL) vs denied (TCP_DENIED).
+#   usage: egress <project> [-f]
+# =============================================================================
+cmd_egress() {
+  local name="${1:-}" follow="${2:-}"
+  [ -n "$name" ] || die "usage: $0 egress <project> [-f]"
+  case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  local logf="$PROXY_DIR/data/egress.log"
+  [ -f "$logf" ] || die "no egress log at $logf — is the proxy running with a restricted project?"
+
+  # Squid access log: time elapsed client action/status bytes method host:port …
+  # Filter to this project via its internal-net subnet prefix when we can.
+  local prefix=""
+  if resolve_engine 2>/dev/null; then
+    prefix="$(net_subnet "$(internal_net "$name")" 2>/dev/null | cut -d/ -f1 | sed 's/\.0*$//')"
+  fi
+
+  if [ "$follow" = "-f" ]; then
+    log "following $logf (Ctrl-C to stop)"
+    if [ -n "$prefix" ]; then exec tail -f "$logf" | grep --line-buffered "$prefix"
+    else exec tail -f "$logf"; fi
+  fi
+
+  log "Egress for '$name' (log: $logf)"
+  local lines
+  if [ -n "$prefix" ]; then lines="$(grep "$prefix" "$logf" 2>/dev/null || true)"
+  else lines="$(cat "$logf" 2>/dev/null || true)"; warn "could not resolve '$name' subnet — showing ALL projects"; fi
+  [ -n "$lines" ] || { warn "no egress traffic logged yet"; return 0; }
+
+  # URI field ($7) is "host:port" for CONNECT but a full "http://host/path" for
+  # plain-HTTP requests — strip scheme/path/port down to the bare domain.
+  _dom='s#^[a-z]*://##; s#/.*$##; s#:[0-9]*$##'
+  echo "── allowed (validated) ─────────────────────────────"
+  printf '%s\n' "$lines" | awk '$4 !~ /DENIED/ {print $7}' | sed "$_dom" | sort | uniq -c | sort -rn | head -20
+  echo "── DENIED (add with: $0 allow $name <domain>) ──"
+  printf '%s\n' "$lines" | awk '$4 ~ /DENIED/ {print $7}' | sed "$_dom" | sort | uniq -c | sort -rn | head -20
+  echo "── last 10 raw entries ─────────────────────────────"
+  printf '%s\n' "$lines" | tail -10
+}
+
+# =============================================================================
 # proxy — a shared Caddy reverse proxy for all projects. Routes
 #   https://<project>-<port>.<PROXY_DOMAIN>/  →  nixenv-<project>:<port>
 # over the shared user network. TLS uses a trusted wildcard cert when `mkcert`
@@ -1589,6 +1944,150 @@ proxy_make_cert() {
   warn "mkcert could not issue the wildcard cert — falling back to Caddy internal CA"; return 1
 }
 
+# Generate $PROXY_DIR/egress/: squid.conf (per-project domain ACLs keyed by the
+# project's internal-net subnet, default-deny), and start.sh (squid + socat ssh
+# relays + caddy). Also fills EGRESS_PUB (extra -p args for the proxy container:
+# restricted projects' ssh/extra ports are published HERE and relayed over the
+# internal net, because ports published on an --internal network don't work).
+# Sets EGRESS_PROJECTS to the restricted project names.
+write_egress_configs() {
+  local edir="$PROXY_DIR/egress"
+  # NOTE: never rm -rf this dir — it's bind-mounted into a possibly-running
+  # proxy container, and replacing the directory inode would detach the mount
+  # (a live 'squid -k reconfigure' would then read the OLD config forever).
+  # Overwriting files in place keeps the mount coherent.
+  mkdir -p "$edir"
+  EGRESS_PUB=(); EGRESS_PROJECTS=""
+  local relays="" acls="" allows="" d pdir name subnet aclname doms ips sshport _line _spec hp cp
+
+  for pdir in "$PROJECTS_DIR"/*/; do
+    [ -d "$pdir" ] || continue
+    name="$(basename "$pdir")"
+    is_restricted "$name" || continue
+    ensure_internal_net "$name"
+    subnet="$(net_subnet "$(internal_net "$name")")"
+    if [ -z "$subnet" ]; then
+      warn "cannot determine subnet of $(internal_net "$name") — skipping egress for '$name'"
+      continue
+    fi
+    EGRESS_PROJECTS="$EGRESS_PROJECTS $name"
+    aclname="$(printf '%s' "$name" | tr -c 'a-zA-Z0-9' '_')"
+
+    # Split allowed_hosts into domains and IPs. Domain matching is EXACT unless
+    # subdomains are explicitly requested:
+    #   yarnpkg.com     → only yarnpkg.com
+    #   .yarnpkg.com    → yarnpkg.com AND *.yarnpkg.com (squid leading-dot form)
+    #   *.yarnpkg.com   → same as .yarnpkg.com
+    doms=""; ips=""
+    if [ -f "$pdir/allowed_hosts" ]; then
+      while IFS= read -r d || [ -n "$d" ]; do
+        d="$(printf '%s' "${d%%#*}" | tr -d '[:space:]')"
+        [ -n "$d" ] || continue
+        case "$d" in
+          \*.*)      doms="$doms .${d#\*.}";;   # *.foo → .foo (subdomains)
+          .*)        doms="$doms $d";;          # .foo  → as-is (subdomains)
+          *[!0-9.]*) doms="$doms $d";;          # plain → EXACT host only
+          *)         ips="$ips $d";;
+        esac
+      done < "$pdir/allowed_hosts"
+    fi
+    acls="$acls
+acl p_$aclname src $subnet"
+    [ -n "$doms" ] && acls="$acls
+acl d_$aclname dstdomain$doms"
+    [ -n "$ips" ] && acls="$acls
+acl i_$aclname dst$ips"
+    [ -n "$doms" ] && allows="$allows
+http_access allow p_$aclname d_$aclname"
+    [ -n "$ips" ] && allows="$allows
+http_access allow p_$aclname i_$aclname"
+
+    # Relays require the ports to be free on the host. If the project container
+    # is RUNNING and still publishes its own ports (started before it became
+    # restricted), publishing them here would collide and kill the proxy —
+    # skip its relays and tell the user to recreate the project container.
+    if container_running "$(container_name "$name")" && \
+       "$ENGINE" port "$(container_name "$name")" 2>/dev/null | grep -q .; then
+      warn "'$name' is running WITHOUT restriction (old container publishes its own ports)"
+      warn "  apply it with:  $0 stop $name && $0 run $name   (skipping its relays for now)"
+      continue
+    fi
+
+    # SSH relay: host ssh port → (proxy container, published) → project:2222.
+    sshport="$(project_port "$name")"
+    EGRESS_PUB+=(-p "127.0.0.1:$sshport:$sshport")
+    relays="$relays
+\"\$PROFILE/bin/socat\" TCP-LISTEN:$sshport,fork,reuseaddr TCP:$(container_name "$name"):$SSHD_PORT &"
+
+    # Extra declared ports (<project>/ports) relayed the same way.
+    if [ -f "$pdir/ports" ]; then
+      while IFS= read -r _line || [ -n "$_line" ]; do
+        _spec="$(printf '%s' "${_line%%#*}" | tr -d '[:space:]')"
+        [ -n "$_spec" ] || continue
+        case "$_spec" in
+          *:*:*) warn "restricted '$name': address port spec '$_spec' unsupported — skipped"; continue;;
+          *:*) hp="${_spec%%:*}"; cp="${_spec#*:}";;
+          *)   hp="$_spec"; cp="$_spec";;
+        esac
+        EGRESS_PUB+=(-p "127.0.0.1:$hp:$hp")
+        relays="$relays
+\"\$PROFILE/bin/socat\" TCP-LISTEN:$hp,fork,reuseaddr TCP:$(container_name "$name"):$cp &"
+      done < "$pdir/ports"
+    fi
+  done
+
+  if [ -n "$EGRESS_PROJECTS" ]; then
+    cat > "$edir/squid.conf" <<EOF
+# Generated by nixenv — egress allowlist for restricted projects. Do not edit
+# (edit <project>/allowed_hosts and re-run 'proxy up' / 'allow' instead).
+# Bind IPv4 explicitly: a bare port makes squid bind [::] which, without
+# dual-stack (v6only=0), refuses the IPv4 connections containers actually make.
+http_port 0.0.0.0:$EGRESS_PORT
+visible_hostname $PROXY_NAME
+pid_filename /data/run/squid.pid
+access_log stdio:/data/egress.log buffer-size=0KB
+cache_log /data/squid-cache.log
+cache deny all
+via off
+forwarded_for delete
+
+# Only tunnel to sane ports (https, ssh, http, git).
+acl Connect_ports port 443 22 80 9418
+acl CONNECT method CONNECT
+
+# Never let a project reach loopback, private/container networks, or link-local
+# through the proxy (169.254.169.254 is the cloud metadata endpoint — the
+# classic SSRF credential-theft target; deny it even though it's inert locally).
+acl to_localnets dst 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fc00::/7 fe80::/10 ::1/128
+http_access deny to_localnets
+
+http_access deny CONNECT !Connect_ports
+$acls
+$allows
+http_access deny all
+EOF
+  else
+    rm -f "$edir/squid.conf"   # no restricted projects → start.sh skips squid
+  fi
+
+  # start.sh: squid (egress) + socat relays + caddy (ingress) — caddy is PID 1.
+  cat > "$edir/start.sh" <<EOF
+#!/bin/sh
+# Generated by nixenv — proxy container startup (egress + relays + ingress).
+PROFILE="$PROFILE"
+mkdir -p /data/run
+if [ -f /etc/egress/squid.conf ]; then
+  # /data persists across proxy recreations: a stale pid file makes squid FATAL
+  # with "already running" (the old PID exists in the NEW container's namespace).
+  # This container is freshly created, so no squid can be running — clear it.
+  rm -f /data/run/squid.pid
+  # stdout/err to a host-visible file so startup FATALs are diagnosable
+  "\$PROFILE/bin/squid" -f /etc/egress/squid.conf -N >>/data/squid-out.log 2>&1 &
+fi$relays
+exec "\$PROFILE/bin/caddy" run --config /etc/caddy/Caddyfile --adapter caddyfile
+EOF
+}
+
 # Write $PROXY_DIR/Caddyfile. $1=1 → use the mkcert wildcard cert, else internal.
 write_caddyfile() {
   local tls_line dom_re
@@ -1611,13 +2110,16 @@ write_caddyfile() {
 	$tls_line
 	@route header_regexp route Host ^(.+)-([0-9]+)\.$dom_re(:[0-9]+)?\$
 	handle @route {
-		reverse_proxy nixenv-{re.route.1}:{re.route.2} {
+		reverse_proxy $CONTAINER_PREFIX-{re.route.1}:{re.route.2} {
 			# Caddy already adds X-Forwarded-For/Proto/Host; make the TLS-terminated
 			# scheme explicit (443 is mapped to caddy's 8443) and add a couple more
 			# so backends (e.g. Symfony behind trusted_proxies) generate https URLs.
 			header_up X-Forwarded-Proto https
 			header_up X-Forwarded-Port 443
 			header_up X-Real-IP {http.request.remote.host}
+			# Stream responses through unbuffered (nginx: proxy_buffering off) —
+			# SSE, chunked output, dev-server live reload. WebSockets need nothing.
+			flush_interval -1
 		}
 	}
 	handle {
@@ -1637,6 +2139,7 @@ cmd_proxy() {
       mkdir -p "$PROXY_DIR/data"
       local cert=0; proxy_make_cert && cert=1 || cert=0
       write_caddyfile "$cert"
+      write_egress_configs   # squid ACLs + relays + start.sh (fills EGRESS_PUB/EGRESS_PROJECTS)
       local certmount; certmount=()
       [ "$cert" = 1 ] && certmount=(-v "$PROXY_DIR/certs:/certs:ro")
       "$ENGINE" rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
@@ -1648,20 +2151,29 @@ cmd_proxy() {
         $(engine_userns) \
         -p "127.0.0.1:$PROXY_HTTP_PORT:8080" \
         -p "127.0.0.1:$PROXY_HTTPS_PORT:8443" \
+        ${EGRESS_PUB[@]+"${EGRESS_PUB[@]}"} \
         -v "$NIX_VOLUME":/nix:ro \
         -v "$PROXY_DIR/Caddyfile":/etc/caddy/Caddyfile:ro \
+        -v "$PROXY_DIR/egress":/etc/egress:ro \
         ${certmount[@]+"${certmount[@]}"} \
         -v "$PROXY_DIR/data":/data \
         -e HOME=/data -e XDG_DATA_HOME=/data -e XDG_CONFIG_HOME=/data/config \
         -w /data \
         "$(img "$RUNTIME_IMAGE")" \
-        "$PROFILE/bin/caddy" run --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null \
+        sh /etc/egress/start.sh >/dev/null \
         || die "failed to start proxy container"
+      # Join every restricted project's internal net so (a) caddy can ingress-route
+      # to it and (b) the project can reach squid — its ONLY path out.
+      local rp
+      for rp in $EGRESS_PROJECTS; do
+        "$ENGINE" network connect "$(internal_net "$rp")" "$PROXY_NAME" >/dev/null 2>&1 || true
+      done
       ok "proxy running as '$PROXY_NAME'"
       echo "   scheme: https://<project>-<port>.$PROXY_DOMAIN/   (e.g. https://myapp-3000.$PROXY_DOMAIN/)"
       if [ "$cert" = 1 ]; then echo "   tls:    trusted wildcard cert via mkcert"
       else echo "   tls:    Caddy internal CA (browser warning until you install/trust mkcert)"; fi
       echo "   net:    $PROXY_NET  (projects auto-join on '$0 run')"
+      [ -n "$EGRESS_PROJECTS" ] && echo "   egress: squid allowlist on :$EGRESS_PORT for:$EGRESS_PROJECTS  (log: $0 egress <project>)"
       echo "   note:   *.localhost auto-resolves to 127.0.0.1 in Chrome/Firefox (Safari needs an /etc/hosts line)"
       ;;
     stop|down)
@@ -1860,6 +2372,9 @@ cmd_delete() {
   if [ -n "$ENGINE" ]; then
     "$ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
     [ -n "$vols" ] && "$ENGINE" volume rm $vols >/dev/null 2>&1 || true
+    # Egress internal network (restricted projects): detach the proxy, then remove.
+    "$ENGINE" network disconnect "$(internal_net "$name")" "$PROXY_NAME" >/dev/null 2>&1 || true
+    "$ENGINE" network rm "$(internal_net "$name")" >/dev/null 2>&1 || true
     volume_exists && "$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" \
       sh -c "rm -f '$prof' '$prof'-*-link" >/dev/null 2>&1 || true
   fi
@@ -1964,7 +2479,7 @@ cmd_update() {
   "$ENGINE" rm -f "${CONTAINER_PREFIX}__update" >/dev/null 2>&1 || true
   "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__update" \
     -v "$FLAKE_DIR":/flake -w /flake \
-    -e NIX_CONFIG=$'experimental-features = nix-command flakes' \
+    -e NIX_CONFIG="$(nix_config)" \
     "$(img "$BUILDER_IMAGE")" nix flake update
   cmd_build
 }
@@ -2067,9 +2582,12 @@ Commands:
                             profile, layered on top of the base. Default reads
                             flake.nix from the repo root; --dir=P copies a whole
                             folder (flake.nix + local deps it references)
-  init <project> [git-url] [--build] [--app-path=/path]
+  init <project> [git-url] [--build] [--unrestricted] [--app-path=/path]
                             Scaffold <project>/home + the <project>_app volume;
-                            prompts for git name/email; clones git-url if given;
+                            prompts for git name/email; clones git-url if given
+                            (the forge domain is auto-added to allowed_hosts).
+                            Egress restriction is ON by default (see 'restrict');
+                            --unrestricted opts this project out.
                             --build also builds the project's flake.
                             --app-path=/path mounts the code volume there instead
                             of /app (stored in <project>/app_mount)
@@ -2093,6 +2611,17 @@ Commands:
                             to skip trusting), else Caddy's internal CA.
                             'renew' reissues the cert; 'remove-cert' deletes it
                             (falls back to the internal CA)
+  restrict <project> [on|off]
+                            Egress restriction — ON BY DEFAULT for every project:
+                            it runs on its own INTERNAL network (no route out) and
+                            can only reach hosts in <project>/allowed_hosts (the
+                            forge domain is seeded automatically), via squid in
+                            the proxy container (default-deny). ssh/ports keep
+                            working (relayed through the proxy). 'off' opts out
+  allow <project> <host>…   Add validated egress host(s) (domain or IP) to
+                            <project>/allowed_hosts and reload the proxy
+  egress <project> [-f]     Show the project's egress log: allowed vs DENIED
+                            domains (candidates to validate); -f follows live
   ssh-config [--install]    Print (or install) the ~/.ssh/config Include so
                             'ssh <project>' works via each <project>/ssh/config
   up <project>              build if needed, then start the service
@@ -2121,6 +2650,10 @@ Per-project (runtime runs as non-root user '$APP_USER'):
   <project>/ports       → extra published ports (one per line; via 'expose')
   <project>/hosts.extra → extra /etc/hosts lines (native "ip name" format), merged
                           into /etc/hosts at container start (edit by hand or 'host')
+  <project>/unrestricted → opt-OUT marker: egress restriction disabled for this
+                          project ('restrict <p> off'; absent = restricted)
+  <project>/allowed_hosts → validated egress hosts, one per line (via 'allow';
+                          init seeds the forge domain from the clone URL)
 
 SSH: each project gets a random host port (stored once in <project>/port). The
 container runs an unprivileged sshd (port 2222) via runit as '$APP_USER', open
@@ -2187,6 +2720,9 @@ main() {
     expose)   cmd_expose "$@";;
     host)     cmd_host "$@";;
     proxy)    cmd_proxy "$@";;
+    restrict) cmd_restrict "$@";;
+    allow)    cmd_allow "$@";;
+    egress)   cmd_egress "$@";;
     stop)     cmd_stop "$@";;
     logs)     cmd_logs "$@";;
     delete|rm) cmd_delete "$@";;
@@ -2199,4 +2735,8 @@ main() {
   esac
 }
 
-main "$@"
+# Run only when EXECUTED. When sourced (the test suite does this to unit-test
+# the functions), define everything but perform no action.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

@@ -101,6 +101,34 @@
             10.0.0.6      cache.internal
             127.0.0.1     api.local
           '';
+
+          # --- Startup hook (optional) ----------------------------------------
+          # DECLARED here at build time, EXECUTED at container start: nixenv
+          # SOURCES etc/nixenv-hooks.sh from this profile before any service
+          # (incl. sshd) starts. This is the only way to run project code at
+          # startup — a Nix build is sandboxed to its own $out and can never
+          # write $HOME. The hook runs in the real container, as the app user,
+          # with this profile already first on PATH.
+          # Handy variables: $SVROOT ($HOME/.nixenv-sv), $NIXENV_APP_MOUNT,
+          # $NIXENV_PROJECT, $NIXENV_EXTRA_PROFILE.
+          # Anything it writes into $SVROOT/<name>/run is supervised THIS boot.
+          #
+          # Simplest form — the file is sourced, so top-level code just runs.
+          # A <project>-setup script shipped by this same flake is on PATH:
+          startupHook = pkgs.writeTextDir "etc/nixenv-hooks.sh" ''
+            myproject-setup
+          '';
+          # Equivalent using the optional hook FUNCTION instead. Use this form if
+          # you want a repo/home hook to be able to override it (last definition
+          # wins), or if the body needs `return` — never `exit` at top level,
+          # which would terminate the entrypoint:
+          #
+          #   startupHook = pkgs.writeTextDir "etc/nixenv-hooks.sh" '''
+          #     nixenv_pre_ssh_start() {
+          #       mkdir -p "$SVROOT/supervisord"
+          #       install -Dm755 ${"\${supervisordRun}"}/bin/run "$SVROOT/supervisord/run"
+          #     }
+          #   ''';
         in {
           default = pkgs.buildEnv {
             name = "project-deps";
@@ -138,6 +166,11 @@
               # Ships etc/hosts.extra in the profile; nixenv merges it into the
               # container's /etc/hosts at start. Remove this line to disable.
               hostsExtra
+
+              # --- Startup hook (see `startupHook` above) ---
+              # Ships etc/nixenv-hooks.sh; nixenv sources it and calls
+              # nixenv_pre_ssh_start before services start. Remove to disable.
+              startupHook
 
               # --- Example using the optional unstable input (see inputs above) ---
               # unstable.some-bleeding-edge-tool
@@ -193,6 +226,15 @@
 #
 # Then `supervisorctl` (also on PATH) manages your supervisord-defined processes.
 # Add more services the same way: one <repo>/.nixenv/sv/<name>/run per service.
+#
+# ── Alternative: declare the service from THIS flake ────────────────────────
+# A flake build is sandboxed — it can only write to its own $out in the store,
+# so it can NEVER create files in $HOME (e.g. ~/.nixenv-sv/<name>/run) or in the
+# app volume. To ship a service with the toolchain instead of the repo, use the
+# STARTUP HOOK (`startupHook` above): the flake declares etc/nixenv-hooks.sh at
+# build time, and nixenv calls `nixenv_pre_ssh_start` at container start — in
+# the real container, where writing to $HOME works. Services it creates in
+# $SVROOT are supervised in the same boot.
 # =============================================================================
 
 # =============================================================================
