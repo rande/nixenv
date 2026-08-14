@@ -17,6 +17,24 @@ assert_contains "$ep" 'NIXENV_EXTRA_PROFILE/etc/hosts.extra' "flake-declared hos
 assert_contains "$ep" '/etc/hosts.extra' "host-side hosts"
 assert_contains "$ep" '127.0.1.1'
 
+assert_not_contains "$ep" '@proxy' "no @proxy indirection (loopback relay replaces it)"
+
+# loopback relay: curl/libcurl force *.localhost to 127.0.0.1, so make that real
+assert_contains "$ep" 'proxy-relay-$_pp' "relay service dirs"
+assert_contains "$ep" 'TCP4-LISTEN:$_pp,bind=127.0.0.1,fork,reuseaddr' "relay listener"
+assert_contains "$ep" 'sleep 5; exit 0' "waits for the proxy instead of crash-looping"
+# the relay must be installed BEFORE the supervise scan picks services up
+relay_ln="$(printf '%s\n' "$ep" | grep -n 'proxy-relay-\$_pp' | head -1 | cut -d: -f1)"
+scan_ln="$(printf '%s\n' "$ep" | grep -n 'for d in "\$SVROOT"/\*/' | cut -d: -f1)"
+[ "$relay_ln" -lt "$scan_ln" ] || fail "relay must be created before the service scan"
+
+# proxy CA merged into a bundle + exported for every major client
+assert_contains "$ep" '/etc/nixenv-proxy-ca.crt' "proxy CA mount path"
+assert_contains "$ep" '.nixenv-ca-bundle.crt' "merged bundle"
+for v in SSL_CERT_FILE CURL_CA_BUNDLE REQUESTS_CA_BUNDLE GIT_SSL_CAINFO NODE_EXTRA_CA_CERTS; do
+  assert_contains "$ep" "$v" "exports $v"
+done
+
 # egress: exported for services AND written to .zshenv; ssh ProxyCommand block
 assert_contains "$ep" 'NIXENV_EGRESS_PROXY'
 assert_contains "$ep" 'export HTTP_PROXY='

@@ -28,3 +28,8 @@ assert_no_file "$NIXENV_PROJECTS_DIR/p/unrestricted"
 nx host p db:10.0.0.5 >/dev/null 2>&1 || true
 assert_contains "$(cat "$NIXENV_PROJECTS_DIR/p/hosts.extra")" "10.0.0.5	db"
 if nx host p gw:host-gateway >/dev/null 2>&1; then fail "non-IP should be rejected"; fi
+
+# public URLs from inside use plain loopback (the relay forwards to the proxy)
+nx host p 'app-8000.nixenv.localhost:127.0.0.1' >/dev/null 2>&1 || true
+assert_contains "$(cat "$NIXENV_PROJECTS_DIR/p/hosts.extra")" "127.0.0.1	app-8000.nixenv.localhost"
+if nx host p 'x.nixenv.localhost:@proxy' >/dev/null 2>&1; then fail "@proxy should no longer be accepted"; fi

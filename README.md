@@ -178,6 +178,56 @@ plain shell if you prefer.
 no zmx) — handy as an escape hatch. The prompt shows the project name (the
 container's hostname is set to it), plus the zmx session when you're in one.
 
+## Networking overview
+
+Four distinct paths, each with its own knob. The diagram shows a restricted
+project (the default); an unrestricted one differs only in that it sits on the
+shared network and publishes its own ports.
+
+```mermaid
+flowchart LR
+    subgraph HOST["🖥️  your Mac"]
+        BROWSER["browser<br/>*.localhost → 127.0.0.1"]
+        CLIENT["psql / TablePlus / ssh"]
+    end
+
+    subgraph PROXYC["📦 nixenv-proxy"]
+        CADDY["Caddy :80/:443<br/><i>ingress — routes on Host</i>"]
+        SQUID["squid :3128<br/><i>egress allowlist</i>"]
+        RELAYS["socat relays<br/><i>ssh + declared ports</i>"]
+    end
+
+    subgraph PROJ["📦 nixenv-myapp &nbsp;(internal network)"]
+        LOOP["socat 127.0.0.1:443/:80<br/><i>loopback relay</i>"]
+        APP["your app :8000"]
+        SSHD["sshd :2222"]
+    end
+
+    NET(["🌍 internet"])
+
+    BROWSER -- "① https://myapp-8000.nixenv.localhost" --> CADDY
+    CADDY -- "Host → container:port" --> APP
+    APP -. "② public URL from inside<br/>curl forces *.localhost → 127.0.0.1" .-> LOOP
+    LOOP -- "raw TCP, TLS stays end-to-end" --> CADDY
+    APP -- "③ HTTPS_PROXY env → CONNECT" --> SQUID
+    SQUID -- "allowed_hosts only<br/>else 403" --> NET
+    CLIENT -- "④ 127.0.0.1:port" --> RELAYS
+    RELAYS --> SSHD
+
+    style NET fill:#eee,stroke:#999
+```
+
+| # | Path | Configure with |
+| --- | --- | --- |
+| ① | **Ingress** — browser → app, HTTPS, no setup | automatic; `proxy up\|status`, `PROXY_DOMAIN`, `PROXY_HTTP_PORT`/`PROXY_HTTPS_PORT`, mkcert for trusted certs |
+| ② | **Public URL from inside** the container | automatic (loopback relay + CA injection); glibc clients need `nixenv host <p> <name>:127.0.0.1` |
+| ③ | **Egress** to the internet — default-deny | `restrict <p> on\|off`, `allow <p> <host>`, `egress <p>` to see allowed vs denied |
+| ④ | **Raw TCP** from your Mac (databases, ssh) | `expose <p> <port>`; ssh port is automatic |
+
+Two paths need no proxy at all: **service-to-service** calls between projects
+use `http://nixenv-<project>:<port>/` over the shared network, and anything
+inside one container talks to itself on `localhost:<port>`.
+
 ## Exposing ports
 
 > **Tip — for HTTP(S) services, prefer the
@@ -226,6 +276,45 @@ headers (`X-Forwarded-Proto: https`, `X-Forwarded-For/-Host/-Port`,
 `X-Real-IP`), so frameworks behind a trusted proxy generate correct `https://`
 URLs. Host ports default to 80/443 (`PROXY_HTTP_PORT`/`PROXY_HTTPS_PORT`; use
 8080/8443 for rootless Podman, which can't bind below 1024).
+
+### Reaching a public URL from *inside* a container
+
+Public URLs work from inside containers too — `curl https://myapp-8000.nixenv.localhost/`
+just works, no configuration:
+
+```sh
+./nixenv.sh shell myapp
+curl https://myapp-8000.nixenv.localhost/     # → routed to the app, cert trusted
+```
+
+Three things make that work, all automatic:
+
+**A loopback relay.** curl (and therefore libcurl, PHP's ext-curl, Guzzle,
+Symfony HttpClient) implements RFC 6761 internally: it resolves `localhost` and
+*any* `*.localhost` name to 127.0.0.1, **ignoring `/etc/hosts` and DNS**. So
+rather than fight it, each project container runs a small `socat` relay
+(supervised by runit) forwarding `127.0.0.1:443` and `:80` to the proxy — making
+loopback genuinely correct. It's a raw TCP relay, so TLS stays end-to-end with
+Caddy: SNI and the `Host` header arrive intact, the wildcard cert matches, and
+routing works. Non-curl clients (PHP streams, Python, Go, Java) resolve via
+`/etc/hosts`, so for those add one line pointing at loopback:
+
+```sh
+./nixenv.sh host myapp myapp-8000.nixenv.localhost:127.0.0.1
+```
+
+**Standard ports.** Caddy binds 80/443 *inside* the proxy container (it runs
+with `net.ipv4.ip_unprivileged_port_start=0`), so URLs need no `:8443` suffix.
+
+**Trusted TLS.** The proxy's root CA (mkcert's, or Caddy's internal one) is
+mounted into every container and merged into a CA bundle exported as
+`SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`
+and `GIT_SSL_CAINFO` — so HTTPS is *trusted*, not merely reachable.
+
+For plain service-to-service calls you don't need any of this:
+`http://nixenv-myapp:8000/` already resolves over the shared network and skips
+the hairpin. Use the public URL when the app genuinely needs it — absolute link
+generation, OAuth redirects, tests hitting the real hostname.
 
 ### Trusted certificates (mkcert)
 

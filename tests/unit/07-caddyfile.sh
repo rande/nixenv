@@ -7,8 +7,10 @@ rm -rf "$PROXY_DIR"
 
 write_caddyfile 0
 cf="$(cat "$PROXY_DIR/Caddyfile")"
-assert_contains "$cf" "http_port 8080"
-assert_contains "$cf" "https_port 8443"
+# Standard ports in-container (proxy runs with ip_unprivileged_port_start=0), so
+# https://<project>-<port>.<domain>/ works from inside containers with no suffix.
+assert_contains "$cf" "http_port 80"
+assert_contains "$cf" "https_port 443"
 assert_contains "$cf" "*.$PROXY_DOMAIN"
 assert_contains "$cf" "tls internal" "internal CA mode"
 assert_contains "$cf" '^(.+)-([0-9]+)\.nixenv\.localhost(:[0-9]+)?$' "route regex"

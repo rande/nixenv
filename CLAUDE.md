@@ -128,7 +128,33 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   it does replace the engine's dynamic container-IP line (we substitute
   `127.0.1.1 <hostname>`). The `host <project> <name:ip>…` helper appends
   converted `ip<TAB>name` lines to the host-side `hosts.extra`; flake entries are
-  the versioned/team-shared path. `$hostsmount` is an empty-guarded unquoted var.
+  the versioned/team-shared path. `$hostsmount` is an array of `-v` args.
+- Reaching PUBLIC URLs from inside a container (`https://<p>-<port>.<domain>/`)
+  needs three things, all implemented: (1) **loopback relay** — curl/libcurl (so
+  also PHP ext-curl, Guzzle, Symfony HttpClient) implement RFC 6761 internally and
+  force `localhost` + ANY `*.localhost` name to 127.0.0.1, IGNORING `/etc/hosts`
+  and DNS. So the entrypoint installs runit services `proxy-relay-443`/`-80`
+  running `socat TCP4-LISTEN:<p>,bind=127.0.0.1,fork TCP:$NIXENV_PROXY_NAME:<p>`,
+  making loopback genuinely correct; it's a raw TCP relay so TLS stays end-to-end
+  with caddy (SNI + Host intact). The run script `getent`s the proxy and
+  `sleep 5; exit 0`s if absent — `run` starts the proxy AFTER the container, so
+  runsv retries until it appears. Project containers therefore also get
+  `--sysctl net.ipv4.ip_unprivileged_port_start=0`. glibc clients (PHP streams,
+  Python, Go) don't share curl's rule, so they need a plain `127.0.0.1 <name>`
+  entry in `hosts.extra` — loopback, NOT the proxy's IP, so everything converges
+  on the relay. (An earlier `@proxy` token that resolved to the proxy container's
+  IP was removed as redundant: the relay is hostname-agnostic, so loopback covers
+  every client, and caddy only serves `*.PROXY_DOMAIN` anyway.)
+  (2) **Port** — caddy binds **80/443 in-container** (proxy gets
+  `--sysctl net.ipv4.ip_unprivileged_port_start=0`; host publish maps
+  `PROXY_HTTP_PORT`/`PROXY_HTTPS_PORT` onto them), so no `:8443` suffix.
+  (3) **TLS trust** — the proxy's root CA (mkcert's, or Caddy's internal via
+  `export_caddy_ca` after start) is published to `~/.nixenv/proxy/certs/rootCA.pem`,
+  mounted at `/etc/nixenv-proxy-ca.crt`, and merged by the entrypoint into
+  `$HOME/.nixenv-ca-bundle.crt`, exported as `SSL_CERT_FILE`/`NIX_SSL_CERT_FILE`/
+  `CURL_CA_BUNDLE`/`REQUESTS_CA_BUNDLE`/`GIT_SSL_CAINFO` (+ `NODE_EXTRA_CA_CERTS`,
+  which Node requires instead of `SSL_CERT_FILE`). Plain service-to-service calls
+  need none of this — `http://<prefix>-<project>:<port>/` already resolves.
 - Per-project tooling: `build <project> [--dir=<path>]` (`cmd_build_project`)
   copies the project flake into `<project>/flake/` and
   `nix profile install path:/flake#$PROJECT_ATTR` into `/nix/var/nix/profiles/proj-<name>`

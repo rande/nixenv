@@ -312,6 +312,28 @@ APP_MOUNT="${NIXENV_APP_MOUNT:-/app}"   # where the code volume is mounted
 mkdir -p "$HOME_DIR/.cache/omz" "$HOME_DIR/.ssh" 2>/dev/null || true
 chmod 700 "$HOME_DIR/.ssh" 2>/dev/null || true
 
+# --- CA bundle ---------------------------------------------------------------
+# The shared store ships a CA bundle. When nixenv mounts the reverse proxy's root
+# CA (mkcert's or Caddy's internal), merge the two into a writable bundle so
+# https://*.<proxy domain> is TRUSTED inside the container — curl, PHP, Node,
+# Python, git all read one of the vars exported below. Falls back to the store
+# bundle untouched when no proxy CA is mounted.
+_NIXENV_CA_BUNDLE="$PROFILE/etc/ssl/certs/ca-bundle.crt"
+_NIXENV_NODE_CA=""
+if [ -f /etc/nixenv-proxy-ca.crt ]; then
+  if cat "$PROFILE/etc/ssl/certs/ca-bundle.crt" /etc/nixenv-proxy-ca.crt \
+       > "$HOME_DIR/.nixenv-ca-bundle.crt" 2>/dev/null; then
+    _NIXENV_CA_BUNDLE="$HOME_DIR/.nixenv-ca-bundle.crt"
+    # Node ignores SSL_CERT_FILE; it needs NODE_EXTRA_CA_CERTS (the extra cert
+    # only, not the bundle).
+    _NIXENV_NODE_CA='export NODE_EXTRA_CA_CERTS="/etc/nixenv-proxy-ca.crt"'
+  fi
+fi
+export SSL_CERT_FILE="$_NIXENV_CA_BUNDLE" NIX_SSL_CERT_FILE="$_NIXENV_CA_BUNDLE"
+export CURL_CA_BUNDLE="$_NIXENV_CA_BUNDLE" REQUESTS_CA_BUNDLE="$_NIXENV_CA_BUNDLE"
+export GIT_SSL_CAINFO="$_NIXENV_CA_BUNDLE"
+[ -n "$_NIXENV_NODE_CA" ] && export NODE_EXTRA_CA_CERTS=/etc/nixenv-proxy-ca.crt
+
 # --- Shared profile + shell config available to every zsh --------------------
 # .zshenv is sourced for login and non-login shells alike. $PROFILE etc. are
 # baked in at write time; \$HOME / \$NIXENV_* stay literal for zsh to evaluate.
@@ -326,8 +348,12 @@ _nixenv_extra=""
 export PATH="\${_nixenv_extra}$PROFILE/bin:\$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export ZSH="$PROFILE/share/oh-my-zsh"
 export ZSH_CACHE_DIR="\$HOME/.cache/omz"
-export SSL_CERT_FILE="$PROFILE/etc/ssl/certs/ca-bundle.crt"
-export NIX_SSL_CERT_FILE="$PROFILE/etc/ssl/certs/ca-bundle.crt"
+export SSL_CERT_FILE="$_NIXENV_CA_BUNDLE"
+export NIX_SSL_CERT_FILE="$_NIXENV_CA_BUNDLE"
+export CURL_CA_BUNDLE="$_NIXENV_CA_BUNDLE"
+export REQUESTS_CA_BUNDLE="$_NIXENV_CA_BUNDLE"
+export GIT_SSL_CAINFO="$_NIXENV_CA_BUNDLE"
+$_NIXENV_NODE_CA
 export EDITOR=vim
 export LANG=C.UTF-8
 EOF
@@ -413,6 +439,10 @@ fi
 # When /etc/hosts is the engine-managed root-owned default this is skipped (we
 # can't and needn't touch it). Regenerating (not appending) is idempotent.
 if [ -w /etc/hosts ]; then
+  # To reach a project's PUBLIC URL from inside, point the name at 127.0.0.1 —
+  # the loopback relay above forwards to the proxy, which routes on the Host
+  # header. (curl/libcurl force *.localhost to loopback anyway, ignoring this
+  # file, so loopback is the one form that works for every client.)
   {
     printf '127.0.0.1\tlocalhost\n'
     printf '::1\tlocalhost ip6-localhost ip6-loopback\n'
@@ -514,6 +544,31 @@ fi
 _extra=""
 [ -n "${NIXENV_EXTRA_PROFILE:-}" ] && [ -d "$NIXENV_EXTRA_PROFILE/bin" ] && _extra="$NIXENV_EXTRA_PROFILE/bin:"
 export PATH="${_extra}$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# 1a. Loopback relay to the shared proxy ------------------------------------
+# curl/libcurl implement RFC 6761 internally: they resolve `localhost` and ANY
+# `*.localhost` name to 127.0.0.1, ignoring /etc/hosts and DNS. So pointing
+# <project>-<port>.<domain> at the proxy's IP in /etc/hosts does NOT work for
+# curl, PHP ext-curl, Guzzle, Symfony HttpClient, …
+# Fix: make loopback correct — relay 127.0.0.1:443/:80 to the proxy container.
+# It's a raw TCP relay, so TLS stays end-to-end with caddy (SNI + Host header
+# arrive intact → the wildcard cert matches and routing works). Needs
+# net.ipv4.ip_unprivileged_port_start=0 on this container (set by 'run').
+if [ -n "${NIXENV_PROXY_NAME:-}" ] && [ -x "$PROFILE/bin/socat" ]; then
+  for _pp in 443 80; do
+    mkdir -p "$SVROOT/proxy-relay-$_pp"
+    # The proxy may not be up yet ('run' starts it AFTER this container), so the
+    # service waits for it to resolve instead of failing. Exiting lets runsv
+    # retry; the sleep throttles that to once every 5s.
+    cat > "$SVROOT/proxy-relay-$_pp/run" <<RELAY
+#!/bin/sh
+getent hosts "$NIXENV_PROXY_NAME" >/dev/null 2>&1 || { sleep 5; exit 0; }
+exec "$PROFILE/bin/socat" TCP4-LISTEN:$_pp,bind=127.0.0.1,fork,reuseaddr TCP:$NIXENV_PROXY_NAME:$_pp
+RELAY
+    chmod +x "$SVROOT/proxy-relay-$_pp/run"
+  done
+  echo "nixenv: loopback relay 127.0.0.1:443/:80 → $NIXENV_PROXY_NAME (public URLs work in-container)"
+fi
 
 # 1b. Startup hooks. Every hook file that exists is sourced, in order:
 #   $NIXENV_EXTRA_PROFILE/etc/nixenv-hooks.sh  (declared in the project flake)
@@ -1616,6 +1671,9 @@ cmd_run() {
   touch "$pdir/etc-hosts"   # writable placeholder owned by us; entrypoint fills it
   hostsmount=(-v "$pdir/etc-hosts:/etc/hosts")
   [ -f "$pdir/hosts.extra" ] && hostsmount+=(-v "$pdir/hosts.extra:/etc/hosts.extra:ro")
+  # The proxy's root CA (mkcert's or Caddy's internal), so the container can
+  # trust https://*.$PROXY_DOMAIN. The entrypoint merges it into a CA bundle.
+  [ -f "$PROXY_DIR/certs/rootCA.pem" ] && hostsmount+=(-v "$PROXY_DIR/certs/rootCA.pem:/etc/nixenv-proxy-ca.crt:ro")
 
   if container_running "$cname"; then
     ok "Project '$name' already running as '$cname'"
@@ -1629,6 +1687,7 @@ cmd_run() {
       --user "$(id -u):$(id -g)" \
       $(engine_userns) \
       --sysctl net.ipv4.ping_group_range="0 2147483647" \
+      --sysctl net.ipv4.ip_unprivileged_port_start=0 \
       ${pub[@]+"${pub[@]}"} \
       ${egress_env[@]+"${egress_env[@]}"} \
       "${hostsmount[@]}" \
@@ -1650,6 +1709,8 @@ cmd_run() {
       -e SSHD_PORT="$SSHD_PORT" \
       -e NIXENV_PROJECT="$name" \
       -e NIXENV_APP_MOUNT="$appmnt" \
+      -e NIXENV_PROXY_NAME="$PROXY_NAME" \
+      -e NIXENV_PROXY_DOMAIN="$PROXY_DOMAIN" \
       -e NIXENV_EXTRA_PROFILE="$(project_profile "$name")" \
       "$(img "$RUNTIME_IMAGE")" \
       sh /usr/local/bin/nixenv-entrypoint >/dev/null
@@ -1745,7 +1806,9 @@ cmd_host() {
     nm="${h%%:*}"; ip="${h#*:}"   # ip = everything after the FIRST ':' (IPv6-safe)
     [ -n "$nm" ] && [ -n "$ip" ] || die "invalid entry '$h' — expected name:ip"
     # The ip part must be a literal address: IPv4 (digits/dots) or IPv6 (has ':').
-    # Names like 'host-gateway' are --add-host magic — invalid in a hosts file.
+    # Names like 'host-gateway' are --add-host magic, invalid in a hosts file.
+    # To reach a public <project>-<port>.$PROXY_DOMAIN URL from inside the
+    # container, use 127.0.0.1 — the loopback relay forwards it to the proxy.
     case "$ip" in
       *:*) ;;                                  # IPv6
       *[!0-9.]*) die "'$ip' is not an IP address (hosts.extra needs literal IPs)";;
@@ -1939,9 +2002,25 @@ proxy_make_cert() {
 
   if mkcert -cert-file "$PROXY_DIR/certs/wildcard.pem" -key-file "$PROXY_DIR/certs/wildcard-key.pem" \
        "*.$PROXY_DOMAIN" "$PROXY_DOMAIN" >/dev/null 2>&1; then
+    # Publish the CA so CONTAINERS can trust these certs too (the host trusts it
+    # via the OS store; containers get it mounted + merged into their bundle).
+    [ -f "$caroot/rootCA.pem" ] && cp "$caroot/rootCA.pem" "$PROXY_DIR/certs/rootCA.pem" 2>/dev/null || true
     ok "issued wildcard cert for *.$PROXY_DOMAIN (mkcert)"; return 0
   fi
   warn "mkcert could not issue the wildcard cert — falling back to Caddy internal CA"; return 1
+}
+
+# Publish Caddy's INTERNAL CA root (used when mkcert isn't available) so project
+# containers can trust https://*.$PROXY_DOMAIN. Caddy writes it on first start,
+# so this runs after the proxy is up. No-op if the file isn't there (yet).
+export_caddy_ca() {
+  local src="$PROXY_DIR/data/caddy/pki/authorities/local/root.crt"
+  [ -f "$PROXY_DIR/certs/rootCA.pem" ] && return 0   # mkcert CA already published
+  if [ -f "$src" ]; then
+    mkdir -p "$PROXY_DIR/certs"
+    cp "$src" "$PROXY_DIR/certs/rootCA.pem" 2>/dev/null || return 1
+    log "published Caddy's internal CA → $PROXY_DIR/certs/rootCA.pem (trusted inside containers)"
+  fi
 }
 
 # Generate $PROXY_DIR/egress/: squid.conf (per-project domain ACLs keyed by the
@@ -2102,8 +2181,12 @@ write_caddyfile() {
   # literal; \. and \$ are preserved/reduced to regex-correct forms.
   cat > "$PROXY_DIR/Caddyfile" <<CADDY
 {
-	http_port 8080
-	https_port 8443
+	# Standard ports IN-CONTAINER: the proxy runs with
+	# net.ipv4.ip_unprivileged_port_start=0 so non-root caddy can bind them.
+	# This is what lets a project reach another project's PUBLIC URL from inside
+	# (https://<project>-<port>.$PROXY_DOMAIN/ with no :port suffix).
+	http_port 80
+	https_port 443
 }
 
 *.$PROXY_DOMAIN {
@@ -2149,8 +2232,9 @@ cmd_proxy() {
         --network "$PROXY_NET" \
         --user "$(id -u):$(id -g)" \
         $(engine_userns) \
-        -p "127.0.0.1:$PROXY_HTTP_PORT:8080" \
-        -p "127.0.0.1:$PROXY_HTTPS_PORT:8443" \
+        --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+        -p "127.0.0.1:$PROXY_HTTP_PORT:80" \
+        -p "127.0.0.1:$PROXY_HTTPS_PORT:443" \
         ${EGRESS_PUB[@]+"${EGRESS_PUB[@]}"} \
         -v "$NIX_VOLUME":/nix:ro \
         -v "$PROXY_DIR/Caddyfile":/etc/caddy/Caddyfile:ro \
@@ -2168,6 +2252,9 @@ cmd_proxy() {
       for rp in $EGRESS_PROJECTS; do
         "$ENGINE" network connect "$(internal_net "$rp")" "$PROXY_NAME" >/dev/null 2>&1 || true
       done
+      # Caddy writes its internal CA on first start; give it a moment, then
+      # publish it so containers can trust the certs it serves.
+      sleep 2; export_caddy_ca || true
       ok "proxy running as '$PROXY_NAME'"
       echo "   scheme: https://<project>-<port>.$PROXY_DOMAIN/   (e.g. https://myapp-3000.$PROXY_DOMAIN/)"
       if [ "$cert" = 1 ]; then echo "   tls:    trusted wildcard cert via mkcert"
