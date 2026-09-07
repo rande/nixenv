@@ -15,6 +15,18 @@ both are installed) into `$ENGINE`; every container call goes through `$ENGINE`,
 and `img()` prefixes `docker.io/` for podman short names. Don't hardcode
 `docker` in new code — use `"$ENGINE"` and wrap image refs in `img`.
 
+The BASE flake is a shell/editor/CLI toolbox and ships **no language runtimes**
+— no Node, PHP, Python, Go, Rust or Ruby, no package managers (composer, uv), no
+sqlite, and no language servers that would need one (pyright, intelephense,
+gopls, …). Only `lua-language-server` (for the nvim config) and
+`bash-language-server` remain, since they need nothing on PATH. Languages belong
+in a **per-project flake** (`build <project>`), runtime + its LSP together; the
+nvim packs in the home skeleton mirror this (bash/lua only). Unit test
+`02-materialize-context.sh` enforces both lists, so don't reintroduce runtimes
+into the embedded flake. Note `claude-code` and the two language servers are
+node applications, but nixpkgs wraps them with their own interpreter — they work
+without Node on PATH.
+
 ## Single source of truth
 
 `nixenv.sh` is **self-contained**. All supporting files are embedded inside it as
@@ -103,7 +115,13 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   volume), then starts a background `runsv` for EVERY service dir present in the
   tree (not just repo-discovered ones — a dir installed there directly, e.g. by a
   project setup script, is supervised too). Remove a service by deleting its
-  `$HOME/.nixenv-sv/<name>` dir. **Startup hooks**: before the supervise scan (so
+  `$HOME/.nixenv-sv/<name>` dir. Declared services are refreshed from TWO
+  sources each boot, repo LAST so it can override: the project flake's
+  `$NIXENV_EXTRA_PROFILE/sv/<name>/run` (templates use
+  `writeTextDir "sv/<name>/run"`) and `$APP_MOUNT/.nixenv/sv/<name>/run`.
+  Declaring services as profile FILES is deliberate — writing them from the hook
+  means nesting shell heredocs inside a Nix `''` string, where indentation
+  stripping can break the terminator and silently produce an unparseable hook. **Startup hooks**: before the supervise scan (so
   hooks can add services for the same boot), the entrypoint sources every hook
   file that exists — `$NIXENV_EXTRA_PROFILE/etc/nixenv-hooks.sh` (flake-declared),
   `$APP_MOUNT/.nixenv/hooks.sh` (repo), `$HOME/.nixenv-hooks.sh` (local) — then
@@ -186,13 +204,18 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
 - `run <project>` (no cmd) starts a **detached** service container named
   `<prefix>-<project>` with `-p <project-port>:22`. `ssh`/`shell` auto-start it;
   `shell` uses `docker exec` (no key needed), `ssh` uses the host `ssh` client.
-  `stop` removes the container; `logs` follows it.
+  `stop <project>` removes that container; **`stop` with no argument** removes
+  every container matching `^<prefix>(-|__)` — all projects, the shared proxy and
+  any stray helper — leaving volumes/projects intact. `logs` follows a container.
 - Egress restriction (ON BY DEFAULT; opt-out per project): restriction applies
   unless the `<project>/unrestricted` marker exists (`restrict <p> off` or
   `init --unrestricted` create it; `restrict <p> on` removes it; `is_restricted`
   = marker absent). `<project>/allowed_hosts` holds the validated hosts
   (domains/IPs, one per line; `allow <p> <host>…` appends; `cmd_init` auto-seeds
-  the forge domain via `forge_host_from_url`, so git-to-forge works by default). A restricted project runs on its
+  the forge domain via `forge_host_from_url`, so git-to-forge works by default,
+  and `init --allow=a.com,b.com` (repeatable) pre-seeds more). Entries go through
+  `normalize_allowed_host` (shared by `init`/`allow`): `*.foo` → `.foo`
+  (subdomains), a bare name stays EXACT, schemes/ports/paths rejected. A restricted project runs on its
   own `--internal` network `nixenv_<p>_egress` (`internal_net`/`ensure_internal_net`)
   — kernel-enforced no-route-out — with NO published ports (`-p` doesn't work on
   internal networks); its ssh/extra ports are published by the PROXY container and
@@ -210,7 +233,13 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   `-e NIXENV_EGRESS_PROXY=http://<proxy>:3128`; the **entrypoint** then exports
   HTTP(S)_PROXY into `.zshenv` and appends a marker-guarded `ProxyCommand socat -
   PROXY:…` block to `~/.ssh/config` (ssh/git-ssh tunnel via CONNECT to validated
-  hosts). Starting a restricted
+  hosts). **Ordering matters**: `cmd_run` starts the proxy BEFORE the container
+  for a restricted project — on an internal network it's the only route out and
+  the first-run hook (template setup: composer/npm/wp-cli) needs egress
+  immediately; starting it afterwards made setup die with "could not resolve
+  proxy". The entrypoint also waits (≤20s) for the proxy name to resolve before
+  running hooks, and `cmd_run` refreshes the proxy again once the container
+  exists so the ssh/port relays can target it. Starting a restricted
   project recreates the proxy (new relays/ports need a new container), but
   `allow` HOT-reloads ACLs via `squid -k reconfigure` (no proxy recreate — which
   is also why `write_egress_configs` must never `rm -rf` the bind-mounted egress
@@ -251,12 +280,46 @@ installed `nixenv`.** The installed `/usr/local/bin/nixenv` is a snapshot from
 the last `./nixenv.sh install`; while iterating on `nixenv.sh` it will be stale,
 so all examples and instructions must use `./nixenv.sh`.
 
+- Templates (`init --template=<name|url|path>`): a template is ONE file that
+  becomes the project's `flake.nix`. `resolve_template` handles local paths,
+  full URLs, and short names against `TEMPLATE_BASE` (cached in
+  `~/.nixenv/templates/`); `template_meta <file> <key>` reads leading
+  `# nixenv:<key> <value>` comments (`description`, `port`, `allow`, `app-path`)
+  BEFORE the build, so declared egress hosts/app-path feed the normal init flow.
+  `install_template` substitutes `@@PROJECT@@`/`@@APP_MOUNT@@`/`@@DOMAIN@@`/
+  `@@PORT@@` and writes `flake.nix` into the app volume (never clobbers an
+  existing one), then `init` forces a project build. Mutually exclusive with a
+  git URL; confirms first unless `--yes`. The app itself is installed at first
+  `run` by the template's **startup hook** (marker-guarded), NOT vendored in the
+  flake — a build can't write the app volume. Shipped: `templates/wordpress.nix`
+  (wp-cli downloads core + plugins), `templates/cloudflare.nix` (scaffolds a
+  Worker, runs `wrangler dev --ip 0.0.0.0`), `templates/symfony.nix`,
+  `templates/headlesscms-directus-astro.nix`, `templates/windmill.nix`
+  (self-hosted Windmill: replaces upstream's docker-compose with runit services —
+  `windmill-server` + two worker groups + postgres, one binary that embeds the
+  frontend). Windmill is the exception to "the app lives in the app volume":
+  scripts/flows live in PostgreSQL, so its hook only seeds a README, a
+  `.gitignore`, an empty `workspaces/` dir, and the
+  `windmill_user`/`windmill_admin` roles the migrations require. Files reach the
+  app volume ONLY via `wmill sync pull`, run by hand — the CLI isn't in nixpkgs
+  so the flake wraps it from JSR through the deno already in windmill's closure,
+  and since sync is stateless and destructive in both directions the hook must
+  never invoke it (the unit test enforces that). `wmill sync` is scoped to the
+  cwd + selected workspace, hence one directory per workspace under
+  `workspaces/`. It also carries
+  an opt-in `useUpstreamBinary` (fetchurl + `autoPatchelfHook` on the release
+  asset, x86_64 only) because nixpkgs lags upstream by ~200 releases — the same
+  prebuilt-binary escape hatch the base flake uses for zmx.
+
 `build [project]`, `init <project> [git-url] [--build]`, `run <project>`,
 `ssh <project>`, `ssh-config [--install]`, `shell <project>`,
 `expose <project> <port>…`, `host <project> <name:ip>…`,
 `proxy [up|stop|status|logs|renew|remove-cert]`, `restrict <project> [on|off]`,
 `allow <project> <host>…`, `egress <project> [-f]`, `up`, `stop`, `logs`,
-`delete`/`rm`, `sync-home <project>`, `projects`, `update`, `status`, `clean`,
+`delete`/`rm`, `sync-home <project>`, `projects`, `update`, `status`,
+`gc [--dry-run]` (nix-collect-garbage -d + store optimise in the builder
+container; warns about running containers, which may still reference paths a
+rebuild made unreachable), `clean`,
 `install`, `uninstall`. See `./nixenv.sh --help` and `README.md`. `delete` prints the
 commands (container/volume/home removal) and prompts before running;
 `resolve_engine` returns non-zero (not `die`) when no engine is found so
@@ -276,6 +339,69 @@ app volume read-only to read the repo overrides; asks for confirmation first.
 (default `/usr/local/bin`) as `INSTALL_NAME` (default `nixenv`); they run before
 `materialize_context` and need neither Docker nor the context.
 
+## Writing templates — hard-won rules
+
+Each template in `templates/` is ONE file that becomes a project's `flake.nix`.
+These rules come from bugs that actually shipped; violating them fails silently,
+which is why the shared test contract in `tests/lib-template.sh` enforces most
+of them. Add a `tests/unit/1N-template-<name>.sh` for every new template.
+
+- **Declare services as FILES, never write them from the hook.** Use
+  `pkgs.writeTextDir "sv/<name>/run"`; the entrypoint copies `sv/*` from the
+  profile into `$SVROOT` each boot. Writing run scripts with `cat > … <<'SV'`
+  *inside* a Nix `''` string is the trap: Nix strips the minimum common
+  indentation, so one stray line changes the strip amount, the heredoc
+  terminator ends up indented, the heredoc never closes, the hook file becomes
+  invalid shell — and the entrypoint (which tolerates hook failures by design)
+  just warns and continues with NO services registered.
+- **A Nix build cannot write the app volume** (sandboxed to `$out`). Anything
+  that creates project files — `wp core download`, `composer create-project`,
+  `npm install`, scaffolding — belongs in the startup hook, guarded by a marker
+  file under `$APP_MOUNT/.nixenv/.<template>-installed` so restarts stay instant.
+- **Scratch dirs must be writable by the non-root `app` user.** `"$APP.tmp"` is
+  the trap: with `APP=/app` that's `/app.tmp` at the filesystem ROOT, which
+  `app` cannot create — the setup dies with permission denied and (because the
+  marker is only written on success) leaves an app volume holding just
+  `flake.nix`. Use `$HOME/.nixenv-run/<scratch>` or a dir inside the app volume.
+  Generators that need an EMPTY target (`composer create-project`) must build in
+  scratch and copy in, then **assert the expected file exists** and fail loudly
+  rather than leaving a half-made project.
+- **nginx and php-fpm do NOT expand env vars in their configs.** `${HOME}` there
+  is a literal broken path; use `/home/app/...` (the runtime user is always
+  `app`). Only the `sv/*/run` scripts, being shell, can use `$HOME`.
+- **Never write a bare `''` in a comment that sits INSIDE an indented string.**
+  `''` both opens and closes such a string, so a comment like `# … a Nix ''
+  string …` terminates it right there; Nix then reports a syntax error pointing
+  at the *comment*, several lines away from anything that looks wrong. Two of
+  them cancel out, so a parity check won't save you — say "indented string" in
+  prose, or escape it as `'''`. `assert_template` rejects any indented comment
+  containing a bare `''` (top-level comments, at column 0, are fine).
+- **In Nix `''` strings, escape shell `${…}` as `''${…}`** (e.g.
+  `''${NIXENV_APP_MOUNT:-/app}`), otherwise Nix tries to interpolate it. A bare
+  `$VAR` is already literal.
+- **Dev servers must bind `0.0.0.0`** (`--host`, `--ip`, `HOST=`), never
+  localhost: the reverse proxy is a different container. The declared
+  `# nixenv:port` must match the port the stack actually serves.
+- **Watch for `buildEnv` path collisions.** Two packages shipping the same file
+  fail the build with "two given paths contain a conflicting subpath" —
+  node tools that vendor their deps are the usual culprits (`wrangler` bundles
+  `typescript`; `mysql-client` overlaps `mariadb`). Fix with
+  `(pkgs.lib.hiPrio pkgs.<winner>)` — the base flake uses the same trick for
+  `git`, and `templates/cloudflare.nix` for `typescript` — or drop the
+  redundant package.
+- **Services need their dependencies to exist.** Each `run` script must `exec` a
+  FOREGROUND process, and should wait for what it needs (php-fpm socket, DB
+  ready) with a short `sleep; exit 0` — runsv retries, so exiting is the
+  throttle. First-run setup happens BEFORE services start, so if the hook needs
+  a database it must start a temporary one itself and shut it down afterwards.
+- **Templates are egress-restricted by default**, so declare every host the
+  setup needs in `# nixenv:allow` — the metadata is read before the build and
+  seeded into `allowed_hosts`. Missing entries surface as `TCP_DENIED` in
+  `nixenv egress <project>`.
+- Metadata (`description`, `port`, `allow`, `app-path`) is parsed from leading
+  `# nixenv:<key>` comments; the header should also show the `init` command.
+  Only `@@PROJECT@@`, `@@APP_MOUNT@@`, `@@DOMAIN@@`, `@@PORT@@` are substituted.
+
 ## Conventions
 
 - Keep the script POSIX-friendly where it runs as `/bin/sh` (the entrypoint) and
@@ -294,7 +420,10 @@ After editing `nixenv.sh`, ALWAYS run the unit suite (fast, no docker):
 ```
 
 Test layout: one bash file per test in `tests/unit/` and `tests/integration/`,
-shared harness `tests/lib.sh` (exit 0 pass / 77 skip / else fail),
+shared harness `tests/lib.sh` (exit 0 pass / 77 skip / else fail), plus
+`tests/lib-template.sh` whose `assert_template <name>` encodes the template
+rules above (metadata valid, hook present, services declared as files, markers,
+placeholders, 0.0.0.0 binding),
 `tests/run.sh [unit|integration|all|<files>]` runner. Integration needs a real
 engine and a DEDICATED environment (isolated `nxt-*` prefix + state dirs; sweeps
 by prefix; reuses the shared store volume). `tests/run-in-docker.sh` runs

@@ -31,11 +31,38 @@ if nx init bad1 --app-path=relative </dev/null >/dev/null 2>&1; then fail "relat
 if nx init bad2 --app-path=/nix    </dev/null >/dev/null 2>&1; then fail "reserved app-path accepted"; fi
 if nx init proxy </dev/null >/dev/null 2>&1; then fail "reserved name 'proxy' accepted"; fi
 
-# re-init never clobbers existing identity
+# init REFUSES to touch an existing project (guards against typo'd names)
+nx init alpha </dev/null >/dev/null 2>&1 && fail "init on an existing project must fail"
+out="$(nx init alpha </dev/null 2>&1 || true)"
+assert_contains "$out" "already exists"  "explains why it refused"
+assert_contains "$out" "--force"         "offers the escape hatch"
+assert_contains "$out" "delete alpha"    "offers removal"
+
+# …and refuses BEFORE doing anything (no template fetch, no prompt)
+if nx init alpha --template=https://127.0.0.1:9/nope.nix </dev/null >/dev/null 2>&1; then
+  fail "existence check must precede template resolution"
+fi
+
+# --force re-scaffolds without clobbering existing files
 echo CUSTOM > "$NIXENV_PROJECTS_DIR/alpha/home/.zshrc"
-nx init alpha </dev/null >/dev/null 2>&1 || true
-assert_eq "$(cat "$NIXENV_PROJECTS_DIR/alpha/home/.zshrc")" "CUSTOM" "no clobber on re-init"
+nx init alpha --force </dev/null >/dev/null 2>&1 || true
+assert_eq "$(cat "$NIXENV_PROJECTS_DIR/alpha/home/.zshrc")" "CUSTOM" "no clobber on --force re-init"
+
+# a brand-new name still works
+nx init zeta </dev/null >/dev/null 2>&1 || fail "init of a new project must succeed"
+assert_file "$NIXENV_PROJECTS_DIR/zeta/home/.zshrc"
 
 # init WITHOUT --build must exit 0 (regression: trailing `[ ] && cmd` made the
 # function return 1 under set -e)
 nx init delta </dev/null >/dev/null 2>&1 || fail "init without --build must exit 0"
+
+# --allow= seeds the egress allowlist at creation (comma-separated + repeatable,
+# normalised like the 'allow' command), alongside the forge domain.
+nx init eps https://gitlab.example.com/t/a.git \
+   --allow=registry.npmjs.org,'*.yarnpkg.com' --allow=pypi.org </dev/null >/dev/null 2>&1 || true
+ah="$(cat "$NIXENV_PROJECTS_DIR/eps/allowed_hosts")"
+assert_contains "$ah" "gitlab.example.com" "forge still seeded"
+assert_contains "$ah" "registry.npmjs.org" "comma-separated entry"
+assert_contains "$ah" ".yarnpkg.com"       "*.foo normalised to .foo"
+assert_contains "$ah" "pypi.org"           "repeated --allow"
+if nx init bad3 --allow='https://x.com' </dev/null >/dev/null 2>&1; then fail "invalid --allow accepted"; fi

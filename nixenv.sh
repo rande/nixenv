@@ -60,6 +60,12 @@ PROXY_HTTPS_PORT="${PROXY_HTTPS_PORT:-443}"          # host port → caddy 8443 
 PROXY_AUTOSTART="${PROXY_AUTOSTART:-1}"              # auto-start the proxy on 'run' (0 to disable)
 EGRESS_PORT="${EGRESS_PORT:-3128}"                   # squid egress port INSIDE the proxy container (not published)
 
+# --- Templates (init --template=<name|url|path>) ------------------------------
+# A template is ONE file: the project's flake.nix. Short names resolve against
+# this base; full URLs and local paths are used as-is.
+TEMPLATE_BASE="${TEMPLATE_BASE:-https://raw.githubusercontent.com/rande/nixenv/main/templates}"
+TEMPLATE_CACHE="$HOME/.nixenv/templates"             # fetched templates are cached here
+
 # ── Pretty output ────────────────────────────────────────────────────────────
 c_blue='\033[1;34m'; c_green='\033[1;32m'; c_yellow='\033[1;33m'; c_red='\033[1;31m'; c_reset='\033[0m'
 log()  { printf "${c_blue}==>${c_reset} %s\n" "$*"; }
@@ -170,15 +176,13 @@ materialize_context() {
               runit
               cacert
 
-              # ── Languages & runtimes ───────────────────────────────────────
-              nodejs_22
-              go
-              rustup
-              php85
-              php85Packages.composer
-              python312
-              uv
-              sqlite
+              # ── Languages & runtimes: NONE, on purpose ────────────────────
+              # The base is a shell + editor + CLI toolbox shared by every
+              # project. Language runtimes (Node, PHP, Python, Go, Rust, Ruby…),
+              # their package managers and their language servers belong in a
+              # PER-PROJECT flake (`nixenv build <project>`), so each project
+              # pins its own versions and nothing pays for what it doesn't use.
+              # See templates/ for complete examples.
 
               # ── Build tools (compile native deps: node-gyp, wheels, etc.) ──
               gnumake
@@ -190,18 +194,15 @@ materialize_context() {
               automake
               libtool
 
-              # ── Editor: Neovim (AstroNvim) + language servers ──────────────
+              # ── Editor: Neovim (AstroNvim) ────────────────────────────────
+              # Only servers that need no language runtime on PATH: lua (for the
+              # nvim config itself) and bash. Everything else — pyright, gopls,
+              # intelephense, rust-analyzer, ruby-lsp, typescript-language-server
+              # — goes in the PROJECT's flake next to the runtime it serves.
               neovim
               tree-sitter          # parser generator AstroNvim uses
               lua-language-server  # for editing the nvim config itself
-              gopls                          # Go
-              (lib.hiPrio rust-analyzer)     # Rust (win the bin/rust-analyzer collision with rustup)
-              pyright                        # Python
-              typescript                     # TypeScript runtime
-              typescript-language-server     # TypeScript/JavaScript
-              bash-language-server           # Bash
-              intelephense                   # PHP
-              ruby-lsp                       # Ruby
+              bash-language-server # shell scripts (bash is always present)
 
               # ── AI tooling (from nixpkgs-unstable only) ────────────────────
               unstable.claude-code
@@ -527,15 +528,22 @@ chmod +x "$SVROOT/sshd/run"
 # this user, next to sshd. Example for supervisord:
 #   #!/bin/sh
 #   exec supervisord -n -c "$NIXENV_APP_MOUNT/supervisord.conf"
-# 1. Refresh repo-declared services into the (persistent) service tree.
-if [ -d "$APP_MOUNT/.nixenv/sv" ]; then
-  for d in "$APP_MOUNT"/.nixenv/sv/*/; do
+# 1. Refresh declared services into the (persistent) service tree. Two sources,
+# repo LAST so a project can override a service its flake/template ships:
+#   $NIXENV_EXTRA_PROFILE/sv/<name>/run   declared by the project flake
+#   $APP_MOUNT/.nixenv/sv/<name>/run      committed in the repo
+for _svsrc in "${NIXENV_EXTRA_PROFILE:-}/sv" "$APP_MOUNT/.nixenv/sv"; do
+  [ -d "$_svsrc" ] || continue
+  for d in "$_svsrc"/*/; do
     [ -f "${d}run" ] || continue
     sname="$(basename "$d")"
     mkdir -p "$SVROOT/$sname"
-    cp "${d}run" "$SVROOT/$sname/run" && chmod +x "$SVROOT/$sname/run"
+    # rm first: the previous copy inherited the Nix store's read-only mode, so
+    # a plain `cp` over it fails with "Permission denied" on every later boot.
+    rm -f "$SVROOT/$sname/run"
+    cp "${d}run" "$SVROOT/$sname/run" && chmod 0755 "$SVROOT/$sname/run"
   done
-fi
+done
 
 # PATH for hooks AND all services: project profile (extra tooling) first, then
 # base — so a hook can call binaries the project flake ships (e.g. a
@@ -568,6 +576,21 @@ RELAY
     chmod +x "$SVROOT/proxy-relay-$_pp/run"
   done
   echo "nixenv: loopback relay 127.0.0.1:443/:80 → $NIXENV_PROXY_NAME (public URLs work in-container)"
+fi
+
+# 1a2. On a restricted project the proxy is the ONLY route out, and the hook
+# below may need it immediately (template first-run setup: composer/npm/wp-cli).
+# 'run' starts the proxy first, but give DNS a moment to settle rather than
+# letting the very first fetch fail with "could not resolve proxy".
+if [ -n "${NIXENV_EGRESS_PROXY:-}" ]; then
+  _pn="${NIXENV_EGRESS_PROXY#http://}"; _pn="${_pn%%:*}"
+  _i=0
+  while ! getent hosts "$_pn" >/dev/null 2>&1; do
+    _i=$((_i+1))
+    [ "$_i" -ge 20 ] && { echo "nixenv: WARNING egress proxy '$_pn' unreachable — network will fail"; break; }
+    [ "$_i" = 1 ] && echo "nixenv: waiting for the egress proxy ($_pn)…"
+    sleep 1
+  done
 fi
 
 # 1b. Startup hooks. Every hook file that exists is sourced, in order:
@@ -819,14 +842,13 @@ require("lazy").setup({
     },
   },
 
-  -- Community: language packs for the requested languages
+  -- Community packs matching the BASE toolchain, which ships NO language
+  -- runtimes: only bash + lua (for editing this config) work out of the box.
+  -- For any real language, add the runtime AND its language server to the
+  -- project's own flake, then enable the matching pack via a per-project
+  -- <repo>/.nixenv/home/.config/nvim/ override + `nixenv sync-home`, e.g.
+  --   { import = "astrocommunity.pack.python" }   (with pyright in the flake)
   "AstroNvim/astrocommunity",
-  { import = "astrocommunity.pack.go" },
-  { import = "astrocommunity.pack.typescript" },
-  { import = "astrocommunity.pack.python" },
-  { import = "astrocommunity.pack.rust" },
-  { import = "astrocommunity.pack.php" },
-  { import = "astrocommunity.pack.ruby" },
   { import = "astrocommunity.pack.bash" },
   { import = "astrocommunity.pack.lua" },
 
@@ -1012,6 +1034,55 @@ ensure_volume()  {
   fi
 }
 
+# The store volume IS the builder image's /nix (Docker seeds an empty volume
+# from the image). A garbage collect can therefore delete the builder's OWN
+# toolchain — sh, coreutils, even nix — leaving a volume nothing can build in
+# ("exec: sh: executable file not found"). Restore it by mounting the volume
+# somewhere OTHER than /nix, so the image's intact store is visible to copy from.
+# Existing files are never clobbered (-n), so our packages and DB survive.
+ensure_builder_usable() {
+  volume_exists || return 0
+  "$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" \
+    nix --version >/dev/null 2>&1 && return 0
+
+  warn "the store volume has no working nix (a previous 'gc' collected the builder's tools)"
+  log "restoring the builder toolchain from $BUILDER_IMAGE — no downloads"
+  "$ENGINE" run --rm -v "$NIX_VOLUME":/mnt "$(img "$BUILDER_IMAGE")" \
+    sh -c 'cp -an /nix/store/. /mnt/store/ 2>/dev/null; cp -an /nix/var/. /mnt/var/ 2>/dev/null; true' \
+    >/dev/null 2>&1 || true
+
+  if "$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" \
+       nix --version >/dev/null 2>&1; then
+    ok "builder toolchain restored"
+  else
+    die "could not repair the store volume — run '$0 clean' then '$0 build' (re-downloads everything)"
+  fi
+}
+
+# Register the builder's own toolchain as GC roots so a collect can never
+# remove the tools the next build needs. Idempotent; safe to call before any gc.
+protect_builder_toolchain() {
+  "$ENGINE" run --rm -v "$NIX_VOLUME":/nix \
+    -e NIX_CONFIG="$(nix_config)" "$(img "$BUILDER_IMAGE")" \
+    sh -euc '
+      mkdir -p /nix/var/nix/gcroots
+      for b in nix sh bash cp du tail env; do
+        p="$(command -v "$b" 2>/dev/null)" || continue
+        [ -n "$p" ] || continue
+        nix-store --add-root "/nix/var/nix/gcroots/nixenv-builder-$b" \
+          --indirect -r "$(readlink -f "$p")" >/dev/null 2>&1 || true
+      done
+    ' >/dev/null 2>&1 || warn "could not pin the builder toolchain as a GC root"
+}
+
+# Human-readable size of the store volume. Uses the RUNTIME image on purpose:
+# the builder's coreutils live inside the store itself, so after a GC its `du`
+# may be gone. debian:stable-slim ships its own /bin.
+store_size() {
+  "$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$RUNTIME_IMAGE")" \
+    du -sh /nix 2>/dev/null | cut -f1 || echo '?'
+}
+
 # True once the shared profile has been populated inside the volume.
 store_is_populated() {
   "$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" \
@@ -1071,6 +1142,51 @@ net_subnet() {
   printf '%s' "$s"
 }
 
+# ── Templates ────────────────────────────────────────────────────────────────
+# A template is ONE file which becomes the project's flake.nix. It may carry
+# metadata in leading comments, which nixenv reads BEFORE building:
+#   # nixenv:description  WordPress + PHP + MariaDB
+#   # nixenv:allow        wordpress.org api.wordpress.org
+#   # nixenv:port         8080
+#   # nixenv:app-path     /var/www/html
+# Everything else (packages, services, first-run setup) is plain Nix + the
+# startup hook, so templates need no support code here.
+
+# Resolve a template ref to a local file, fetching + caching if remote.
+# Prints the path; returns 1 on failure.
+resolve_template() {
+  local ref="$1" url="" dest=""
+  # An existing file always wins — absolute, ./relative or bare relative
+  # (templates/foo.nix). Checked BEFORE the short-name branch so a path that
+  # exists is never mistaken for a name.
+  if [ -f "$ref" ]; then printf '%s' "$ref"; return 0; fi
+  case "$ref" in
+    http://*|https://*) url="$ref" ;;
+    *://*) warn "unsupported template URL scheme: $ref"; return 1 ;;
+    /*|./*|../*|*/*)                                # looks like a path, but isn't
+      warn "no such template file: $ref"; return 1 ;;
+    *.nix)                                          # a filename that doesn't exist
+      warn "no such template file: $ref (short names have no .nix suffix)"; return 1 ;;
+    *)
+      case "$ref" in *[!a-zA-Z0-9._-]*) warn "invalid template name: $ref"; return 1;; esac
+      url="$TEMPLATE_BASE/${ref}.nix" ;;
+  esac
+
+  mkdir -p "$TEMPLATE_CACHE"
+  dest="$TEMPLATE_CACHE/$(printf '%s' "$url" | tr -c 'a-zA-Z0-9._-' '_')"
+  have curl || { warn "curl is required to fetch templates"; return 1; }
+  log "Fetching template: $url" >&2
+  curl -fsSL --max-time 30 -o "$dest.tmp" "$url" || { warn "could not fetch $url"; return 1; }
+  [ -s "$dest.tmp" ] || { warn "template is empty: $url"; rm -f "$dest.tmp"; return 1; }
+  mv "$dest.tmp" "$dest"
+  printf '%s' "$dest"
+}
+
+# Read one metadata key from a template file: template_meta <file> <key>
+template_meta() {
+  sed -n "s/^[[:space:]]*#[[:space:]]*nixenv:$2[[:space:]]\{1,\}//p" "$1" | head -1
+}
+
 # Extract the forge hostname from a git clone URL (https/ssh/scp-like forms).
 forge_host_from_url() {
   local url="$1" host=""
@@ -1081,6 +1197,17 @@ forge_host_from_url() {
       host="${url#*@}"; host="${host%%:*}";;
   esac
   printf '%s' "$host"
+}
+
+# Normalise + validate one allowlist entry. '*.foo' → '.foo' (squid's
+# subdomain form); a bare name stays EXACT. Rejects schemes, ports and paths.
+# Prints the normalised value; returns 1 if invalid.
+normalize_allowed_host() {
+  local d; d="$(printf '%s' "$1" | tr -d '[:space:]')"
+  [ -n "$d" ] || return 1
+  case "$d" in \*.*) d=".${d#\*.}";; esac
+  case "$d" in *[!a-zA-Z0-9.-]*) return 1;; esac
+  printf '%s' "$d"
 }
 
 # Append a domain to <project>/allowed_hosts (deduplicated).
@@ -1316,6 +1443,46 @@ GITCRED
   ok "stored HTTPS credentials for $host (user '$user') in home/.git-credentials"
 }
 
+# Copy a template file into the app volume as flake.nix. Placeholders are
+# substituted so the template can reference the project it was applied to:
+#   @@PROJECT@@    project name        @@APP_MOUNT@@  code path in-container
+#   @@DOMAIN@@     proxy base domain   @@PORT@@       the template's declared port
+# Never clobbers an existing flake.nix.
+install_template() {
+  local tfile="$1" name="$2" port="${3:-}" force="${4:-0}" appv appmnt tmp
+  require_engine
+  appv="$(app_volume "$name")"; appmnt="$(project_app_mount "$name")"
+  ensure_volumes "$name"
+
+  tmp="$(project_dir "$name")/.template.nix"
+  sed -e "s|@@PROJECT@@|$name|g" \
+      -e "s|@@APP_MOUNT@@|$appmnt|g" \
+      -e "s|@@DOMAIN@@|$PROXY_DOMAIN|g" \
+      -e "s|@@PORT@@|$port|g" \
+      "$tfile" > "$tmp"
+
+  if [ -n "$("$ENGINE" run --rm -v "$appv":/app "$(img "$RUNTIME_IMAGE")" \
+              sh -c 'ls -A /app/flake.nix 2>/dev/null' 2>/dev/null)" ]; then
+    if [ "$force" != 1 ]; then
+      warn "flake.nix already exists in the app volume — template NOT applied"
+      log  "to refresh it from the template: $0 init $name --force --template=<t>"
+      rm -f "$tmp"; return 0
+    fi
+    # --force: refresh the flake (e.g. after the template gained a fix), keeping
+    # a backup so local edits are never lost silently.
+    "$ENGINE" run --rm --user "$(id -u):$(id -g)" $(engine_userns) \
+      -v "$appv":/app "$(img "$RUNTIME_IMAGE")" \
+      sh -c 'cp -f /app/flake.nix /app/flake.nix.bak' >/dev/null 2>&1 || true
+    warn "overwriting the existing flake.nix (previous kept as flake.nix.bak)"
+  fi
+  "$ENGINE" run --rm --user "$(id -u):$(id -g)" $(engine_userns) \
+    -v "$appv":/app -v "$tmp":/tmp/flake.nix:ro \
+    "$(img "$RUNTIME_IMAGE")" sh -c 'cp /tmp/flake.nix /app/flake.nix' \
+    || { rm -f "$tmp"; die "failed to write flake.nix into the app volume"; }
+  rm -f "$tmp"
+  ok "template installed → $appmnt/flake.nix"
+}
+
 # Clone a git repo into the project's repo dir (must be empty). Runs the debian
 # runtime image as the non-root user with the shared store + project home, so it
 # uses the store's git and the project's SSH keys; the bind-mounted repo dir ends
@@ -1365,23 +1532,66 @@ clone_repo() {
 #   usage: init <project> [git-repo-url]
 cmd_init() {
   local name="${1:-}"
-  [ -n "$name" ] || die "usage: $0 init <project> [git-repo-url] [--build] [--unrestricted] [--app-path=/path]"
+  [ -n "$name" ] || die "usage: $0 init <project> [git-repo-url] [--build] [--unrestricted] [--allow=host,…] [--app-path=/path]"
   valid_project_name "$name" || die "invalid project name: '$name'"
   shift
 
-  local git_url="" do_build=0 do_open=0 app_mount="${APP_MOUNT:-}" a
+  local git_url="" do_build=0 do_open=0 app_mount="${APP_MOUNT:-}" allow_list="" \
+        template="" assume_yes=0 force=0 a
   for a in "$@"; do
     case "$a" in
       --build) do_build=1;;
       --unrestricted|--open) do_open=1;;
       --app-path=*) app_mount="${a#*=}";;
-      --*) die "unknown option: $a (usage: $0 init <project> [git-repo-url] [--build] [--unrestricted] [--app-path=/path])";;
+      # --allow=a.com,b.com (repeatable). Validated below, applied with the forge.
+      --allow=*) allow_list="$allow_list $(printf '%s' "${a#*=}" | tr ',' ' ')";;
+      --template=*) template="${a#*=}";;
+      --yes|-y) assume_yes=1;;
+      --force) force=1;;
+      --*) die "unknown option: $a (usage: $0 init <project> [git-repo-url] [--template=<name|url|path>] [--build] [--unrestricted] [--allow=host,…] [--app-path=/path] [--force])";;
       *) [ -z "$git_url" ] && git_url="$a" || die "unexpected argument: $a";;
     esac
   done
 
+  # --- Refuse to touch an existing project ----------------------------------
+  # Checked BEFORE anything is fetched, prompted for or created, so a typo'd
+  # name can't half-reinitialise a live project. --force re-runs the scaffold
+  # (useful to refresh the git identity); it still never clobbers volumes.
   local pdir; pdir="$(project_dir "$name")"
-  log "Initialising project '$name' at $pdir"
+  if [ "$force" != 1 ] && [ -d "$pdir" ] && { [ -d "$pdir/home" ] || [ -f "$pdir/port" ]; }; then
+    warn "project '$name' already exists ($pdir)"
+    echo "   start it:      $0 run $name"
+    echo "   remove it:     $0 delete $name     (deletes its volumes — asks first)"
+    echo "   re-scaffold:   $0 init $name --force   (keeps volumes; re-prompts git identity)"
+    die "refusing to re-initialise '$name'"
+  fi
+
+  # --- Template: resolve + read metadata BEFORE scaffolding, so its declared
+  # allow/port/app-path participate in the normal init flow.
+  local tfile="" tdesc="" tport="" tallow=""
+  if [ -n "$template" ]; then
+    [ -z "$git_url" ] || die "--template and a git URL are mutually exclusive"
+    tfile="$(resolve_template "$template")" || die "could not resolve template '$template'"
+    tdesc="$(template_meta "$tfile" description)"
+    tport="$(template_meta "$tfile" port)"
+    tallow="$(template_meta "$tfile" allow)"
+    [ -z "$app_mount" ] && app_mount="$(template_meta "$tfile" app-path)"
+    [ -n "$tallow" ] && allow_list="$allow_list $tallow"
+
+    log "Template '$template'${tdesc:+ — $tdesc}"
+    echo "   file:  $tfile"
+    echo "   flake: becomes ${app_mount:-/app}/flake.nix in project '$name'"
+    [ -n "$tallow" ] && echo "   egress: $tallow"
+    [ -n "$tport" ]  && echo "   serves: port $tport (https://$name-$tport.$PROXY_DOMAIN/)"
+    warn "A template is code: it is BUILT with nix and its startup hook runs in the container."
+    if [ "$assume_yes" != 1 ] && [ -t 0 ]; then
+      printf 'Apply this template? [y/N] '
+      local tans=""; read -r tans || true
+      case "$tans" in [yY]|[yY][eE][sS]) ;; *) die "aborted";; esac
+    fi
+  fi
+
+  log "Initialising project '$name' at $pdir"   # $pdir set by the existence check
   mkdir -p "$pdir/home"   # host seed for the home volume (skeleton + git config)
 
   # Custom code-volume mount path (default /app). Validate it's absolute and not
@@ -1420,6 +1630,13 @@ cmd_init() {
   if [ -n "$git_url" ]; then
     add_allowed_host "$name" "$(forge_host_from_url "$git_url")"
   fi
+  # --allow=… entries, validated the same way as the 'allow' command.
+  local _h _nh
+  for _h in $allow_list; do
+    _nh="$(normalize_allowed_host "$_h")" \
+      || die "invalid --allow host '$_h' (domain, .domain for subdomains, or IP)"
+    add_allowed_host "$name" "$_nh"
+  done
   touch "$pdir/allowed_hosts"
   if [ "$do_open" = 1 ]; then
     touch "$pdir/unrestricted"
@@ -1433,6 +1650,13 @@ cmd_init() {
   if [ -n "$git_url" ]; then
     configure_git_credentials "$pdir" "$git_url"
     clone_repo "$git_url" "$name"
+  fi
+
+  # Template: install as the project's flake.nix, then build it (the toolchain
+  # and startup hook it declares are what make the project work on first run).
+  if [ -n "$tfile" ]; then
+    install_template "$tfile" "$name" "$tport" "$force"
+    do_build=1
   fi
 
   # Assign a stable random SSH port + write the host-side ssh config.
@@ -1453,14 +1677,23 @@ cmd_init() {
   # (if/fi, NOT `[ ] && cmd`: the latter would make init's exit status 1
   # whenever --build is absent — set -e then kills callers/scripts.)
   if [ "$do_build" = 1 ]; then cmd_build_project "$name"; fi
+
+  if [ -n "$tfile" ]; then
+    echo
+    ok "Template ready — start it with:"
+    echo "    $0 run $name"
+    [ -n "$tport" ] && echo "    then open https://$name-$tport.$PROXY_DOMAIN/"
+    log "first start runs the template's setup hook (installs the app); watch it with: $0 logs $name"
+  fi
 }
 
-# Auto-scaffold a project if missing.
+# Auto-scaffold a project if missing. (--force so a half-created project dir —
+# e.g. one that only has a 'port' file — doesn't trip init's existence check.)
 ensure_project() {
   local name="$1" pdir; pdir="$(project_dir "$name")"
   if [ ! -d "$pdir/home" ]; then
     warn "Project '$name' not initialised — scaffolding it now"
-    cmd_init "$name"
+    cmd_init "$name" --force
   fi
 }
 
@@ -1474,6 +1707,7 @@ cmd_build() {
   require_engine
   [ -f "$FLAKE_DIR/flake.nix" ] || die "no flake.nix in $FLAKE_DIR"
   ensure_volume
+  ensure_builder_usable   # self-heal a volume whose nix/sh a gc removed
 
   log "Building flake deps '$FLAKE_REF' from $FLAKE_DIR into volume '$NIX_VOLUME' (slow the first time)"
 
@@ -1638,6 +1872,15 @@ cmd_run() {
     ensure_internal_net "$name"
     netarg="$(internal_net "$name")"
     egress_env=(-e NIXENV_EGRESS_PROXY="http://$PROXY_NAME:$EGRESS_PORT")
+    # The proxy must be up BEFORE the container starts: on an internal network
+    # it is the only way out, and the container's FIRST-RUN hook (template setup:
+    # composer/npm/wp-cli) needs egress immediately. Starting it afterwards left
+    # the hook unable to even resolve the proxy's name.
+    if ! container_running "$PROXY_NAME"; then
+      log "Starting the egress proxy first (restricted project needs it to reach the network)"
+      ( PROXY_MKCERT_INSTALL="${PROXY_MKCERT_INSTALL:-0}"; cmd_proxy up ) \
+        || warn "proxy failed to start — '$name' will have no network access"
+    fi
   fi
 
   # Published ports: ssh (loopback) → in-container $SSHD_PORT, + <project>/ports.
@@ -1717,8 +1960,8 @@ cmd_run() {
     ok "Started '$cname'"
   fi
   if [ "$restricted" = 1 ]; then
-    # The proxy must (re)load this project's ACL, relays, and join its internal
-    # net — recreate it (quick; also serves as the ensure-running step).
+    # Refresh so the proxy picks up this project's ACL + ssh/port relays (the
+    # relays need the container to exist, hence after the start above).
     log "Refreshing proxy (egress allowlist + ssh relay for '$name')"
     ( PROXY_MKCERT_INSTALL="${PROXY_MKCERT_INSTALL:-0}"; cmd_proxy up ) \
       || warn "proxy refresh failed — '$0 proxy up' manually (ssh relies on its relay)"
@@ -1880,14 +2123,12 @@ cmd_allow() {
   local pdir d; pdir="$(project_dir "$name")"
   [ -d "$pdir" ] || die "unknown project '$name' — run '$0 init $name' first"
 
+  local nd
   for d in "$@"; do
-    d="$(printf '%s' "$d" | tr -d '[:space:]')"
-    [ -n "$d" ] || continue
-    case "$d" in \*.*) d=".${d#\*.}";; esac   # normalise *.foo → .foo
-    case "$d" in
-      *[!a-zA-Z0-9.-]*) die "invalid host '$d' (domain, .domain for subdomains, or IP — no schemes/ports/paths)";;
-    esac
-    add_allowed_host "$name" "$d"
+    [ -n "$(printf '%s' "$d" | tr -d '[:space:]')" ] || continue
+    nd="$(normalize_allowed_host "$d")" \
+      || die "invalid host '$d' (domain, .domain for subdomains, or IP — no schemes/ports/paths)"
+    add_allowed_host "$name" "$nd"
   done
 
   if ! is_restricted "$name"; then
@@ -2409,7 +2650,28 @@ cmd_ssh() {
 # =============================================================================
 cmd_stop() {
   require_engine
-  local name="${1:-}"; [ -n "$name" ] || die "usage: $0 stop <project>"
+  local name="${1:-}"
+
+  # No project → stop EVERYTHING nixenv started: all project containers and the
+  # shared proxy. Matches on the container prefix, so nothing else is touched.
+  if [ -z "$name" ]; then
+    local all
+    all="$("$ENGINE" ps -a --format '{{.Names}}' \
+            | grep -E "^${CONTAINER_PREFIX}(-|__)" || true)"
+    if [ -z "$all" ]; then
+      warn "nothing to stop (no '${CONTAINER_PREFIX}-*' containers)"
+      return 0
+    fi
+    log "Stopping all nixenv containers:"
+    printf '   %s\n' $all
+    # shellcheck disable=SC2086
+    "$ENGINE" rm -f $all >/dev/null 2>&1 || true
+    ok "Stopped $(printf '%s\n' $all | wc -l | tr -d ' ') container(s)"
+    log "volumes and projects are untouched — '$0 run <project>' starts one again"
+    return 0
+  fi
+
+  case "$name" in */*|.|..) die "invalid project name: $name";; esac
   local cname; cname="$(container_name "$name")"
   container_exists "$cname" || { warn "no container '$cname' (already stopped)"; return 0; }
   "$ENGINE" rm -f "$cname" >/dev/null && ok "Stopped '$cname'"
@@ -2580,13 +2842,108 @@ cmd_status() {
   if volume_exists; then
     ok "Volume '$NIX_VOLUME' exists"
     "$ENGINE" volume inspect "$NIX_VOLUME" --format '   mountpoint: {{.Mountpoint}}'
-    local size
-    size=$("$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" du -sh /nix 2>/dev/null | cut -f1 || echo '?')
-    echo "   store size: $size"
+    echo "   store size: $(store_size)"
     if store_is_populated; then ok "Shared profile present at $PROFILE"; else warn "Shared profile not built yet"; fi
+
+    # Per-project profiles (built by 'build <project>'). Listed with a health
+    # check so a broken/collected one is obvious without digging in the store.
+    local profs
+    profs="$("$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$RUNTIME_IMAGE")" \
+      sh -c 'ls -1 /nix/var/nix/profiles/ 2>/dev/null | grep "^proj-" | grep -v -- "-link$"' 2>/dev/null || true)"
+    if [ -n "$profs" ]; then
+      log "Project profiles:"
+      local p n
+      for p in $profs; do
+        n="$("$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$RUNTIME_IMAGE")" \
+          sh -c "ls -1 /nix/var/nix/profiles/$p/bin 2>/dev/null | wc -l" 2>/dev/null | tr -d ' ')"
+        if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+          printf '   ✓ %-24s %s binaries\n' "${p#proj-}" "$n"
+        else
+          printf '   ✗ %-24s empty — rebuild: %s build %s\n' "${p#proj-}" "$0" "${p#proj-}"
+        fi
+      done
+    fi
   else
     warn "Volume '$NIX_VOLUME' does not exist (run '$0 build')"
   fi
+}
+
+# =============================================================================
+# gc — garbage-collect the shared store: delete every path not reachable from a
+#      live profile (the base + each proj-<name>), and drop old generations.
+#      Reclaims the space left by packages you removed from a flake.
+#   usage: gc [--dry-run]
+# =============================================================================
+cmd_gc() {
+  require_engine
+  volume_exists || die "volume '$NIX_VOLUME' does not exist (nothing to collect)"
+  local dry=0
+  case "${1:-}" in
+    ""|--delete) ;;
+    --dry-run|-n) dry=1;;
+    *) die "usage: $0 gc [--dry-run]";;
+  esac
+
+  # Measure with the RUNTIME image, never the builder: the builder's userland
+  # lives IN the store we're about to collect, so its du/tail can vanish
+  # mid-run. debian carries its own /bin and is unaffected.
+  local before; before="$(store_size)"
+  log "Store size before: $before"
+
+  # A RUNNING container executes binaries from the store paths it was started
+  # with. If a rebuild has since moved its profile forward, those older paths are
+  # unreachable — collecting them would break the running container.
+  local running
+  running="$("$ENGINE" ps --format '{{.Names}}' | grep "^${CONTAINER_PREFIX}-" || true)"
+  if [ -n "$running" ] && [ "$dry" != 1 ]; then
+    warn "these containers are running and may reference paths being collected:"
+    printf '   %s\n' $running
+    warn "stop them first ('$0 stop <project>') for a clean sweep, or restart them after"
+    printf 'Continue anyway? [y/N] '
+    local ans=""; read -r ans || true
+    case "$ans" in [yY]|[yY][eE][sS]) ;; *) warn "Aborted"; return 0;; esac
+  fi
+
+  if [ "$dry" = 1 ]; then
+    log "Dry run — nothing will be deleted"
+    "$ENGINE" run --rm -v "$NIX_VOLUME":/nix \
+      -e NIX_CONFIG="$(nix_config)" "$(img "$BUILDER_IMAGE")" \
+      nix-collect-garbage --dry-run 2>&1 | tail -20   # piped on the HOST, safe
+    return 0
+  fi
+
+  # Pin the builder's own toolchain first: the volume IS the builder image's
+  # /nix, so without roots a collect deletes the very tools the next build needs.
+  ensure_builder_usable
+  protect_builder_toolchain
+
+  # Optimise BEFORE collecting, while the builder's own tools are still present;
+  # afterwards the shell may have lost binaries the GC removed. No pipes here
+  # for the same reason (`| tail` would break once coreutils is collected).
+  log "Hardlinking identical files"
+  "$ENGINE" run --rm -v "$NIX_VOLUME":/nix \
+    -e NIX_CONFIG="$(nix_config)" "$(img "$BUILDER_IMAGE")" \
+    nix store optimise >/dev/null 2>&1 || warn "store optimise failed (continuing)"
+
+  log "Collecting garbage (keeping the base + every proj-* profile)"
+  "$ENGINE" run --rm -v "$NIX_VOLUME":/nix \
+    -e NIX_CONFIG="$(nix_config)" "$(img "$BUILDER_IMAGE")" \
+    nix-collect-garbage -d || warn "garbage collection reported errors"
+
+  local after; after="$(store_size)"
+  ok "Store size: $before → $after"
+
+  # The GC can remove paths the BUILDER image itself was seeded with (they are
+  # not GC roots). Verify the store can still build, and say plainly how to fix
+  # it if not, rather than letting the next 'build' fail mysteriously.
+  if ! "$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" \
+        nix --version >/dev/null 2>&1; then
+    warn "nix itself is no longer usable from the store volume"
+    warn "run '$0 clean' then '$0 build' to recreate it"
+  fi
+  store_is_populated || warn "the shared profile is gone — run '$0 build'"
+  [ -n "$running" ] && warn "restart running projects so they use the current store paths"
+  return 0
 }
 
 # =============================================================================
@@ -2669,17 +3026,29 @@ Commands:
                             profile, layered on top of the base. Default reads
                             flake.nix from the repo root; --dir=P copies a whole
                             folder (flake.nix + local deps it references)
-  init <project> [git-url] [--build] [--unrestricted] [--app-path=/path]
+  init <project> [git-url] [--template=<name|url|path>] [--build]
+       [--unrestricted] [--allow=host,…] [--app-path=/path] [--yes] [--force]
+                            Fails if <project> already exists (--force re-runs
+                            the scaffold, keeping volumes and the SSH port).
                             Scaffold <project>/home + the <project>_app volume;
                             prompts for git name/email; clones git-url if given
                             (the forge domain is auto-added to allowed_hosts).
+                            --template=<t> installs a ready-to-run stack: ONE
+                            file that becomes the project's flake.nix, declaring
+                            the toolchain + a startup hook that installs the app
+                            on first 'run'. Short names resolve against
+                            TEMPLATE_BASE; URLs and local paths also work.
+                            Official: wordpress, cloudflare. Mutually exclusive
+                            with git-url; asks to confirm unless --yes.
                             Egress restriction is ON by default (see 'restrict');
                             --unrestricted opts this project out.
+                            --allow=a.com,b.com pre-validates egress hosts (same
+                            syntax as 'allow'; repeatable).
                             --build also builds the project's flake.
                             --app-path=/path mounts the code volume there instead
                             of /app (stored in <project>/app_mount)
   run <project>             Start the project as a background service (sshd under
-                            runit); prints the SSH port
+                            runit); prints the SSH port  (alias: start)
   ssh <project>             SSH into the running service (auto-starts it)
   shell <project>           Interactive zsh via the engine's 'exec' (no SSH key)
   expose <project> <port>…  Publish extra port(s) (e.g. 8080 or 3000:3000),
@@ -2712,7 +3081,9 @@ Commands:
   ssh-config [--install]    Print (or install) the ~/.ssh/config Include so
                             'ssh <project>' works via each <project>/ssh/config
   up <project>              build if needed, then start the service
-  stop <project>            Stop & remove the project's service container
+  stop [<project>]          Stop & remove the project's service container.
+                            With NO project: stops every nixenv container,
+                            including the shared proxy (volumes are untouched)
   logs <project>            Follow the service container logs
   delete <project>          Permanently remove a project (container; app, home and
                             databases volumes; host dir) — prints the commands and
@@ -2724,6 +3095,10 @@ Commands:
   projects                  List projects with their SSH port and state
   update                    Refresh flake.lock, then rebuild into the volume
   status                    Show context + volume + shared-profile state
+  gc [--dry-run]            Garbage-collect the store: delete old generations and
+                            every path no live profile needs — reclaims the space
+                            left by packages removed from a flake. Prints the
+                            before/after size; --dry-run only reports
   clean                     Delete the standalone volume (removes shared packages)
   install                   Copy this script onto your PATH (as '${INSTALL_NAME:-nixenv}')
   uninstall                 Remove the installed copy
@@ -2766,6 +3141,8 @@ Environment overrides:
   PROXY_MKCERT_INSTALL                        (1=run 'mkcert -install' on explicit 'proxy up';
                                                0=never trust — HTTPS works with a warning.
                                                Auto-start on 'run' defaults to 0)
+  TEMPLATE_BASE=$TEMPLATE_BASE
+                                              (where 'init --template=<name>' resolves short names)
 
 Projects always live in $PROJECTS_DIR.
 
@@ -2774,6 +3151,8 @@ Examples:
   $0 init myapp                             # scaffold + prompt for git identity
   $0 init myapp git@github.com:me/app.git   # also clone into the app volume
   $0 init web git@github.com:me/web.git --app-path=/var/www/html   # custom mount
+  $0 init myblog --template=wordpress       # ready-to-run WordPress stack
+  $0 init myworker --template=cloudflare    # Cloudflare Workers + wrangler
   $0 run myapp                              # start the service (prints SSH port)
   $0 ssh myapp                              # SSH in as 'app'
   $0 shell myapp                            # interactive zsh via engine exec
@@ -2799,7 +3178,7 @@ main() {
   case "$cmd" in
     build)    cmd_build "$@";;
     init)     cmd_init "$@";;
-    run)      cmd_run "$@";;
+    run|start) cmd_run "$@";;
     up)       cmd_up "$@";;
     shell)    cmd_shell "$@";;
     ssh)      cmd_ssh "$@";;
@@ -2817,6 +3196,7 @@ main() {
     projects) cmd_projects "$@";;
     update)   cmd_update "$@";;
     status)   cmd_status "$@";;
+    gc)       cmd_gc "$@";;
     clean)    cmd_clean "$@";;
     *) die "unknown command: $cmd (try '$0 --help')";;
   esac

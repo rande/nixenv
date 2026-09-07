@@ -91,7 +91,7 @@ interactive `zsh` via `docker exec` (no SSH key needed).
   per-project profile, layered on the base. Default reads `flake.nix` from the
   repo root; `--dir=<path>` copies a whole folder (flake + local files it
   references). See [Per-project tooling](#per-project-tooling).
-- `init <project> [git-url] [--build] [--app-path=/path]` — scaffold the
+- `init <project> [git-url] [--build] [--unrestricted] [--allow=host,…] [--app-path=/path]` — scaffold the
   project, prompt for git name/email, assign a stable random SSH port, and
   optionally clone `git-url` into the app volume. `--build` also builds the
   project's flake afterwards. `--app-path=/path` mounts the code volume at a
@@ -117,7 +117,9 @@ interactive `zsh` via `docker exec` (no SSH key needed).
 - `proxy [up|stop|status|logs|renew|remove-cert]` — shared HTTPS reverse proxy
   for all projects (see [Reverse proxy](#reverse-proxy-httpsproject-portnixenvlocalhost)).
 - `up <project>` — build if needed, then start the service.
-- `stop <project>` — stop and remove the project's service container.
+- `stop [<project>]` — stop and remove the project's service container; with no
+  project, stops **every** nixenv container including the shared proxy (volumes
+  and projects are untouched).
 - `logs <project>` — follow the service container logs.
 - `delete <project>` (alias `rm`) — permanently remove a project: its
   container(s), the app/home/databases volumes, and its host dir. Prints the
@@ -127,6 +129,8 @@ interactive `zsh` via `docker exec` (no SSH key needed).
 - `projects` — list projects with their SSH port and running state.
 - `update` — refresh `flake.lock`, then rebuild into the volume.
 - `status` — show context, volume, and shared-profile state.
+- `gc [--dry-run]` — garbage-collect the store (see
+  [Reclaiming disk space](#reclaiming-disk-space)).
 - `clean` — delete the standalone volume (removes all shared packages).
 - `install` / `uninstall` — copy this script onto your `PATH` (as `nixenv`) /
   remove it.
@@ -177,6 +181,63 @@ plain shell if you prefer.
 `nixenv ssh <project>` and `nixenv shell <project>` connect directly (plain zsh,
 no zmx) — handy as an escape hatch. The prompt shows the project name (the
 container's hostname is set to it), plus the zmx session when you're in one.
+
+## Templates — a ready-to-run stack in one command
+
+```sh
+./nixenv.sh init myblog   --template=wordpress    # WordPress + PHP + nginx + MariaDB
+./nixenv.sh run  myblog                           # → https://myblog-8080.nixenv.localhost/
+
+./nixenv.sh init myworker --template=cloudflare   # Cloudflare Workers + wrangler
+./nixenv.sh run  myworker                         # → https://myworker-8787.nixenv.localhost/
+
+./nixenv.sh init flows    --template=windmill     # Windmill self-hosted + PostgreSQL
+./nixenv.sh run  flows                            # → https://flows-8000.nixenv.localhost/
+```
+
+Shipped templates: `wordpress`, `cloudflare`, `symfony`,
+`headlesscms-directus-astro`, `windmill`.
+
+**One file = one template**, and that file *becomes the project's `flake.nix`* —
+so the result is an ordinary nixenv project you own and can edit, not a black
+box. The template declares only the **toolchain** (php/nginx/mariadb/wp-cli, or
+node/wrangler) plus config files and a startup hook. The application itself is
+installed **once on first start** by that hook — `wp core download` +
+`wp core install` + plugins for WordPress, a scaffolded Worker for Cloudflare —
+so your site/worker is real editable files in the app volume that you can
+git-commit. (A Nix build is sandboxed to its own `$out` and can never write the
+app volume; the hook is the supported way to do runtime setup, and it's
+marker-guarded so restarts are instant.)
+
+Templates resolve three ways:
+
+```sh
+--template=wordpress                        # official, from the nixenv repo
+--template=https://example.com/mystack.nix  # any URL
+--template=./templates/wordpress.nix        # local file (your own fork)
+```
+
+Override the base for short names with `TEMPLATE_BASE`; fetched templates are
+cached in `~/.nixenv/templates/`. A template can declare metadata that nixenv
+reads *before* building — used to pre-fill the egress allowlist, the served port
+and the app path:
+
+```nix
+# nixenv:description  WordPress + PHP 8.3 + nginx + MariaDB
+# nixenv:port         8080
+# nixenv:allow        wordpress.org api.wordpress.org downloads.wordpress.org
+```
+
+That `allow` line matters because projects are [egress-restricted by
+default](#egress-restriction-default-validated-hosts-only) — it's what lets
+WordPress fetch core and plugins on first run. Since a template is code that
+gets built and whose hook runs in your container, `init` prints what it will do
+and asks for confirmation (`--yes` to skip).
+
+Writing your own: copy either file in [`templates/`](templates/), edit the
+toolchain and the hook, and point `--template=` at it. The placeholders
+`@@PROJECT@@`, `@@APP_MOUNT@@`, `@@DOMAIN@@` and `@@PORT@@` are substituted when
+it's installed.
 
 ## Networking overview
 
@@ -392,9 +453,17 @@ gitlab.example.com      # exactly this host
 10.0.0.5              # a literal IP
 ```
 
-`init` **seeds the forge domain from the clone URL automatically**; projects
-created before this feature have an empty list, so `allow` their forge before
-pulling. Manage it from the host:
+`init` **seeds the forge domain from the clone URL automatically**, and
+`--allow=` pre-validates anything else the project needs from the start
+(comma-separated, repeatable):
+
+```sh
+./nixenv.sh init myapp https://gitlab.example.com/t/a.git \
+    --allow=registry.npmjs.org,.yarnpkg.com --allow=pypi.org
+```
+
+Projects created before this feature have an empty list, so `allow` their forge
+before pulling. Manage it from the host:
 
 ```sh
 ./nixenv.sh allow myapp registry.npmjs.org api.stripe.com   # add + reload
@@ -579,21 +648,43 @@ Caddy (for the shared reverse proxy), the
 Claude CLI (`claude`), zmx (terminal session persistence), common CLI tools
 (curl, wget, ping, host/dig, ripgrep,
 fd, fzf, bat, jq, delta, lazygit, …), a build toolchain (gnumake, gcc, binutils,
-pkg-config, cmake, autoconf, automake, libtool), language runtimes: Node 22
-(with `npx`), Go, Rust (rustup), PHP 8.5 + Composer, Python 3.12, and `uv` (with
-`uvx`), and an editor — **Neovim + AstroNvim** with language servers for Go,
-TypeScript/JavaScript, Python, Rust, PHP, Ruby, Bash, and Lua (see
-[Editor](#editor-neovim--astronvim)). Edit the embedded `flake.nix` block in
-`nixenv.sh` and re-run `build` to change the set.
+pkg-config, cmake, autoconf, automake, libtool), and an editor — **Neovim +
+AstroNvim** (see [Editor](#editor-neovim--astronvim)).
+
+The base ships **no language runtimes at all** — no Node, PHP, Python, Go, Rust,
+Ruby — and no package managers or language servers for them. That's deliberate:
+the base is the shell/editor/CLI toolbox every project shares, and languages
+belong in a **per-project flake** (see
+[Per-project tooling](#per-project-tooling)), so each project pins its own
+versions and nothing pays for toolchains it never uses. Add the runtime and its
+language server together:
+
+```nix
+paths = with pkgs; [
+  nodejs_22                       # or php83 + php83Packages.composer
+  typescript-language-server      # …and its LSP, so nvim works
+];
+```
+
+The [templates](#templates--a-ready-to-run-stack-in-one-command) are complete
+worked examples. Edit the embedded `flake.nix` block in `nixenv.sh` and re-run
+`build` to change the base set.
 
 ## Editor (Neovim + AstroNvim)
 
 `nvim` launches [AstroNvim](https://astronvim.com) — a Neovim distribution with a
 VS Code-like feel: file tree, buffer tabs, statusline, LSP, completion, git
-signs, and a VS Code colorscheme. Language servers come from the base toolchain
-(`gopls`, `rust-analyzer`, `pyright`, `typescript-language-server`,
-`intelephense`, `ruby-lsp`, `bash-language-server`, `lua-language-server`), so
-they're on `PATH` and Mason won't download its own copies.
+signs, and a VS Code colorscheme. Language servers come from the toolchain, not
+Mason (which is disabled) — and since the base has no language runtimes, it
+ships only the two servers that need none: `lua-language-server` (for editing
+the nvim config itself) and `bash-language-server`, with their astrocommunity
+packs enabled.
+
+For a real language, add the server to the **project's** flake next to its
+runtime (`pyright`, `intelephense`, `gopls`, `rust-analyzer`, `ruby-lsp`,
+`typescript-language-server`, …) and enable the matching pack through a
+per-project `<repo>/.nixenv/home/.config/nvim/` override applied with
+[`sync-home`](#updating-dotfiles-sync-home).
 
 The config lives at `~/.config/nvim/init.lua` (seeded from the skeleton, editable
 in the home volume). On the **first** `nvim` launch, `lazy.nvim` downloads the
@@ -654,6 +745,32 @@ Override via environment variables:
   published; used by restricted projects).
 
 Projects always live in `~/.nixenv/projects` (not configurable).
+
+## Reclaiming disk space
+
+The Nix store keeps every package it has ever built. Removing something from a
+flake only makes those paths *unreachable* — it doesn't delete them, so the
+store grows over time (a base rebuild that drops a language runtime can leave
+gigabytes behind). Collect them:
+
+```sh
+./nixenv.sh gc --dry-run     # report what would go
+./nixenv.sh gc               # delete it, prints before → after size
+```
+
+It deletes old profile generations plus every path not reachable from a live
+profile — the base (`shared`) and each `proj-<project>` — then hardlinks
+identical files. Everything your current toolchains reference is kept, so the
+next `run` needs no downloads.
+
+Stop your projects first if you want a full sweep: a **running** container
+executes binaries from the store paths it started with, and if a rebuild has
+since moved its profile forward, those older paths are collectable. `gc` warns
+and asks before proceeding when it sees running containers, and reminds you to
+restart them afterwards.
+
+`gc` is the safe, incremental option; [`clean`](#commands) is the nuclear one —
+it removes the whole volume, so the next `build` re-downloads everything.
 
 ## Testing
 
