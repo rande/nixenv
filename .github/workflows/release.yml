@@ -25,7 +25,7 @@ jobs:
     name: Verify tag and tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The single most valuable check here. `brew test` asserts that
       # `nixenv --version` equals the formula's version, which is derived from
@@ -59,7 +59,7 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # --generate-notes diffs against the previous tag
 
@@ -80,7 +80,7 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # secrets are not available in a job-level `if`, so gate inside the job.
       - name: Check for a tap token
@@ -117,7 +117,7 @@ jobs:
 
       - name: Check out the tap
         if: steps.gate.outputs.enabled == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ github.repository_owner }}/homebrew-nixenv
           token: ${{ secrets.TAP_TOKEN }}

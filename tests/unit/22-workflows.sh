@@ -70,6 +70,16 @@ assert_contains "$rel_body" '::notice::' "skips with a notice when unset"
 # --- write scope is needed to create a release, and only that ----------------
 assert_contains "$rel_body" 'contents: write' "declares the permission it needs"
 
+# --- no action may pin a runtime GitHub has deprecated ------------------------
+# actions/checkout@v4 and older declare `using: node20`; runners force them onto
+# node24 and emit a deprecation warning on every run. Keep them at v5+.
+for wf in "$rel" "$ci"; do
+  if grep -qE 'actions/checkout@v[1-4]([^0-9]|$)' "$wf"; then
+    fail "$(basename "$wf"): actions/checkout must be v5 or newer (v4 = deprecated node20)"
+  fi
+  grep -q 'actions/checkout@v' "$wf" || fail "$(basename "$wf"): no checkout step"
+done
+
 # --- CI must cover macOS, where Bash 3.2 lives -------------------------------
 ci_body="$(cat "$ci")"
 assert_contains "$ci_body" 'macos-latest' "CI covers macOS (Bash 3.2)"

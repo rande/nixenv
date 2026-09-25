@@ -25,7 +25,7 @@ jobs:
         # with (no `depends_on "bash"` in the Homebrew formula relies on it).
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Bash version in use
         run: bash --version | head -1
