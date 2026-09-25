@@ -129,6 +129,24 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   This is the ONLY way to run project code at container start: a flake build is
   sandboxed to its `$out`, so it can't write `$HOME`/`$SVROOT` — declare the hook
   at build time (`writeTextDir "etc/nixenv-hooks.sh"`), execute at runtime. `run` maps the project's random host port → 2222.
+- Arbitrary extra engine flags for a project's container come from
+  `<project>/extra-parameters` — a FILE, not a CLI flag, matching
+  `unrestricted`/`ports`/`hosts.extra`. `project_extra_args` strips `#` comments,
+  collapses whitespace and echoes the tokens; `cmd_run` splits them into the
+  `extra_args` ARRAY and expands it guarded
+  (`${extra_args[@]+"${extra_args[@]}"}`) so each flag is its own argv entry.
+  Contents are passed VERBATIM — there are no presets or magic tokens, so what's
+  in the file is exactly what the engine receives. `write_extra_parameters`
+  scaffolds a comments-only (hence no-op) file from `init` and `run`, so it's
+  discoverable rather than folklore, and never clobbers an existing one. Flags
+  are fixed at container creation, so edits need a `run <project>`. The commented
+  example is the podman/docker-in-container set (`--security-opt
+  seccomp=unconfined|apparmor=unconfined|label=disable`, `--device /dev/fuse`,
+  `--device /dev/net/tun`); two caveats there — a device that doesn't exist on
+  the engine host makes `run` fail outright, and the container still runs as your
+  uid with no added capabilities and no `/etc/subuid`/`/etc/subgid`, so rootless
+  podman inside is limited to a single UID unless the project supplies those
+  mappings itself.
 - Extra published ports live one-per-line in `<project>/ports` (helper: `expose`
   / read in `cmd_run`). A bare number maps `127.0.0.1:N:N`; a `:`-spec is passed
   to `docker -p` verbatim. The SSH port is always published on `127.0.0.1`.
@@ -180,7 +198,18 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   from `repo/`; `--dir=<path>` (relative to repo, or absolute) copies a WHOLE
   folder so a flake with local file references resolves. `run` passes the profile
   path as `NIXENV_EXTRA_PROFILE`; `.zshenv` prepends its `bin` to `PATH` (ahead of
-  base) when present. `delete` removes the profile; `init --build` runs the
+  base) when present.
+- **PATH order is `$HOME/.local/bin` → project profile → base profile**, and it
+  is set in FOUR places that must agree, or a tool resolves differently depending
+  on how you got a shell: the entrypoint's `.zshenv` (ssh/zmx logins), the
+  entrypoint's own `export PATH` (hooks + every runit service), the ephemeral
+  `run <project> cmd` branch, and `home-skel/.zshrc` (which re-asserts it because
+  oh-my-zsh reorders PATH). `~/.local/bin` leads so user-installed binaries
+  (`pip install --user`, pipx, hand-dropped files) win; it lives in the home
+  volume so it persists, and the entrypoint `mkdir -p`s it so it exists before
+  anything installs there. `10-entrypoint-content.sh` parses every
+  `export PATH=` line and fails if any mentions a profile without listing
+  `.local/bin` first. `delete` removes the profile; `init --build` runs the
   default mode after scaffolding.
 - The Claude CLI (`claude-code` from `nixpkgs-unstable`) is on the shared
   profile. Two shared paths are bind-mounted **rw** into every container so one
@@ -189,6 +218,13 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   (`CLAUDE_JSON`). `.claude.json` lives in the home root (not inside `.claude`),
   so it's shared as its own file; `prepare_claude_share` seeds it (restoring the
   newest `.claude/backups/` if present) before each `run`.
+  `CLAUDE_CODE_PROJECT_DIR_NAME=nixenv-<project>` is set in **two** places, and
+  both are required: `cmd_run` passes it with `-e` (covers runit services and
+  `shell`'s `docker exec`) and the entrypoint writes it into `.zshenv` (covers
+  ssh/zmx logins — sshd builds a FRESH environment, so the container's `-e`
+  never reaches a login shell). It must stay equal to the
+  `$CLAUDE_DIR/projects/nixenv-<name>` mount or transcripts land outside the
+  per-project dir; `10-entrypoint-content.sh` asserts all three agree.
 - Terminal session persistence uses **zmx** (github:neurosnap/zmx), installed in
   the base flake as a **prebuilt static-musl binary** (`builtins.fetchTarball` +
   `runCommand`) because its source build needs bubblewrap/user namespaces the
@@ -247,9 +283,19 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   stale config). Squid's access log is host-visible at
   `~/.nixenv/proxy/data/egress.log`; `egress <p> [-f]` summarises allowed vs
   `TCP_DENIED` domains (filtered by the project's subnet). `delete` also removes
-  the internal network (disconnecting the proxy first). Known limits: DNS
-  resolution isn't blocked (only traffic), UDP/QUIC isn't proxied, and the
-  one-time `clone_repo` runs unrestricted (default bridge).
+  the internal network (disconnecting the proxy first). Known limits: squid's ACLs filter
+  traffic, not name lookups, so a reachable resolver would still answer for a
+  denied host; UDP/QUIC isn't proxied; and the one-time `clone_repo` runs
+  unrestricted (default bridge). Note what this looks like from INSIDE a
+  restricted container: the internal network has no route out, so EXTERNAL name
+  resolution fails outright — `ping google.com` → "Temporary failure in name
+  resolution", and `ping`/`dig`/`nc`/QUIC can never work, since only
+  proxy-aware TCP clients have an exit. That is the design, not a fault.
+  Container-name DNS still resolves (it's how `nixenv-proxy` is found) and squid
+  resolves the target host on the project's behalf, so
+  `curl https://<allowed-host>/` succeeds while `ping` does not. `getent hosts
+  nixenv-proxy` (works) vs `getent hosts google.com` (fails) is the quickest way
+  to tell this apart from a real DNS problem.
 - Shared reverse proxy (`cmd_proxy`, `nixenv proxy up|stop|status|logs`): a single
   `${PREFIX}-proxy` Caddy container (caddy is in the base flake, run from the store)
   on a shared user network `PROXY_NET` (`nixenv_net`) that every project container
@@ -337,7 +383,54 @@ app volume read-only to read the repo overrides; asks for confirmation first.
 
 `install`/`uninstall` copy the single self-contained script to `INSTALL_DIR`
 (default `/usr/local/bin`) as `INSTALL_NAME` (default `nixenv`); they run before
-`materialize_context` and need neither Docker nor the context.
+`materialize_context` and need neither Docker nor the context. `cmd_install`
+refuses when `$SCRIPT_DIR` is inside a Homebrew prefix
+(`/opt/homebrew/*`, `*/Cellar/*`, `/home/linuxbrew/*`) — brew already put us on
+PATH, and a second copy would never be upgraded. Intel's `/usr/local/bin`
+symlink dir isn't (and can't be) matched, but it is also the default
+`INSTALL_DIR`, so `src -ef dest` catches it as "already installed".
+
+`NIXENV_VERSION` (top of the script) is printed by `-v|--version|version` and in
+the `usage` header. Like `--help`/`install`, it is dispatched BEFORE
+`materialize_context`, so it needs no engine, no network, and writes nothing —
+`20-version-and-license.sh` asserts that ordering and that no `$CONTEXT_DIR`
+appears. Bump it in the same commit as a release tag so the Homebrew formula's
+`test` block can assert the two agree. Licence is **GPL-3.0-or-later**: the
+verbatim FSF text is in `LICENSE` (~35 kB; the test rejects a truncated one) and
+the script header carries the copyright + no-warranty notice.
+
+Homebrew packaging lives in `packaging/homebrew/` (formula, release helper,
+publishing notes) and ships via a personal tap
+(`rande/homebrew-nixenv` → `brew install rande/nixenv/nixenv`), not homebrew-core.
+The formula has NO dependencies — that is load-bearing on the Bash 3.2 rule, so
+`21-homebrew-formula.sh` fails if anyone adds `depends_on "bash"` without also
+changing the shebang. It also asserts the formula's `url` tag equals
+`NIXENV_VERSION`, since a drifted formula only breaks on users' machines.
+`update-formula.sh <version>` rewrites `url`+`sha256` together from the real
+GitHub tarball and refuses when the script's version, the requested version, or
+the version *inside* the downloaded tarball disagree. Release order is fixed:
+bump `NIXENV_VERSION` → commit → tag → `update-formula.sh` (the sha256 cannot
+exist before the tag) → copy into the tap. The formula also installs
+`templates/` into `pkgshare`; `TEMPLATE_BASE="file://$(brew --prefix)/share/nixenv/templates"`
+pins templates to the installed release, because `resolve_template` otherwise
+curls them from `main` and a tagged nixenv can pull templates that moved on
+(curl handles `file://`, so short names keep working).
+
+CI/release live in `.github/workflows/` and are covered by `22-workflows.sh`
+(YAML validity, trigger shape, job dependency chain, and that the guards exist).
+`ci.yml` runs the unit suite on push/PR across ubuntu **and macos** — macOS is
+the one that actually exercises the Bash 3.2 rule. `release.yml` fires only on
+`v[0-9]+.[0-9]+.[0-9]+` tags, in three dependent jobs: `verify` (tag must equal
+`NIXENV_VERSION`, `bash -n`, unit suite, `--version` smoke test) → `release` (`gh
+release create --generate-notes`, attaching `nixenv.sh` + `LICENSE` so people can
+install the single file without brew or git) → `formula` (runs
+`update-formula.sh`, commits the formula to the default branch, pushes it to the
+tap). The formula job calls the SAME script you'd run locally rather than
+recomputing the sha inline — `22-workflows.sh` fails if a `sha256sum`/`shasum`
+appears in the workflow. It needs a `TAP_TOKEN` secret (fine-grained PAT with
+Contents: write on the tap; `GITHUB_TOKEN` cannot push to another repo) and, when
+that is unset, skips with a `::notice::` instead of failing the release — secrets
+aren't available in a job-level `if`, so the gate is a step that sets an output.
 
 ## Writing templates — hard-won rules
 

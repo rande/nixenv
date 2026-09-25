@@ -582,7 +582,8 @@ Host-side, `~/.nixenv/projects/<name>/` keeps only small state: `home/` (the
 **seed** the home volume is populated from on first run — skeleton + git config),
 the generated `passwd`/`group`/`shadow` (the container's user db), `port`,
 `ports`, `app_mount` (custom code-volume path, if set), `hosts.extra`
-(local `/etc/hosts` entries, if any), and `ssh/config`. Because the code and home are in volumes, they're not directly
+(local `/etc/hosts` entries, if any), `extra-parameters` (see below), and
+`ssh/config`. Because the code and home are in volumes, they're not directly
 editable from the host — you work through the container (`nixenv ssh` /
 Remote-SSH / VS Code). Populate the code volume by passing a git URL to `init`,
 or by cloning/working inside the container at the app mount (`/app` by default,
@@ -591,6 +592,41 @@ or your `--app-path`).
 Git identity is stored per project in `home/.gitconfig.identity`, which the
 project's `.gitconfig` includes — so re-running `init` never duplicates the
 `[user]` block.
+
+### Extra engine parameters
+
+`init` and `run` create an empty `~/.nixenv/projects/<project>/extra-parameters`
+for you. Anything you put there is appended **verbatim** to the container's
+`run` — one flag per line, `#` comments allowed, no presets and no magic:
+
+```
+--memory=4g
+--ulimit nofile=8192
+```
+
+There is no CLI flag for this on purpose; it's project state like `unrestricted`
+or `ports`. Parameters apply when the container is **created**, so re-run
+`./nixenv.sh run <project>` after editing. `run` echoes the active set.
+
+#### Running podman/docker inside a project
+
+That's what the commented example in the scaffolded file is for — uncomment it:
+
+```
+--security-opt seccomp=unconfined     # user-namespace syscalls (clone/unshare)
+--security-opt apparmor=unconfined    # Debian/Ubuntu hosts
+--security-opt label=disable          # SELinux hosts
+--device /dev/fuse                    # fuse-overlayfs storage driver
+--device /dev/net/tun                 # slirp4netns / pasta networking
+```
+
+Drop any `--device` your engine host doesn't have — a missing device makes `run`
+fail outright. Two more caveats: podman isn't in the base toolchain (add it to
+the project flake), and the container runs as your uid with no added
+capabilities and no `/etc/subuid`/`/etc/subgid`, so rootless podman inside is
+limited to a single UID — images that chown to other UIDs will fail unless the
+project provides those mappings itself.
+
 
 ## Per-project tooling
 
@@ -808,3 +844,24 @@ disposable privileged DinD container with a named cache volume
 - The `.gitconfig` seeded into each home ships sensible modern defaults
   (histogram diff, `push.autoSetupRemote`, `rerere`, `rebase.autoStash`, …),
   largely from [how Git core devs configure Git](https://blog.gitbutler.com/how-git-core-devs-configure-git#tldr).
+
+## Version
+
+```sh
+./nixenv.sh --version        # nixenv 0.1.0
+```
+
+`--version` is dispatched before the embedded context is materialised, so it
+needs no container engine, no network, and writes nothing — which is what makes
+it usable as a packaging smoke test.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+nixenv is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. It is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.

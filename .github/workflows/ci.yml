@@ -1,0 +1,43 @@
+# =============================================================================
+# ci — unit suite on every push and PR
+# =============================================================================
+# Deliberately unit-only: the integration suite needs a real container engine
+# and a dedicated environment (isolated nxt-* prefix + state dirs). Run that
+# locally with ./tests/run-in-docker.sh.
+# =============================================================================
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS matters: it ships Bash 3.2, which the script must keep working
+        # with (no `depends_on "bash"` in the Homebrew formula relies on it).
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash version in use
+        run: bash --version | head -1
+
+      - name: Shell syntax
+        run: bash -n nixenv.sh
+
+      - name: Unit tests
+        run: ./tests/run.sh unit
+
+      - name: Entrypoint parses as POSIX sh
+        run: |
+          CONTEXT_DIR="$RUNNER_TEMP/ctx" ./nixenv.sh --help >/dev/null
+          CONTEXT_DIR="$RUNNER_TEMP/ctx" bash -c 'source ./nixenv.sh; materialize_context'
+          sh -n "$RUNNER_TEMP/ctx/entrypoint.sh"

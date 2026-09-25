@@ -18,9 +18,17 @@
 #   volume <prefix>_<name>_app       → /app or <project>/app_mount (code; WORKDIR)
 #   volume <prefix>_<name>_home      → /home/app (dotfiles, nvim, shell history)
 #   volume <prefix>_<name>_databases → /databases (persistent DB data)
+#
+# Copyright (C) 2026 Thomas Rabaix and nixenv contributors
+# Licensed under the GNU General Public License v3.0 or later — see LICENSE.
+# This program comes with ABSOLUTELY NO WARRANTY. It is free software, and you
+# are welcome to redistribute it under certain conditions.
 # =============================================================================
 
 set -euo pipefail
+
+# Bump on release; the Homebrew formula's `test` asserts this matches its tag.
+NIXENV_VERSION="0.1.0"
 
 # ── Configuration (override via env) ─────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -342,11 +350,18 @@ cat > "$HOME_DIR/.zshenv" <<EOF
 export PROFILE="$PROFILE"
 export NIXENV_PROJECT="${NIXENV_PROJECT:-}"
 export NIXENV_APP_MOUNT="$APP_MOUNT"
+# Claude CLI: name this project's transcript dir after the project instead of
+# an encoded cwd. Matches the ~/.claude/projects mount cmd_run sets up, and is
+# repeated here because sshd builds a FRESH environment for login shells —
+# the container's -e never reaches an ssh/zmx session.
+export CLAUDE_CODE_PROJECT_DIR_NAME="nixenv-${NIXENV_PROJECT:-unknown}"
 export NIXENV_EXTRA_PROFILE="${NIXENV_EXTRA_PROFILE:-}"
-# The per-project profile (extra tooling) goes first when it exists, then base.
+# PATH order: the user's own ~/.local/bin wins over everything (pip --user,
+# pipx, hand-dropped binaries — it lives in the home volume, so it persists),
+# then the per-project profile (extra tooling), then base.
 _nixenv_extra=""
 [ -n "\$NIXENV_EXTRA_PROFILE" ] && [ -d "\$NIXENV_EXTRA_PROFILE/bin" ] && _nixenv_extra="\$NIXENV_EXTRA_PROFILE/bin:"
-export PATH="\${_nixenv_extra}$PROFILE/bin:\$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="\$HOME/.local/bin:\${_nixenv_extra}$PROFILE/bin:\$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export ZSH="$PROFILE/share/oh-my-zsh"
 export ZSH_CACHE_DIR="\$HOME/.cache/omz"
 export SSL_CERT_FILE="$_NIXENV_CA_BUNDLE"
@@ -457,7 +472,7 @@ fi
 # Command mode: run the given command as the (already non-root) user, then exit.
 # =============================================================================
 if [ "$#" -gt 0 ]; then
-  export PATH="$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  export PATH="$HOME/.local/bin:$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   exec "$ZSH_BIN" -lc 'exec "$@"' zsh "$@"
 fi
 
@@ -545,13 +560,16 @@ for _svsrc in "${NIXENV_EXTRA_PROFILE:-}/sv" "$APP_MOUNT/.nixenv/sv"; do
   done
 done
 
-# PATH for hooks AND all services: project profile (extra tooling) first, then
-# base — so a hook can call binaries the project flake ships (e.g. a
-# <project>-setup script) and a service can use e.g. supervisord. This MUST come
-# before the hooks below: they run in this process and inherit this PATH.
+# PATH for hooks AND all services: the user's ~/.local/bin first, then the
+# project profile (extra tooling), then base — so a hook can call binaries the
+# project flake ships (e.g. a <project>-setup script) and a service can use e.g.
+# supervisord. This MUST come before the hooks below: they run in this process
+# and inherit this PATH. Same order as .zshenv/.zshrc, so a tool resolves the
+# same way in a login shell, a hook and a runit service.
+mkdir -p "$HOME/.local/bin"   # so `pip install --user` & friends land on PATH
 _extra=""
 [ -n "${NIXENV_EXTRA_PROFILE:-}" ] && [ -d "$NIXENV_EXTRA_PROFILE/bin" ] && _extra="$NIXENV_EXTRA_PROFILE/bin:"
-export PATH="${_extra}$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="$HOME/.local/bin:${_extra}$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # 1a. Loopback relay to the shared proxy ------------------------------------
 # curl/libcurl implement RFC 6761 internally: they resolve `localhost` and ANY
@@ -666,12 +684,13 @@ plugins=(git z fzf docker rust golang node npm python pip)
 source "$ZSH/oh-my-zsh.sh"
 
 # --- Profiles on PATH ---
-# Keep the per-project profile (extra tooling, e.g. a pinned PHP) AHEAD of the
-# base profile, matching the order .zshenv set — otherwise base tools shadow the
-# project's pinned versions. oh-my-zsh above may have reordered PATH, so re-assert.
+# Keep ~/.local/bin first and the per-project profile (extra tooling, e.g. a
+# pinned PHP) AHEAD of the base profile, matching the order .zshenv set —
+# otherwise base tools shadow the project's pinned versions. oh-my-zsh above may
+# have reordered PATH, so re-assert.
 _nixenv_pp=""
 [ -n "${NIXENV_EXTRA_PROFILE:-}" ] && [ -d "$NIXENV_EXTRA_PROFILE/bin" ] && _nixenv_pp="$NIXENV_EXTRA_PROFILE/bin:"
-export PATH="${_nixenv_pp}$PROFILE/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.local/bin:${_nixenv_pp}$PROFILE/bin:$HOME/.cargo/bin:$PATH"
 
 # --- Integrations ---
 eval "$(fzf --zsh 2>/dev/null || true)"
@@ -1127,6 +1146,39 @@ vol_exists()      { "$ENGINE" volume inspect "$1" >/dev/null 2>&1; }
 #   allowed_hosts  → validated domains, one per line ('allow' appends; init
 #                    seeds the forge domain from the clone URL)
 is_restricted()        { [ ! -f "$(project_dir "$1")/unrestricted" ]; }
+
+# Extra engine parameters for a project's container, from the per-project file
+#   ~/.nixenv/projects/<project>/extra-parameters
+# Deliberately a FILE, not a CLI flag, so it stays project state alongside
+# 'unrestricted'/'ports'/'hosts.extra'. Contents are whitespace-separated tokens
+# appended VERBATIM to the container's `run` ('#' comments stripped) — a general
+# escape hatch for memory limits, devices, ulimits, security-opts, whatever.
+#
+# Flags are fixed at container CREATION, so edits need a `run <project>`.
+project_extra_args() {
+  local f; f="$(project_dir "$1")/extra-parameters"
+  [ -f "$f" ] || return 0
+  sed 's/#.*//' "$f" | tr '\n\t' '  ' | tr -s ' ' | sed 's/^ *//; s/ *$//'
+}
+
+# Created empty (comments only) when missing, so the file is discoverable
+# instead of something you have to know about. Never overwrites an existing one.
+write_extra_parameters() {
+  local f; f="$(project_dir "$1")/extra-parameters"
+  [ -f "$f" ] && return 0
+  cat > "$f" <<'EOF'
+# nixenv: extra parameters for this project's container (auto-created, empty).
+# Whitespace-separated flags, appended verbatim to the engine's `run`.
+# Applied at container creation — re-run `nixenv run <project>` after editing.
+#
+# Example — run podman/docker INSIDE the container:
+#   --security-opt seccomp=unconfined
+#   --security-opt apparmor=unconfined
+#   --security-opt label=disable
+#   --device /dev/fuse
+#   --device /dev/net/tun
+EOF
+}
 internal_net()         { printf '%s_%s_egress' "$CONTAINER_PREFIX" "$1"; }
 ensure_internal_net()  {
   "$ENGINE" network inspect "$(internal_net "$1")" >/dev/null 2>&1 || \
@@ -1662,6 +1714,7 @@ cmd_init() {
   # Assign a stable random SSH port + write the host-side ssh config.
   local port; port="$(project_port "$name")"
   write_host_ssh_config "$name"
+  write_extra_parameters "$name"
 
   ok "Project '$name' ready"
   echo "   home → /home/$APP_USER  (volume $(home_volume "$name"); seed: $pdir/home)"
@@ -1854,6 +1907,7 @@ cmd_run() {
   mkdir -p "$CLAUDE_DIR/projects/nixenv-$name"
   write_passwd_files "$pdir"    # /etc/passwd|group|shadow giving our uid the name 'app'
   write_host_ssh_config "$name" # <project>/ssh/config for `ssh <project>`
+  write_extra_parameters "$name" # <project>/extra-parameters (empty scaffold)
 
   # --- Start a detached container: unprivileged sshd under runit -------------
   local port; port="$(project_port "$name")"
@@ -1923,12 +1977,21 @@ cmd_run() {
   else
     container_exists "$cname" && "$ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
     log "Starting service '$cname' ($RUNTIME_IMAGE) as uid $(id -u) — sshd on 127.0.0.1:$port, volumes $appv → $appmnt, $homev → /home/$APP_USER"
+    # Extra engine parameters from <project>/extra-parameters, split into an
+    # ARRAY so each flag becomes its own argv entry.
+    # (if/fi, NOT `[ ] && cmd`: a false test would return 1 under set -e.)
+    local _extra extra_args; _extra="$(project_extra_args "$name")"; extra_args=()
+    if [ -n "$_extra" ]; then
+      extra_args=($_extra)
+      log "extra parameters ($pdir/extra-parameters): $_extra"
+    fi
     "$ENGINE" run -d \
       --name "$cname" \
       --hostname "$name" \
       --network "$netarg" \
       --user "$(id -u):$(id -g)" \
       $(engine_userns) \
+      ${extra_args[@]+"${extra_args[@]}"} \
       --sysctl net.ipv4.ping_group_range="0 2147483647" \
       --sysctl net.ipv4.ip_unprivileged_port_start=0 \
       ${pub[@]+"${pub[@]}"} \
@@ -1952,6 +2015,7 @@ cmd_run() {
       -e SSHD_PORT="$SSHD_PORT" \
       -e NIXENV_PROJECT="$name" \
       -e NIXENV_APP_MOUNT="$appmnt" \
+      -e CLAUDE_CODE_PROJECT_DIR_NAME="nixenv-$name" \
       -e NIXENV_PROXY_NAME="$PROXY_NAME" \
       -e NIXENV_PROXY_DOMAIN="$PROXY_DOMAIN" \
       -e NIXENV_EXTRA_PROFILE="$(project_profile "$name")" \
@@ -2970,6 +3034,15 @@ cmd_install() {
   dest="$dir/$name"
 
   [ -f "$src" ] || die "cannot locate this script at $src"
+
+  # Running FROM a Homebrew prefix means brew already put us on PATH. Copying
+  # ourselves elsewhere would leave a second, never-upgraded nixenv that shadows
+  # (or is shadowed by) the managed one depending on PATH order.
+  case "$SCRIPT_DIR" in
+    /opt/homebrew/*|/usr/local/Cellar/*|/opt/homebrew/Cellar/*|/home/linuxbrew/*)
+      die "installed via Homebrew — already on PATH; upgrade with 'brew upgrade $name'";;
+  esac
+
   if [ -e "$dest" ] && [ "$src" -ef "$dest" ]; then
     ok "Already installed at $dest"
     return 0
@@ -3012,7 +3085,7 @@ cmd_uninstall() {
 
 usage() {
   cat <<EOF
-nixenv.sh — self-contained shared Nix dev environment in a Docker volume
+nixenv.sh $NIXENV_VERSION — self-contained shared Nix dev environment in a Docker volume
 
 Usage: $0 <command> [args]
 
@@ -3102,6 +3175,7 @@ Commands:
   clean                     Delete the standalone volume (removes shared packages)
   install                   Copy this script onto your PATH (as '${INSTALL_NAME:-nixenv}')
   uninstall                 Remove the installed copy
+  --version                 Print the version and exit
 
 Per-project (runtime runs as non-root user '$APP_USER'):
   volume <project>_home → /home/$APP_USER  (seeded from <project>/home)
@@ -3168,6 +3242,9 @@ main() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     ""|-h|--help|help) usage; return 0;;
+    # Before materialize_context on purpose: `--version` must work with no
+    # engine, no network and no writes — it's what `brew test` runs.
+    -v|--version|version) printf 'nixenv %s\n' "$NIXENV_VERSION"; return 0;;
     install)   cmd_install "$@"; return $?;;
     uninstall) cmd_uninstall "$@"; return $?;;
   esac

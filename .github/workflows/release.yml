@@ -1,0 +1,140 @@
+# =============================================================================
+# release — cut a GitHub release when a vX.Y.Z tag is pushed
+# =============================================================================
+#   git tag -a v0.2.0 -m "nixenv 0.2.0" && git push --tags
+#
+# Order is deliberate: verify → release → formula. The Homebrew sha256 is taken
+# from the tarball GitHub generates for the tag, which cannot exist before the
+# tag is pushed — so the formula can only ever be updated after the fact.
+#
+# The formula job is optional: without a TAP_TOKEN secret it skips with a notice
+# rather than failing the release. See packaging/homebrew/README.md.
+# =============================================================================
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify tag and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The single most valuable check here. `brew test` asserts that
+      # `nixenv --version` equals the formula's version, which is derived from
+      # this tag — so a tag that disagrees with NIXENV_VERSION ships a formula
+      # that fails on every user's machine and never on ours.
+      - name: Tag must match NIXENV_VERSION
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          declared="$(sed -n 's/^NIXENV_VERSION="\([^"]*\)".*/\1/p' nixenv.sh | head -1)"
+          echo "tag=$tag declared=$declared"
+          if [ "$tag" != "$declared" ]; then
+            echo "::error::tag v$tag but nixenv.sh declares NIXENV_VERSION=\"$declared\"." \
+                 "Bump it, commit, delete the tag and re-tag."
+            exit 1
+          fi
+
+      - name: Shell syntax
+        run: bash -n nixenv.sh
+
+      - name: Unit tests
+        run: ./tests/run.sh unit
+
+      # Cheap end-to-end check of what users will actually invoke.
+      - name: Smoke-test the CLI
+        run: |
+          ./nixenv.sh --version | grep -qx "nixenv ${GITHUB_REF_NAME#v}"
+          ./nixenv.sh --help | head -1
+
+  release:
+    name: Publish GitHub release
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # --generate-notes diffs against the previous tag
+
+      # nixenv.sh is attached on its own so people can install without brew or
+      # git: curl the single file, chmod, done. That is the whole point of the
+      # script being self-contained.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "nixenv ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            nixenv.sh LICENSE
+
+  formula:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # secrets are not available in a job-level `if`, so gate inside the job.
+      - name: Check for a tap token
+        id: gate
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "::notice::TAP_TOKEN not set — skipping the Homebrew tap update." \
+                 "Run packaging/homebrew/update-formula.sh ${GITHUB_REF_NAME#v} by hand."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Reuses the same script you would run locally, so there is ONE
+      # implementation of "compute the sha256 and rewrite the formula" — and it
+      # re-checks the version inside the downloaded tarball.
+      - name: Rewrite the formula for this tag
+        if: steps.gate.outputs.enabled == 'true'
+        run: ./packaging/homebrew/update-formula.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Commit the formula back to this repo
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- packaging/homebrew/Formula/nixenv.rb; then
+            git add packaging/homebrew/Formula/nixenv.rb
+            git commit -m "homebrew: nixenv ${GITHUB_REF_NAME#v}"
+            # The tag points at the pre-update commit by design; push the branch.
+            git push origin "HEAD:${{ github.event.repository.default_branch }}"
+          fi
+
+      - name: Check out the tap
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/homebrew-nixenv
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+
+      - name: Publish to the tap
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          mkdir -p tap/Formula
+          cp packaging/homebrew/Formula/nixenv.rb tap/Formula/nixenv.rb
+          cd tap
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "tap already up to date"
+            exit 0
+          fi
+          git add Formula/nixenv.rb
+          git commit -m "nixenv ${GITHUB_REF_NAME#v}"
+          git push
