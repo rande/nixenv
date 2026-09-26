@@ -31,50 +31,15 @@ cd homebrew-nixenv && git add -A && git commit -m "nixenv formula" && git push
 
 ## Releasing a version
 
-**Automated.** Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`,
-which verifies the tag matches `NIXENV_VERSION`, runs the unit suite, creates the
-GitHub release (attaching `nixenv.sh` and `LICENSE`), then runs
-`update-formula.sh` and pushes the result to the tap:
+See **[RELEASING.md](../../RELEASING.md)** — the whole process, the automated and
+manual paths, and how to recover from a bad tag live there so there is one
+description of it.
 
-```sh
-sed -i '' 's/^NIXENV_VERSION=.*/NIXENV_VERSION="0.2.0"/' nixenv.sh
-./tests/run.sh
-git commit -am "release 0.2.0"
-git tag -a v0.2.0 -m "nixenv 0.2.0" && git push && git push --tags
-```
-
-The tap step needs a **`TAP_TOKEN`** repo secret — a fine-grained PAT with
-Contents: write on `rande/homebrew-nixenv`. The default `GITHUB_TOKEN` cannot
-push to another repository. Without it the job skips with a notice and the
-release still succeeds; finish by hand with the manual steps below.
-
-### Manual release
-
-The order matters: the sha256 is computed from the tarball GitHub generates, so
-the tag has to exist first.
-
-```sh
-# 1. bump the version IN the script (single source of truth) and commit
-sed -i '' 's/^NIXENV_VERSION=.*/NIXENV_VERSION="0.2.0"/' nixenv.sh
-./tests/run.sh                                    # 21-homebrew-formula.sh guards the sync
-git commit -am "release 0.2.0"
-
-# 2. tag and push — GitHub builds the tarball from this
-git tag -a v0.2.0 -m "nixenv 0.2.0" && git push --tags
-
-# 3. rewrite url + sha256 from the real tarball
-./packaging/homebrew/update-formula.sh 0.2.0
-
-# 4. publish to the tap
-cp packaging/homebrew/Formula/nixenv.rb ../homebrew-nixenv/Formula/
-(cd ../homebrew-nixenv && git commit -am "nixenv 0.2.0" && git push)
-```
-
-`update-formula.sh` refuses to run when `NIXENV_VERSION` in the script doesn't
-match the version you asked for, and re-checks the version *inside* the
-downloaded tarball. Both exist because a formula whose `test` block fails only
-breaks for users, never for you. `--check` verifies without writing, which is
-what CI should run.
+The formula-specific part: `update-formula.sh <version>` rewrites `url` and
+`sha256` together from the real GitHub tarball, and refuses when the script's
+version, the version you asked for, or the version *inside* the downloaded
+tarball disagree. Those guards exist because a formula whose `test` block fails
+breaks for users, never for you. `--check` verifies without writing.
 
 ## Verifying before you publish
 

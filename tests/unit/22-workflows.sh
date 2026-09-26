@@ -101,6 +101,25 @@ for wf in "$rel" "$ci"; do
   grep -q 'actions/checkout@v' "$wf" || fail "$(basename "$wf"): no checkout step"
 done
 
+# --- RELEASING.md must describe the workflow that actually exists -------------
+# A release runbook that has drifted is worse than none: it gets followed.
+rel_doc="$REPO_DIR/RELEASING.md"
+assert_file "$rel_doc" "RELEASING.md exists"
+doc="$(cat "$rel_doc")"
+for j in verify release formula; do
+  assert_contains "$doc" "$j" "runbook mentions the '$j' job"
+done
+assert_contains "$doc" 'NIXENV_VERSION' "runbook names the version source of truth"
+assert_contains "$doc" 'TAP_TOKEN'      "runbook explains the tap secret"
+# The tag pattern it tells people to use must be the one the workflow accepts.
+doc_pat="$(printf '%s' "$doc" | grep -o 'v\[0-9\][^ `]*' | head -1)"
+wf_pat="$(sed -n 's/^ *- "\(v\[0-9\].*\)"$/\1/p' "$rel")"
+[ -n "$wf_pat" ] || fail "could not read the tag pattern from $(basename "$rel")"
+assert_eq "$doc_pat" "$wf_pat" "runbook's tag pattern matches the trigger"
+# Every command the runbook tells you to run must exist.
+assert_contains "$doc" 'packaging/homebrew/update-formula.sh' "runbook uses the real helper"
+assert_file "$REPO_DIR/packaging/homebrew/update-formula.sh" "that helper exists"
+
 # --- CI must cover macOS, where Bash 3.2 lives -------------------------------
 assert_contains "$ci_body" 'macos-latest' "CI covers macOS (Bash 3.2)"
 assert_contains "$ci_body" './tests/run.sh unit' "CI runs the unit suite"

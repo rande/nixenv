@@ -407,6 +407,15 @@ appears. Bump it in the same commit as a release tag so the Homebrew formula's
 verbatim FSF text is in `LICENSE` (~35 kB; the test rejects a truncated one) and
 the script header carries the copyright + no-warranty notice.
 
+**`RELEASING.md` (repo root) is the canonical release runbook** — one-time setup,
+the tag-push flow, recovery from a bad tag, the manual fallback, and version
+numbering. `packaging/homebrew/README.md` points at it and keeps only
+formula-specific detail, so the process is described once. `22-workflows.sh`
+guards against drift: it asserts the runbook names all three jobs, `NIXENV_VERSION`
+and `TAP_TOKEN`, and that the tag pattern it tells people to use is byte-identical
+to `release.yml`'s trigger. A stale release runbook is worse than none, because it
+gets followed.
+
 Homebrew packaging lives in `packaging/homebrew/` (formula, release helper,
 publishing notes) and ships via a personal tap
 (`rande/homebrew-nixenv` → `brew install rande/nixenv/nixenv`), not homebrew-core.
