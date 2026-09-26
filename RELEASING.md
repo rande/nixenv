@@ -20,30 +20,48 @@ Then watch **Actions → release**. That's it — steps 4+ are automatic.
 
 ---
 
-## One-time setup
+## The very first release (bootstrap)
 
-Neither is needed to publish a GitHub release; both are needed for `brew` to see
-the new version.
-
-**1. The tap repository.** The `homebrew-` prefix is how `brew` resolves
-`rande/nixenv`:
+Do this once, in this order. **Tag before creating the tap**: the formula in this
+repo ships a placeholder `sha256`, and the real one can only be computed from the
+tarball GitHub builds for the tag. A tap published with the placeholder gives
+users `SHA256 mismatch` on every install.
 
 ```sh
+# 1. tag — release.yml verifies + publishes; the tap job skips (no TAP_TOKEN yet)
+./tests/run.sh
+git tag -a v0.1.0 -m "nixenv 0.1.0" && git push && git push --tags
+
+# 2. now the tarball exists, so the formula can be made correct
+./packaging/homebrew/update-formula.sh 0.1.0
+
+# 3. create the tap — the 'homebrew-' prefix is how brew resolves rande/nixenv
 gh repo create rande/homebrew-nixenv --public \
   --description "Homebrew tap for nixenv"
-git clone https://github.com/rande/homebrew-nixenv
-mkdir -p homebrew-nixenv/Formula
-cp packaging/homebrew/Formula/nixenv.rb homebrew-nixenv/Formula/
-cd homebrew-nixenv && git add -A && git commit -m "nixenv formula" && git push
+git clone https://github.com/rande/homebrew-nixenv ../homebrew-nixenv
+mkdir -p ../homebrew-nixenv/Formula
+cp packaging/homebrew/Formula/nixenv.rb ../homebrew-nixenv/Formula/
+(cd ../homebrew-nixenv && git add -A \
+   && git commit -m "nixenv 0.1.0" && git push)
+
+# 4. commit the real sha back here too, so the repo and the tap agree
+git commit -am "homebrew: nixenv 0.1.0" && git push
+
+# 5. verify end to end
+brew install rande/nixenv/nixenv && nixenv --version
 ```
 
-**2. A `TAP_TOKEN` secret** on *this* repo (Settings → Secrets and variables →
-Actions). A fine-grained PAT with **Contents: write** on `rande/homebrew-nixenv`.
-The default `GITHUB_TOKEN` cannot push to another repository, which is the whole
-reason this secret exists.
+`brew install` fails with `Repository not found` until step 3 — that's this
+missing repo, not a broken formula.
 
-Without it the release still succeeds — the tap job skips with a `::notice::` and
-you finish by hand (see [Manual fallback](#manual-fallback)).
+**Then add a `TAP_TOKEN` secret** on *this* repo (Settings → Secrets and
+variables → Actions): a fine-grained PAT with **Contents: write** on
+`rande/homebrew-nixenv`. The default `GITHUB_TOKEN` cannot push to another
+repository, which is the whole reason this secret exists. With it set, steps 2–4
+happen automatically on every future tag.
+
+Without it, releases still succeed — the tap job skips with a `::notice::` and you
+repeat steps 2–4 by hand (see [Manual fallback](#manual-fallback)).
 
 ## What the tag triggers
 
