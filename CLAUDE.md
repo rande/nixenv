@@ -321,10 +321,18 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
 
 ## Commands
 
-**Always invoke the tool as `./nixenv.sh <command>` from the repo — not the
-installed `nixenv`.** The installed `/usr/local/bin/nixenv` is a snapshot from
-the last `./nixenv.sh install`; while iterating on `nixenv.sh` it will be stale,
-so all examples and instructions must use `./nixenv.sh`.
+**When working IN this repo, always invoke the tool as `./nixenv.sh <command>` —
+not the installed `nixenv`.** The installed `/usr/local/bin/nixenv` (or the
+Homebrew one) is a snapshot from the last `install`; while iterating on
+`nixenv.sh` it will be stale, so anything you run, and every example in CLAUDE.md
+or a commit message, uses `./nixenv.sh`.
+
+**`README.md` is the exception, and deliberately so: it uses bare `nixenv`.** It
+addresses users who installed via Homebrew or `install`, for whom `./nixenv.sh`
+would simply not exist. The only places it keeps `./nixenv.sh` are the "Single
+file" and "From a clone" install subsections (where the script genuinely is a
+local file), plus a note telling clone users to substitute it. Don't "fix" the
+README back to `./nixenv.sh`.
 
 - Templates (`init --template=<name|url|path>`): a template is ONE file that
   becomes the project's `flake.nix`. `resolve_template` handles local paths,

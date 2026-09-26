@@ -99,14 +99,17 @@ instead of `./nixenv.sh <command>`. Note that the installed copy is a *snapshot*
 if you're editing `nixenv.sh`, keep calling `./nixenv.sh` from the clone or it
 will be stale.
 
+> Every example below uses `nixenv`. Working from a clone without installing?
+> Substitute `./nixenv.sh` — the commands are otherwise identical.
+
 ## Quick start
 
 ```sh
-./nixenv.sh build                 # download all deps into the volume (slow once)
-./nixenv.sh init myapp            # scaffold a project, prompts for git identity
-./nixenv.sh run myapp             # start the service (prints the SSH port;
+nixenv build                 # download all deps into the volume (slow once)
+nixenv init myapp            # scaffold a project, prompts for git identity
+nixenv run myapp             # start the service (prints the SSH port;
                                   # also auto-starts the shared HTTPS proxy)
-./nixenv.sh ssh myapp             # SSH in as 'app'
+nixenv ssh myapp             # SSH in as 'app'
 ```
 
 With the app listening on `:3000`, it's already reachable at
@@ -117,11 +120,11 @@ Clone a repo while initialising (cloned into the project's app volume), and
 optionally pick where it mounts in the container:
 
 ```sh
-./nixenv.sh init myapp git@github.com:me/app.git
-./nixenv.sh init web  git@github.com:me/web.git --app-path=/var/www/html
+nixenv init myapp git@github.com:me/app.git
+nixenv init web  git@github.com:me/web.git --app-path=/var/www/html
 ```
 
-Don't want to set up keys? `./nixenv.sh shell myapp` drops you straight into an
+Don't want to set up keys? `nixenv shell myapp` drops you straight into an
 interactive `zsh` via `docker exec` (no SSH key needed).
 
 ## Commands
@@ -183,7 +186,7 @@ container runs an unprivileged `sshd` (supervised by `runit`, as your user) and
 maps that host port to port **2222** inside the container.
 
 ```sh
-./nixenv.sh ssh myapp                       # convenience wrapper
+nixenv ssh myapp                       # convenience wrapper
 ssh -p <port> app@127.0.0.1                 # equivalent
 ```
 
@@ -225,14 +228,14 @@ container's hostname is set to it), plus the zmx session when you're in one.
 ## Templates — a ready-to-run stack in one command
 
 ```sh
-./nixenv.sh init myblog   --template=wordpress    # WordPress + PHP + nginx + MariaDB
-./nixenv.sh run  myblog                           # → https://myblog-8080.nixenv.localhost/
+nixenv init myblog   --template=wordpress    # WordPress + PHP + nginx + MariaDB
+nixenv run  myblog                           # → https://myblog-8080.nixenv.localhost/
 
-./nixenv.sh init myworker --template=cloudflare   # Cloudflare Workers + wrangler
-./nixenv.sh run  myworker                         # → https://myworker-8787.nixenv.localhost/
+nixenv init myworker --template=cloudflare   # Cloudflare Workers + wrangler
+nixenv run  myworker                         # → https://myworker-8787.nixenv.localhost/
 
-./nixenv.sh init flows    --template=windmill     # Windmill self-hosted + PostgreSQL
-./nixenv.sh run  flows                            # → https://flows-8000.nixenv.localhost/
+nixenv init flows    --template=windmill     # Windmill self-hosted + PostgreSQL
+nixenv run  flows                            # → https://flows-8000.nixenv.localhost/
 ```
 
 Shipped templates: `wordpress`, `cloudflare`, `symfony`,
@@ -343,9 +346,9 @@ Each project publishes its SSH port automatically. To expose more directly (a
 database, raw TCP, etc.):
 
 ```sh
-./nixenv.sh expose myapp 8080          # → 127.0.0.1:8080:8080
-./nixenv.sh expose myapp 3000:3000     # host:container
-./nixenv.sh expose myapp 0.0.0.0:80:80 # bind all interfaces (network-reachable)
+nixenv expose myapp 8080          # → 127.0.0.1:8080:8080
+nixenv expose myapp 3000:3000     # host:container
+nixenv expose myapp 0.0.0.0:80:80 # bind all interfaces (network-reachable)
 ```
 
 Ports are stored one-per-line in `~/.nixenv/projects/<name>/ports`, so they
@@ -367,7 +370,7 @@ e.g. https://myapp-3000.nixenv.localhost/   →  your dev server on :3000
 Every project container automatically joins a shared network (`nixenv_net`) on
 `run`, and the proxy **auto-starts with the first project** (disable with
 `PROXY_AUTOSTART=0`), so usually there's nothing to do. Manage it explicitly
-with `./nixenv.sh proxy up | stop | status | logs`. New projects need no proxy
+with `nixenv proxy up | stop | status | logs`. New projects need no proxy
 configuration — the routing is dynamic. Your app must listen on `0.0.0.0` (not
 `127.0.0.1`) inside its container so the proxy can reach it.
 
@@ -384,7 +387,7 @@ Public URLs work from inside containers too — `curl https://myapp-8000.nixenv.
 just works, no configuration:
 
 ```sh
-./nixenv.sh shell myapp
+nixenv shell myapp
 curl https://myapp-8000.nixenv.localhost/     # → routed to the app, cert trusted
 ```
 
@@ -401,7 +404,7 @@ routing works. Non-curl clients (PHP streams, Python, Go, Java) resolve via
 `/etc/hosts`, so for those add one line pointing at loopback:
 
 ```sh
-./nixenv.sh host myapp myapp-8000.nixenv.localhost:127.0.0.1
+nixenv host myapp myapp-8000.nixenv.localhost:127.0.0.1
 ```
 
 **Standard ports.** Caddy binds 80/443 *inside* the proxy container (it runs
@@ -425,7 +428,7 @@ If [`mkcert`](https://github.com/FiloSottile/mkcert) is installed, an explicit
 
 ```sh
 brew install mkcert nss     # nss = Firefox trust
-./nixenv.sh proxy up        # issues the wildcard cert (one-time 'mkcert -install')
+nixenv proxy up        # issues the wildcard cert (one-time 'mkcert -install')
 ```
 
 The one-time `mkcert -install` adds mkcert's local CA to your OS/browser trust
@@ -451,7 +454,7 @@ base entries plus two optional sources, in order:
    `/etc/hosts` format (`ip<TAB>name`). Edit it by hand, or append entries with:
 
 ```sh
-./nixenv.sh host myapp db:10.0.0.5 api.local:127.0.0.1
+nixenv host myapp db:10.0.0.5 api.local:127.0.0.1
 ```
 
 Entries apply on the next container start (`host` restarts a running project
@@ -465,11 +468,11 @@ validated set of hosts — deny-everything-else. The forge domain from the clone
 URL is validated automatically at `init`, so git keeps working out of the box:
 
 ```sh
-./nixenv.sh init myapp https://gitlab.example.com/team/app.git
+nixenv init myapp https://gitlab.example.com/team/app.git
 #   → gitlab.example.com auto-allowed; everything else denied
-./nixenv.sh restrict myapp off        # opt OUT (full internet access)
-./nixenv.sh restrict myapp on         # re-enable (the default)
-./nixenv.sh init open-project --unrestricted   # opt out at creation
+nixenv restrict myapp off        # opt OUT (full internet access)
+nixenv restrict myapp on         # re-enable (the default)
+nixenv init open-project --unrestricted   # opt out at creation
 ```
 
 How it works: the restricted project runs on its own **internal** network — the
@@ -498,7 +501,7 @@ gitlab.example.com      # exactly this host
 (comma-separated, repeatable):
 
 ```sh
-./nixenv.sh init myapp https://gitlab.example.com/t/a.git \
+nixenv init myapp https://gitlab.example.com/t/a.git \
     --allow=registry.npmjs.org,.yarnpkg.com --allow=pypi.org
 ```
 
@@ -506,9 +509,9 @@ Projects created before this feature have an empty list, so `allow` their forge
 before pulling. Manage it from the host:
 
 ```sh
-./nixenv.sh allow myapp registry.npmjs.org api.stripe.com   # add + reload
-./nixenv.sh egress myapp                                    # allowed vs DENIED domains
-./nixenv.sh egress myapp -f                                 # follow live
+nixenv allow myapp registry.npmjs.org api.stripe.com   # add + reload
+nixenv egress myapp                                    # allowed vs DENIED domains
+nixenv egress myapp -f                                 # follow live
 ```
 
 `egress` reads squid's access log, so the DENIED section is your worklist:
@@ -526,40 +529,40 @@ Copy the lines for the package managers your project actually uses (replace
 ```sh
 # git over HTTPS to GitHub (your own forge is seeded by init);
 # release-assets serves GitHub Releases downloads
-./nixenv.sh allow myapp github.com release-assets.githubusercontent.com
+nixenv allow myapp github.com release-assets.githubusercontent.com
 
 # npm / npx / pnpm
-./nixenv.sh allow myapp registry.npmjs.org
+nixenv allow myapp registry.npmjs.org
 
 # yarn
-./nixenv.sh allow myapp registry.yarnpkg.com
+nixenv allow myapp registry.yarnpkg.com
 
 # Composer (PHP) — packagist metadata + GitHub-hosted dists
-./nixenv.sh allow myapp repo.packagist.org api.github.com codeload.github.com github.com
+nixenv allow myapp repo.packagist.org api.github.com codeload.github.com github.com
 
 # pip / uv (Python)
-./nixenv.sh allow myapp pypi.org files.pythonhosted.org
+nixenv allow myapp pypi.org files.pythonhosted.org
 
 # cargo (Rust) — sparse index + crate downloads; rustup toolchains
-./nixenv.sh allow myapp index.crates.io static.crates.io crates.io static.rust-lang.org
+nixenv allow myapp index.crates.io static.crates.io crates.io static.rust-lang.org
 
 # go modules
-./nixenv.sh allow myapp proxy.golang.org sum.golang.org
+nixenv allow myapp proxy.golang.org sum.golang.org
 
 # Claude CLI (platform.claude.com serves OAuth login/token refresh)
-./nixenv.sh allow myapp api.anthropic.com statsig.anthropic.com platform.claude.com
+nixenv allow myapp api.anthropic.com statsig.anthropic.com platform.claude.com
 
 # Neovim / AstroNvim first launch (lazy.nvim clones plugins from GitHub)
-./nixenv.sh allow myapp github.com
+nixenv allow myapp github.com
 
 # VS Code Remote-SSH — server download + extension marketplace
-./nixenv.sh allow myapp update.code.visualstudio.com vscode.download.prss.microsoft.com marketplace.visualstudio.com .vsassets.io
+nixenv allow myapp update.code.visualstudio.com vscode.download.prss.microsoft.com marketplace.visualstudio.com .vsassets.io
 ```
 
 (VS Code alternative needing no allowlist: set
 `"remote.SSH.localServerDownload": "always"` so your local VS Code uploads the
 server over ssh.) For anything not listed, run the tool once and read the
-DENIED section of `./nixenv.sh egress myapp` — it names the exact domains.
+DENIED section of `nixenv egress myapp` — it names the exact domains.
 
 ## Updating dotfiles (`sync-home`)
 
@@ -568,7 +571,7 @@ git default, an AstroNvim pin, …) don't propagate to existing projects on thei
 own. Refresh them with:
 
 ```sh
-./nixenv.sh sync-home myapp
+nixenv sync-home myapp
 ```
 
 This layers the embedded skeleton first, then per-project overrides committed in
@@ -646,7 +649,7 @@ for you. Anything you put there is appended **verbatim** to the container's
 
 There is no CLI flag for this on purpose; it's project state like `unrestricted`
 or `ports`. Parameters apply when the container is **created**, so re-run
-`./nixenv.sh run <project>` after editing. `run` echoes the active set.
+`nixenv run <project>` after editing. `run` echoes the active set.
 
 #### Running podman/docker inside a project
 
@@ -830,8 +833,8 @@ store grows over time (a base rebuild that drops a language runtime can leave
 gigabytes behind). Collect them:
 
 ```sh
-./nixenv.sh gc --dry-run     # report what would go
-./nixenv.sh gc               # delete it, prints before → after size
+nixenv gc --dry-run     # report what would go
+nixenv gc               # delete it, prints before → after size
 ```
 
 It deletes old profile generations plus every path not reachable from a live
@@ -888,7 +891,7 @@ disposable privileged DinD container with a named cache volume
 ## Version
 
 ```sh
-./nixenv.sh --version        # nixenv 0.1.0
+nixenv --version        # nixenv 0.1.0
 ```
 
 `--version` is dispatched before the embedded context is materialised, so it
