@@ -417,7 +417,15 @@ curls them from `main` and a tagged nixenv can pull templates that moved on
 (curl handles `file://`, so short names keep working).
 
 CI/release live in `.github/workflows/` and are covered by `22-workflows.sh`
-(YAML validity, trigger shape, job dependency chain, and that the guards exist).
+(trigger shape, job dependency chain, and that the guards exist). That test must
+NOT depend on PyYAML: GitHub's **macOS** runner ships a `python3` with no `yaml`
+module, which failed the whole file. The structural checks are therefore textual
+(an `awk` `job_needs` helper asserts the scalar `needs: <job>` form, so a list
+form is deliberately unsupported), with a real `yaml.safe_load` only as a bonus
+when the module happens to exist — GitHub rejects malformed workflow YAML on push
+anyway. `actions/checkout` must be **v5+**; v4 declares `using: node20`, which
+runners force onto node24 with a deprecation warning on every run, and the test
+rejects `@v1`–`@v4`.
 `ci.yml` runs the unit suite on push/PR across ubuntu **and macos** — macOS is
 the one that actually exercises the Bash 3.2 rule. `release.yml` fires only on
 `v[0-9]+.[0-9]+.[0-9]+` tags, in three dependent jobs: `verify` (tag must equal

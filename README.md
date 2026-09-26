@@ -46,18 +46,58 @@ the answer in `~/.nixenv/engine`. Override anytime with
 `CONTAINER_ENGINE=docker|podman`, or delete that file to be asked again. For
 Podman, image names are automatically qualified with `docker.io/`.
 
-## Install (optional)
+## Install
 
-Install the single self-contained script onto your `PATH` so you can call
-`nixenv` from anywhere:
+Three ways, all of which put `nixenv` on your `PATH`. Pick one.
+
+### Homebrew (macOS and Linux)
 
 ```sh
-./nixenv.sh install               # copies to /usr/local/bin/nixenv
+brew install rande/nixenv/nixenv
+nixenv --version
+```
+
+That taps `rande/homebrew-nixenv` and installs on first use; `brew upgrade
+nixenv` afterwards. The formula has no dependencies — nixenv is a single bash
+script that works with the system bash — so it installs in a second. You still
+need a container engine, which Homebrew won't pull in for you:
+
+```sh
+brew install --cask docker        # or: brew install podman
+brew install mkcert               # optional: trusted HTTPS for *.nixenv.localhost
+```
+
+Homebrew also installs this release's templates locally. To use those instead of
+fetching from GitHub — pinning templates to the nixenv version you actually have:
+
+```sh
+export TEMPLATE_BASE="file://$(brew --prefix)/share/nixenv/templates"
+```
+
+Don't run `nixenv install` on a Homebrew install; it refuses, because a second
+copy would never be upgraded by `brew`.
+
+### Single file, no package manager
+
+The script is self-contained, so one file is the whole tool:
+
+```sh
+curl -fsSLO https://github.com/rande/nixenv/releases/latest/download/nixenv.sh
+chmod +x nixenv.sh && ./nixenv.sh --version
+```
+
+### From a clone
+
+```sh
+git clone https://github.com/rande/nixenv && cd nixenv
+./nixenv.sh install              # copies to /usr/local/bin/nixenv
 ```
 
 Override the location or name with `INSTALL_DIR` / `INSTALL_NAME`, and remove it
 with `./nixenv.sh uninstall`. Once installed you can use `nixenv <command>`
-instead of `./nixenv.sh <command>`.
+instead of `./nixenv.sh <command>`. Note that the installed copy is a *snapshot*:
+if you're editing `nixenv.sh`, keep calling `./nixenv.sh` from the clone or it
+will be stale.
 
 ## Quick start
 
