@@ -42,6 +42,19 @@ proxy_id="$("$E" inspect nxt-proxy --format '{{.Id}}')"
 nx allow p1 httpbin.org >/dev/null
 assert_eq "$("$E" inspect nxt-proxy --format '{{.Id}}')" "$proxy_id" "proxy NOT recreated by allow"
 
+# SEC-05: the reordered config (`dstdomain -n`, name gates before the only dst
+# rule) must parse under the REAL squid. A config it rejects would take out all
+# egress, and the unit test can only check the text. The no-lookup property is
+# covered by tests/squid_acl_sim.py in unit/08.
+out="$("$E" exec nxt-proxy "$PROFILE_PATH/bin/squid" -k parse -f /etc/egress/squid.conf 2>&1)" \
+  || fail "squid rejected the generated config: $out"
+printf '%s' "$out" | grep -qiE 'FATAL|unrecognized|Bungled' \
+  && fail "squid complained about the generated config: $out"
+# A look-alike of an allowed name is still refused.
+denied="$(dexec p1 "$PROFILE_PATH/bin/zsh" -lc \
+  'curl -sv http://notexample.com/ -o /dev/null 2>&1 | grep -c 403 || true')"
+[ "$denied" -ge 1 ] || fail "look-alike of an allowed host was not denied"
+
 # egress log shows both outcomes; egress command summarises
 log="$(cat "$PROXY_DIR/data/egress.log")"
 assert_contains "$log" "example.com" "allowed logged"

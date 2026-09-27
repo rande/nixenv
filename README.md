@@ -509,8 +509,13 @@ subdomains, and bare IPs are also accepted:
 ```
 gitlab.example.com      # exactly this host
 .yarnpkg.com          # yarnpkg.com AND every subdomain (classic.yarnpkg.com, …)
-10.0.0.5              # a literal IP
+203.0.113.7           # requests addressed to this IP literally
 ```
+
+An IP entry matches requests *addressed* to that IP, not hostnames that happen
+to resolve to it — honouring the latter would mean looking up every requested
+name, which is exactly the leak described below. Private, loopback and
+link-local addresses are always refused, whatever the allowlist says.
 
 `init` **seeds the forge domain from the clone URL automatically**, and
 `--allow=` pre-validates anything else the project needs from the start
@@ -532,10 +537,15 @@ nixenv egress myapp -f                                 # follow live
 
 `egress` reads squid's access log, so the DENIED section is your worklist:
 run the project, watch what gets blocked, `allow` what's legitimate. Limits to
-know: UDP (QUIC) isn't proxied (tools fall back to TCP); DNS *resolution* still
-works for any name (data can't flow, but lookups aren't blocked); proxy-less
-raw-TCP clients can't reach external services (use ssh/CONNECT-capable paths);
-and the CONNECT ports are limited to 443/22/80/9418.
+know: UDP (QUIC) isn't proxied (tools fall back to TCP); proxy-less raw-TCP
+clients can't reach external services (use ssh/CONNECT-capable paths); and the
+CONNECT ports are limited to 443/22/80/9418.
+
+**Refused names are never looked up.** A DNS lookup is itself a way out: code
+that asks for `<secret>.attacker.example` delivers the secret to whoever runs
+that domain's nameserver, even though the request is then refused. So the proxy
+decides on the *name* first, and only resolves names that are already allowed —
+it still does that, to refuse an allowed name that points at a private address.
 
 ### Allowlist cheatsheet (tools in the base toolchain + VS Code)
 
