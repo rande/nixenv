@@ -38,6 +38,15 @@ skip() { echo "SKIP: $*"; exit 77; }
 note() { echo "  ... $*"; }
 
 assert_eq()        { [ "$1" = "$2" ]        || fail "${3:-assert_eq}: expected [$2], got [$1]"; }
+# Strip shell/Nix `#` comments from stdin. Use this before grepping source for a
+# pattern that the code's own comments are likely to mention — this repo
+# documents its traps in comments right next to the fix, so a naive grep matches
+# the warning instead of the code. It has caught us out three times: the bare
+# `''` rule, `[ -t 2 ] &&`, and an `ensure_volumes` ordering check.
+# (Not a real parser: a `#` inside a string is stripped too. Fine for grepping,
+# wrong for anything that must preserve the code exactly.)
+code_only() { sed 's/[[:space:]]*#.*//'; }
+
 assert_contains()  { case "$1" in *"$2"*) ;; *) fail "${3:-assert_contains}: [$2] not found in: $1";; esac; }
 assert_not_contains(){ case "$1" in *"$2"*) fail "${3:-assert_not_contains}: [$2] unexpectedly present";; esac; }
 assert_file()      { [ -f "$1" ] || fail "${2:-assert_file}: missing file $1"; }

@@ -1419,6 +1419,26 @@ project_port() {
 # Prompt for git identity and write it to home/.gitconfig.identity, which the
 # project's .gitconfig includes. Rewriting this one file avoids duplicate
 # [user] blocks on re-init. Non-interactive runs fall back to env / host git.
+# Populate <project>/home from the embedded skeleton, without clobbering what is
+# already there. Used by `init` and by `import` when the archive carries no home
+# volume (the default), where it is what gives the fresh home its dotfiles.
+seed_project_home() {
+  local pdir="$1" _f _rel
+  # Portable no-clobber: busybox cp has no -n, BSD/GNU differ — copy per file.
+  if [ -d "$HOME_SKEL" ]; then
+    ( cd "$HOME_SKEL" && find . -type f ) | while IFS= read -r _f; do
+      _rel="${_f#./}"
+      [ -e "$pdir/home/$_rel" ] && continue
+      mkdir -p "$pdir/home/$(dirname "$_rel")"
+      cp "$HOME_SKEL/$_rel" "$pdir/home/$_rel" || true
+    done
+  fi
+  # SSH needs strict perms or ssh/git refuse the keys.
+  mkdir -p "$pdir/home/.ssh"
+  chmod 700 "$pdir/home/.ssh"
+  find "$pdir/home/.ssh" -type f -exec chmod 600 {} \; 2>/dev/null || true
+}
+
 configure_git_identity() {
   local pdir="$1" def_name def_email gname="" gemail=""
   def_name="${GIT_USER_NAME:-$(git config --global user.name 2>/dev/null || true)}"
@@ -1661,21 +1681,7 @@ cmd_init() {
     ok "code volume will mount at '$app_mount' (not /app)"
   fi
 
-  # Seed home from the skeleton WITHOUT clobbering existing files.
-  # (Portable no-clobber: busybox cp has no -n, BSD/GNU differ — copy per file.)
-  if [ -d "$HOME_SKEL" ]; then
-    ( cd "$HOME_SKEL" && find . -type f ) | while IFS= read -r _f; do
-      _rel="${_f#./}"
-      [ -e "$pdir/home/$_rel" ] && continue
-      mkdir -p "$pdir/home/$(dirname "$_rel")"
-      cp "$HOME_SKEL/$_rel" "$pdir/home/$_rel" || true
-    done
-  fi
-
-  # SSH needs strict perms or ssh/git refuse the keys.
-  mkdir -p "$pdir/home/.ssh"
-  chmod 700 "$pdir/home/.ssh"
-  find "$pdir/home/.ssh" -type f -exec chmod 600 {} \; 2>/dev/null || true
+  seed_project_home "$pdir"
 
   # Egress: restriction is ON BY DEFAULT (default-deny). Record the forge domain
   # in the allowlist so cloning/pulling works; --unrestricted opts out.
@@ -1815,14 +1821,32 @@ cmd_build_project() {
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
   shift
 
-  local dir="" a
+  local dir="" dir_given=0 a
   for a in "$@"; do
     case "$a" in
-      --dir=*) dir="${a#--dir=}";;
+      --dir=*) dir="${a#--dir=}"; dir_given=1;;
       --dir)   die "use --dir=<path>";;
       *) die "unknown option: $a (usage: $0 build <project> [--dir=<path>])";;
     esac
   done
+
+  # --dir is REMEMBERED in <project>/flake_dir, so a project whose flake lives in
+  # e.g. infra/nixos is rebuilt with a bare `build <project>` forever after —
+  # forgetting it silently builds the wrong (or no) flake. `--dir=` with an empty
+  # value clears it.
+  local dirfile; dirfile="$(project_dir "$name")/flake_dir"
+  if [ "$dir_given" = 1 ]; then
+    if [ -n "$dir" ]; then
+      mkdir -p "$(dirname "$dirfile")"
+      printf '%s' "$dir" > "$dirfile"
+    else
+      rm -f "$dirfile"
+      log "cleared the remembered flake dir — building from the repo root"
+    fi
+  elif [ -f "$dirfile" ] && [ -s "$dirfile" ]; then
+    dir="$(cat "$dirfile")"
+    log "using remembered flake dir: --dir=$dir  (clear with --dir=)"
+  fi
 
   require_engine
   volume_exists || die "shared store missing — run '$0 build' first"
@@ -2802,6 +2826,401 @@ cmd_delete() {
 #     1. the embedded skeleton (nvim init.lua, .zshrc, .gitconfig, starship.toml,
 #        .vimrc, .ssh/config) — the shared defaults;
 #     2. project-specific overrides committed in the repo at <repo>/.nixenv/home/
+# =============================================================================
+# export / import — move a whole project between machines, or back it up
+# =============================================================================
+# An archive holds the THREE volumes (app, home, databases) plus the portable
+# host-side state. It deliberately does NOT hold:
+#   * the shared Nix store — gigabytes, and fully reproducible from the project's
+#     flake + flake.lock by 'build';
+#   * passwd/group/shadow and port/ssh/config — generated per machine, from your
+#     uid and a free port. Restoring them verbatim onto a different uid gives a
+#     container whose files it cannot write, and a port that may be taken.
+#   * flake/ and etc-hosts — build artefacts, rebuilt on demand.
+#
+# Only these host-side files travel. Anything not listed is machine-specific or
+# regenerated, so the list is an allowlist rather than an exclude list: a new
+# per-project file is left behind until someone adds it here deliberately.
+EXPORT_META_FILES="ports app_mount hosts.extra allowed_hosts unrestricted extra-parameters flake_dir"
+
+# Outer archive is NOT gzipped: each volume inside is already a .tar.gz, so
+# compressing twice costs time and saves nothing.
+export_archive_default() { printf 'nixenv-%s-%s.tar' "$1" "$(date +%Y%m%d-%H%M%S)"; }
+
+# Turn `tar -v`'s per-file listing into ONE self-updating line, so a multi-GB
+# volume doesn't look like a hang. Reads the listing on stdin and reports to
+# stderr; the archive itself goes to a mounted file inside the container, so the
+# container's stdout is ours to consume.
+#
+# awk, not a bash `read` loop: a 200k-file volume is 200k lines, and bash would
+# make the progress meter the slow part. Only every PROGRESS_EVERY-th line
+# touches the terminal, for the same reason.
+#
+# No TTY (CI, piped) → periodic whole lines instead of \r, so logs stay readable.
+# NIXENV_PROGRESS=0 silences it entirely.
+PROGRESS_EVERY="${PROGRESS_EVERY:-200}"
+progress_count() {
+  local label="$1" tty=0
+  if [ "${NIXENV_PROGRESS:-1}" = 0 ]; then cat >/dev/null; return 0; fi
+  # if/fi, NOT `[ -t 2 ] && tty=1`: a false test makes the list return 1, which
+  # is the set -e trap this repo has already been bitten by twice.
+  if [ -t 2 ]; then tty=1; fi
+  awk -v label="$label" -v tty="$tty" -v every="$PROGRESS_EVERY" '
+    { n++
+      if (n % every == 0) {
+        if (tty)                  printf "\r   %s… %d files", label, n > "/dev/stderr"
+        else if (n % 5000 == 0)   printf "   %s… %d files\n", label, n > "/dev/stderr"
+        fflush()
+      }
+    }
+    END {
+      if (tty) printf "\r   %s… %d files\n", label, n+0 > "/dev/stderr"
+      else     printf "   %s… %d files\n",   label, n+0 > "/dev/stderr"
+      fflush()
+    }'
+}
+
+# Human-readable size of a path, or "?" — du's flags differ enough between
+# platforms that a failure here must never abort an export.
+human_size() { du -h "$1" 2>/dev/null | cut -f1 | tail -1 || printf '?'; }
+
+# key=value, one per line. Parsed with grep/cut — NEVER sourced: the file comes
+# out of an archive we did not create.
+manifest_get() {
+  [ -f "$1" ] || return 1
+  sed -n "s/^$2=//p" "$1" | head -1
+}
+
+# --- git credentials living in the APP volume --------------------------------
+# A clone URL like https://user:token@host/repo.git is written verbatim into
+# .git/config, so the app volume can carry a token even when the home volume
+# (the usual place for secrets) is excluded. Both helpers below run in the
+# runtime image because the volume is only reachable from a container.
+
+# Prints offending "url = https://user:pass@host" lines, or nothing.
+app_git_embedded_creds() {
+  local appv; appv="$(app_volume "$1")"
+  vol_exists "$appv" || return 0
+  "$ENGINE" run --rm -v "$appv":/app:ro "$(img "$RUNTIME_IMAGE")" \
+    sh -c 'grep -hoE "url *= *https?://[^/@]+:[^/@]+@[^[:space:]]*" /app/.git/config 2>/dev/null || true' \
+    2>/dev/null || true
+}
+
+# Rewrites them in place to https://host/…, leaving the credential helper to
+# supply the secret. ssh://git@host is untouched: that is a username, not a
+# secret. Mounts rw ON PURPOSE — used only on a just-imported volume.
+app_scrub_git_creds() {
+  local appv; appv="$(app_volume "$1")"
+  vol_exists "$appv" || return 0
+  "$ENGINE" run --rm --user "$(id -u):$(id -g)" $(engine_userns) \
+    -v "$appv":/app "$(img "$RUNTIME_IMAGE")" \
+    sh -c 'f=/app/.git/config; [ -f "$f" ] || exit 0
+           sed -i -E "s#(url *= *https?://)[^/@]+:[^/@]+@#\\1#g" "$f"' \
+    >/dev/null 2>&1 || true
+}
+
+# Prints the origin remote URL from the app volume, or nothing.
+app_git_remote() {
+  local appv; appv="$(app_volume "$1")"
+  vol_exists "$appv" || return 0
+  # Parsed with sed, NOT `git config --get`: these helpers run in the bare
+  # RUNTIME_IMAGE with no /nix mounted, and debian:stable-slim has no git. A
+  # `git` call here silently returns nothing, which is exactly how the import
+  # credential prompt came to be skipped for an https remote.
+  "$ENGINE" run --rm -v "$appv":/app:ro "$(img "$RUNTIME_IMAGE")" \
+    sh -c 'sed -n "/^\[remote \"origin\"\]/,/^\[/p" /app/.git/config 2>/dev/null \
+           | sed -n "s/^[[:space:]]*url[[:space:]]*=[[:space:]]*//p" | head -1' \
+    2>/dev/null || true
+}
+
+# Copy specific files from the host-side home seed into the home VOLUME. Needed
+# when something is written to the seed AFTER ensure_volumes has already copied
+# it — importing credentials, for instance, since the clone URL is only known
+# once the app volume is restored.
+sync_home_files() {
+  local name="$1"; shift
+  local pdir homev f list=""; pdir="$(project_dir "$name")"; homev="$(home_volume "$name")"
+  for f in "$@"; do [ -f "$pdir/home/$f" ] && list="$list $f"; done
+  [ -n "$list" ] || return 0
+  "$ENGINE" run --rm --user "$(id -u):$(id -g)" $(engine_userns) \
+    -v "$homev":/home/"$APP_USER" -v "$pdir/home":/seed:ro \
+    "$(img "$RUNTIME_IMAGE")" \
+    sh -c 'for f in '"$list"'; do cp "/seed/$f" "/home/'"$APP_USER"'/$f" || true; done
+           [ -f "/home/'"$APP_USER"'/.git-credentials" ] && chmod 600 "/home/'"$APP_USER"'/.git-credentials"
+           true' >/dev/null 2>&1 || true
+}
+
+cmd_export() {
+  require_engine
+  local name="" force=0 out="" with_home=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --force) force=1;;
+      --with-home) with_home=1;;
+      -*) die "unknown option: $1";;
+      *) if [ -z "$name" ]; then name="$1"; else out="$1"; fi;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || die "usage: $0 export <project> [archive.tar] [--force]"
+  case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  local pdir; pdir="$(project_dir "$name")"
+  [ -d "$pdir" ] || die "unknown project '$name'"
+  [ -n "$out" ] || out="$(export_archive_default "$name")"
+  case "$out" in /*) ;; *) out="$PWD/$out";; esac
+
+  # A live database's files are crash-consistent AT BEST. Refuse rather than
+  # hand someone an archive that restores into a corrupt cluster.
+  local cname; cname="$(container_name "$name")"
+  if container_running "$cname"; then
+    if [ "$force" != 1 ]; then
+      die "'$name' is running — stop it first so the database files are consistent:
+     $0 stop $name && $0 export $name
+     (or --force to snapshot it live, crash-consistent at best)"
+    fi
+    warn "'$name' is RUNNING — this snapshot is crash-consistent at best"
+  fi
+
+  # The app volume is in EVERY archive, so a token embedded in .git/config leaks
+  # even without --with-home. Refuse rather than scrub: the remote URL is the
+  # user's data, and a token in it is a hazard well beyond nixenv.
+  local leak; leak="$(app_git_embedded_creds "$name")"
+  if [ -n "$leak" ]; then
+    if [ "$force" != 1 ]; then
+      die "the app volume's .git/config embeds credentials — the archive would leak them:
+     $(printf '%s' "$leak" | sed 's#:[^/@]*@#:***@#')
+     Fix the remote, then re-export (git's credential helper keeps working):
+       $0 ssh $name
+       git remote set-url origin https://<host>/<path>.git
+     …or --force to archive them anyway."
+    fi
+    warn "--force: archiving .git/config WITH embedded credentials"
+  fi
+
+  local stage; stage="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$stage'" EXIT
+  mkdir -p "$stage/nixenv-export/meta" "$stage/nixenv-export/volumes"
+
+  local f
+  for f in $EXPORT_META_FILES; do
+    [ -e "$pdir/$f" ] && cp -a "$pdir/$f" "$stage/nixenv-export/meta/$f"
+  done
+
+  # The home volume holds ~/.ssh and ~/.git-credentials, so it is OPT-IN: the
+  # default archive is safe to hand to a colleague. `import` reseeds a fresh home
+  # from the skeleton, which is what most of that volume is anyway.
+  local vols="app databases"
+  [ "$with_home" = 1 ] && vols="app home databases"
+
+  local v vol
+  for v in $vols; do
+    case "$v" in
+      app)       vol="$(app_volume "$name")";;
+      home)      vol="$(home_volume "$name")";;
+      databases) vol="$(db_volume "$name")";;
+    esac
+    if ! vol_exists "$vol"; then
+      warn "volume '$vol' does not exist — skipping"
+      continue
+    fi
+    log "Archiving $vol"
+    # -v lists each file on STDOUT (the archive goes to a mounted file), which is
+    # what feeds the progress line. stderr stays visible: "file changed as we read
+    # it" on a --force export is exactly what you want to see.
+    "$ENGINE" run --rm -v "$vol":/src:ro -v "$stage/nixenv-export/volumes":/out \
+      "$(img "$RUNTIME_IMAGE")" tar -C /src -cvzf "/out/$v.tar.gz" . \
+      | progress_count "archiving $v" \
+      || die "failed to archive $vol"
+    echo "   $v.tar.gz  $(human_size "$stage/nixenv-export/volumes/$v.tar.gz")"
+  done
+
+  {
+    echo "nixenv-export=1"
+    echo "version=$NIXENV_VERSION"
+    echo "project=$name"
+    echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "app_mount=$(project_app_mount "$name")"
+    echo "source_uid=$(id -u)"
+    echo "engine=$ENGINE"
+    echo "home=$with_home"
+  } > "$stage/nixenv-export/manifest"
+
+  log "Writing $out"
+  ( cd "$stage" && tar -cf "$out" nixenv-export ) || die "failed to write $out"
+  rm -rf "$stage"; trap - EXIT
+
+  ok "Exported '$name' → $out"
+  echo "   size:   $(human_size "$out")"
+  echo "   holds:  $(printf '%s' "$vols" | tr ' ' '+') volumes, and $(printf '%s' "$EXPORT_META_FILES" | wc -w | tr -d ' ') host-side files"
+  echo "   import: $0 import $out [new-name]"
+  if [ "$with_home" = 1 ]; then
+    warn "--with-home: this archive contains ~/.ssh and ~/.git-credentials — treat it as a SECRET"
+  else
+    echo "   home:   NOT included (no ssh keys or git credentials)."
+    echo "           import reseeds dotfiles and asks for a git identity."
+    echo "           Shell history, nvim plugins and ~/.local/bin are not kept —"
+    echo "           add --with-home if you want them."
+  fi
+}
+
+cmd_import() {
+  require_engine
+  local arc="" newname="" force=0 assume_yes=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --force) force=1;;
+      --yes|-y) assume_yes=1;;
+      -*) die "unknown option: $1";;
+      *) if [ -z "$arc" ]; then arc="$1"; else newname="$1"; fi;;
+    esac
+    shift
+  done
+  [ -n "$arc" ] || die "usage: $0 import <archive.tar> [new-name] [--force] [--yes]"
+  [ -f "$arc" ] || die "no such archive: $arc"
+
+  local stage; stage="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$stage'" EXIT
+  # --no-same-owner: the archive's uids mean nothing here.
+  tar -xf "$arc" -C "$stage" --no-same-owner 2>/dev/null \
+    || die "could not extract $arc"
+  local root="$stage/nixenv-export"
+  [ -f "$root/manifest" ] || die "not a nixenv export (no manifest): $arc"
+  [ "$(manifest_get "$root/manifest" nixenv-export)" = "1" ] \
+    || die "not a nixenv export (bad manifest): $arc"
+
+  local name; name="${newname:-$(manifest_get "$root/manifest" project)}"
+  [ -n "$name" ] || die "manifest has no project name and none was given"
+  # The name comes from an untrusted archive and becomes a path and a container
+  # name, so validate it exactly as 'init' would.
+  case "$name" in */*|.|..|"") die "invalid project name from archive: '$name'";; esac
+  case "$name" in *[!a-zA-Z0-9._-]*) die "invalid project name: '$name'";; esac
+
+  local pdir; pdir="$(project_dir "$name")"
+  if [ -d "$pdir" ]; then
+    # Say WHERE the name came from: "pick another name" reads as nonsense when
+    # the user just passed one.
+    local src_of_name="from the archive"
+    [ -n "$newname" ] && src_of_name="the name you gave"
+    if [ "$force" != 1 ]; then
+      die "project '$name' already exists ($src_of_name). Either:
+       $0 import $arc <a-different-name>
+       $0 delete $name          # then re-import
+       $0 import $arc $name --force   # OVERWRITES its volumes"
+    fi
+    # --force here is as destructive as `delete`: the restore wipes each volume
+    # before untarring. `delete` confirms, so this must too.
+    warn "'$name' already exists — --force will REPLACE its app/databases volumes"
+    echo "    existing data in $(app_volume "$name") and $(db_volume "$name") is lost"
+    echo "    (the home volume is $( [ -f "$root/volumes/home.tar.gz" ] && echo "replaced too" || echo "left alone"))"
+    if [ "$assume_yes" != 1 ]; then
+      printf 'Proceed? [y/N] '
+      local ans=""; read -r ans || true
+      case "$ans" in
+        [yY]|[yY][eE][sS]) ;;
+        *) warn "Aborted — nothing changed"; rm -rf "$stage"; trap - EXIT; return 0 ;;
+      esac
+    fi
+  fi
+
+  log "Importing '$name' (exported $(manifest_get "$root/manifest" created) by nixenv $(manifest_get "$root/manifest" version))"
+  mkdir -p "$pdir/home"
+
+  local f
+  for f in $EXPORT_META_FILES; do
+    [ -e "$root/meta/$f" ] && cp -a "$root/meta/$f" "$pdir/$f"
+  done
+
+  # Machine-specific state is REGENERATED, never restored: passwd/group/shadow
+  # from this uid, and a fresh free port (the exported one may be taken here).
+  write_passwd_files "$pdir"
+  local port; port="$(project_port "$name")"
+
+  # An archive WITHOUT a home volume is the normal case — export omits it unless
+  # --with-home, so the archive carries no ssh keys or git credentials. Build a
+  # fresh home here instead: skeleton dotfiles plus a git identity. This must run
+  # BEFORE ensure_volumes, which seeds the home volume from <project>/home — do
+  # it after and the volume is seeded from an empty directory.
+  # (if/fi, not `[ ] && var=1`: a false test returns 1 and trips set -e.)
+  local has_home=0
+  if [ -f "$root/volumes/home.tar.gz" ]; then
+    has_home=1
+  else
+    log "No home volume in the archive — seeding a fresh one"
+    seed_project_home "$pdir"
+    configure_git_identity "$pdir"
+  fi
+  ensure_volumes "$name"
+
+  local v vol
+  for v in app home databases; do
+    [ -f "$root/volumes/$v.tar.gz" ] || continue
+    case "$v" in
+      app)       vol="$(app_volume "$name")";;
+      home)      vol="$(home_volume "$name")";;
+      databases) vol="$(db_volume "$name")";;
+    esac
+    log "Restoring $vol"
+    # -u 0 then chown: the archive's files carry the EXPORTING machine's uid, and
+    # ensure_volumes only chowns when the root isn't already ours — so without
+    # this an import across machines leaves every file unwritable.
+    "$ENGINE" run --rm -u 0 -v "$vol":/dst -v "$root/volumes":/in:ro \
+      "$(img "$RUNTIME_IMAGE")" \
+      sh -c 'set -e; rm -rf /dst/* /dst/.[!.]* /dst/..?* 2>/dev/null || true
+             tar -C /dst -xvzf "/in/'"$v"'.tar.gz"
+             chown -R '"$(id -u):$(id -g)"' /dst' \
+      | progress_count "restoring $v" \
+      || die "failed to restore $vol"
+  done
+
+  # Defence in depth for archives made before export learned to refuse these.
+  local leak; leak="$(app_git_embedded_creds "$name")"
+  if [ -n "$leak" ]; then
+    warn "the imported .git/config embedded credentials — removing them"
+    app_scrub_git_creds "$name"
+  fi
+
+  # A fresh home has no ~/.git-credentials, so an https remote would prompt on
+  # every fetch. The clone URL is only knowable once the app volume is restored,
+  # which is after ensure_volumes seeded the home volume — hence sync_home_files.
+  if [ "$has_home" != 1 ]; then
+    local origin; origin="$(app_git_remote "$name")"
+    case "$origin" in
+      http://*|https://*)
+        log "Project clones over HTTPS — credentials are needed to fetch/push"
+        configure_git_credentials "$pdir" "$origin"
+        sync_home_files "$name" .git-credentials .gitconfig.credentials .gitconfig
+        ;;
+    esac
+  fi
+
+  write_extra_parameters "$name"
+  write_host_ssh_config "$name"
+  rm -rf "$stage"; trap - EXIT
+
+  ok "Imported as '$name'"
+  echo "   ssh:    host port $port  (freshly assigned — the exported one is not reused)"
+  echo "   repo → $(project_app_mount "$name")"
+  if is_restricted "$name"; then
+    echo "   egress→ RESTRICTED (allowed: $(tr '\n' ' ' < "$pdir/allowed_hosts" 2>/dev/null))"
+  fi
+  if [ "$has_home" != 1 ]; then
+    echo
+    warn "the home volume was not in the archive — a fresh one was created"
+    echo "   git identity: written to $pdir/home/.gitconfig.identity"
+    echo "   ssh keys:     none. For git-over-ssh, add a key inside the project:"
+    echo "                 $0 ssh $name   then   ssh-keygen -t ed25519"
+    echo "   https auth:   asked for above when the remote is https; otherwise"
+    echo "                 re-run '$0 init $name <https-clone-url>' to store a token."
+  fi
+  echo
+  log "next: $0 build            # once per machine, if the shared store is missing"
+  log "      $0 build $name      # the project's own flake"
+  log "      $0 run $name"
+}
+
+# =============================================================================
 #        (e.g. .nixenv/home/.config/nvim/init.lua), which win over the skeleton.
 #   Any file it overwrites is backed up in the volume at
 #   ~/.nixenv/home-backups/<timestamp> first. Also refreshes the host seed so a
@@ -3098,7 +3517,9 @@ Commands:
   build <project> [--dir=P] Build the project's OWN flake into a per-project
                             profile, layered on top of the base. Default reads
                             flake.nix from the repo root; --dir=P copies a whole
-                            folder (flake.nix + local deps it references)
+                            folder (flake.nix + local deps it references).
+                            --dir is REMEMBERED per project, so later rebuilds
+                            are just 'build <project>'; --dir= (empty) clears it
   init <project> [git-url] [--template=<name|url|path>] [--build]
        [--unrestricted] [--allow=host,…] [--app-path=/path] [--yes] [--force]
                             Fails if <project> already exists (--force re-runs
@@ -3161,6 +3582,18 @@ Commands:
   delete <project>          Permanently remove a project (container; app, home and
                             databases volumes; host dir) — prints the commands and
                             asks to confirm
+  export <project> [file]   Archive the project (app + databases volumes and
+                            portable host state) into one .tar for another
+                            machine or a backup. Refuses while it is running
+                            (--force snapshots live). --with-home also archives
+                            the home volume, which holds ~/.ssh and git
+                            credentials — that archive is a SECRET.
+  import <file> [new-name] [--force] [--yes]
+                            Recreate a project from such an archive: restores the
+                            volumes, chowns them to YOUR uid, regenerates
+                            passwd/shadow, assigns a fresh SSH port, and (when
+                            the archive has no home) seeds dotfiles and prompts
+                            for a git identity.
   sync-home <project>       Refresh home dotfiles into the existing home volume:
                             embedded templates first, then per-project overrides
                             from <repo>/.nixenv/home/; backs up overwritten files,
@@ -3270,6 +3703,8 @@ main() {
     logs)     cmd_logs "$@";;
     delete|rm) cmd_delete "$@";;
     sync-home) cmd_sync_home "$@";;
+    export)   cmd_export "$@";;
+    import)   cmd_import "$@";;
     projects) cmd_projects "$@";;
     update)   cmd_update "$@";;
     status)   cmd_status "$@";;

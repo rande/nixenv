@@ -196,7 +196,13 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   `nix profile install path:/flake#$PROJECT_ATTR` into `/nix/var/nix/profiles/proj-<name>`
   (`project_profile`) in the same store. Default copies just `flake.nix`/`.lock`
   from `repo/`; `--dir=<path>` (relative to repo, or absolute) copies a WHOLE
-  folder so a flake with local file references resolves. `run` passes the profile
+  folder so a flake with local file references resolves. **`--dir` is remembered**
+  in `<project>/flake_dir`, so a project whose flake lives in e.g. `infra/nixos`
+  rebuilds with a bare `build <project>` — forgetting the flag used to silently
+  build the repo-root flake (or none). An explicit `--dir=` overrides the stored
+  value; `--dir=` with an EMPTY value clears it, which is why the parser tracks
+  `dir_given` separately from `dir`. It travels in an export (`EXPORT_META_FILES`),
+  since the destination needs it to rebuild too. `run` passes the profile
   path as `NIXENV_EXTRA_PROFILE`; `.zshenv` prepends its `bin` to `PATH` (ahead of
   base) when present.
 - **PATH order is `$HOME/.local/bin` → project profile → base profile**, and it
@@ -370,7 +376,8 @@ README back to `./nixenv.sh`.
 `expose <project> <port>…`, `host <project> <name:ip>…`,
 `proxy [up|stop|status|logs|renew|remove-cert]`, `restrict <project> [on|off]`,
 `allow <project> <host>…`, `egress <project> [-f]`, `up`, `stop`, `logs`,
-`delete`/`rm`, `sync-home <project>`, `projects`, `update`, `status`,
+`delete`/`rm`, `export <project>`, `import <file>`, `sync-home <project>`,
+`projects`, `update`, `status`,
 `gc [--dry-run]` (nix-collect-garbage -d + store optimise in the builder
 container; warns about running containers, which may still reference paths a
 rebuild made unreachable), `clean`,
@@ -378,6 +385,81 @@ rebuild made unreachable), `clean`,
 commands (container/volume/home removal) and prompts before running;
 `resolve_engine` returns non-zero (not `die`) when no engine is found so
 host-file deletion still works.
+
+`export <project> [file] [--with-home] [--force]` / `import <file> [new-name]
+[--force]`
+(`cmd_export`/`cmd_import`) move a project between machines or back it up. The
+archive is a plain `.tar` (NOT gzipped — each volume inside is already a
+`.tar.gz`, so compressing twice costs time and saves nothing) containing
+`nixenv-export/{manifest,meta/,volumes/{app,databases[,home]}.tar.gz}`.
+`EXPORT_META_FILES` is an **allowlist** of the portable host-side files
+(`ports app_mount hosts.extra allowed_hosts unrestricted extra-parameters`), so a
+newly added per-project file stays behind until someone includes it deliberately;
+`23-export-import.sh` fails if machine-specific state (`passwd`/`shadow`/`port`/
+`etc-hosts`/`flake`/`ssh`/`home`) ever appears in it. Three things are
+REGENERATED on import rather than restored, and each would otherwise break a
+cross-machine move: `write_passwd_files` for this uid; a fresh port via
+`project_port` (the exported one may be taken); and — the critical one — the
+restore runs `-u 0` and `chown -R` to your uid, because the archive's files carry
+the *exporting* machine's ownership and `ensure_volumes` only chowns when the root
+isn't already yours. The shared Nix store is deliberately excluded: gigabytes, and
+reproducible by `build`. `manifest_get` parses with `sed`, never `source` — the
+manifest comes from an archive we didn't create — and the project name out of it
+is validated exactly as `init` would before becoming a path or container name.
+`export` refuses on a running project (a live DB tars crash-consistent at best)
+unless `--force`. `import` onto an EXISTING project also needs `--force`, and
+that path is as destructive as `delete` — the restore wipes each volume before
+untarring — so it warns, names the volumes it will replace, and confirms
+(`--yes` skips the prompt for scripts). The refusal message states whether the
+colliding name came from the archive or from the argument: "pick another name"
+reads as nonsense to someone who just passed one.
+
+**A token can also hide in the APP volume**, which is in *every* archive: a
+clone URL like `https://user:token@host/repo.git` is written verbatim into
+`.git/config`, so excluding the home volume does not make an archive safe on its
+own. `app_git_embedded_creds` detects it and `export` REFUSES (masking the token
+in the message, and naming the `git remote set-url` fix) unless `--force` —
+scrubbing the user's own remote silently would be worse. `import` runs
+`app_scrub_git_creds` as defence in depth for archives made before that check.
+On a no-home import, `app_git_remote` reads the origin URL and, when it is
+http(s), `configure_git_credentials` prompts for a token — then `sync_home_files`
+copies the result into the home VOLUME, because `ensure_volumes` seeded that
+volume earlier and writing only to `<project>/home` would never reach the
+container. Only `http(s)` URLs are scrubbed: `ssh://git@host` is a username, not
+a secret.
+
+**Helpers that run a bare `RUNTIME_IMAGE` container have ONLY base-Debian tools.**
+`git`, `zsh`, `socat` and everything else come from the nix store, which those
+helpers deliberately do not mount — so `app_git_remote` parses `.git/config`
+with `sed` rather than calling `git config --get`. This is not theoretical: the
+first version used `git`, which is absent from `debian:stable-slim`, returned an
+empty string, and silently skipped the credential prompt on an https import.
+`23-export-import.sh` fails if any of the `app_git_*` helpers invokes `git`.
+Mount `-v "$NIX_VOLUME":/nix:ro` and call `$PROFILE/bin/<tool>` if a helper
+genuinely needs store tooling.
+
+**The home volume is OPT-IN (`--with-home`), and the default must stay that way:**
+it holds `~/.ssh` and `~/.git-credentials`, so including it would make every
+backup a credential leak. A default archive is `app + databases` only and is safe
+to hand to a colleague; the SECRET warning fires only when `--with-home` is used,
+or it becomes noise. The manifest records `home=0|1` so import can tell
+"deliberately excluded" from "old archive". When the archive has no home volume,
+import calls `seed_project_home` + `configure_git_identity` — and must do so
+BEFORE `ensure_volumes`, which copies `<project>/home` into the volume; after it,
+the volume is seeded from an empty directory. `seed_project_home` is shared with
+`cmd_init` (one definition, so a skeleton change reaches both paths) and the unit
+test asserts both the sharing and the ordering.
+
+Both tars run with `-v` and pipe the per-file listing through `progress_count`,
+which is the ONLY long step nixenv reports on itself — `build`, `init`'s clone and
+`gc` already get progress from nix/git/nix-collect-garbage, so adding ours there
+would duplicate or fight with theirs. The listing goes to the container's stdout
+(the archive is a mounted file), so it's ours to consume; tar's **stderr is left
+visible** because "file changed as we read it" on a `--force` export is exactly
+what you want to see. Counting is done in `awk`, not a bash `read` loop — 200k
+files means 200k lines and bash would make the meter the bottleneck. No TTY →
+periodic whole lines instead of `\r`; `NIXENV_PROGRESS=0` silences it but still
+`cat >/dev/null`s stdin, or tar would block on a full pipe.
 
 `sync-home <project>` (`cmd_sync_home`) refreshes the home volume's dotfiles
 into an EXISTING volume (the seed→volume copy is otherwise one-time, so template
@@ -539,6 +621,12 @@ After editing `nixenv.sh`, ALWAYS run the unit suite (fast, no docker):
 
 Test layout: one bash file per test in `tests/unit/` and `tests/integration/`,
 shared harness `tests/lib.sh` (exit 0 pass / 77 skip / else fail), plus
+`tests/lib.sh`'s `code_only` filter (strip `#` comments before grepping source)
+exists because this repo documents each trap in a comment right beside the fix,
+so a naive grep matches the warning instead of the code — that has broken a
+guard three times (the bare `''` rule, `[ -t 2 ] &&`, and an `ensure_volumes`
+ordering check). Pipe through it whenever a test greps for a pattern the code's
+own comments plausibly mention.
 `tests/lib-template.sh` whose `assert_template <name>` encodes the template
 rules above (metadata valid, hook present, services declared as files, markers,
 placeholders, 0.0.0.0 binding),

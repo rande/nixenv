@@ -133,7 +133,9 @@ interactive `zsh` via `docker exec` (no SSH key needed).
 - `build <project> [--dir=<path>]` — build the project's **own** flake into a
   per-project profile, layered on the base. Default reads `flake.nix` from the
   repo root; `--dir=<path>` copies a whole folder (flake + local files it
-  references). See [Per-project tooling](#per-project-tooling).
+  references) and is **remembered**, so later rebuilds are just
+  `nixenv build <project>`. `--dir=` (empty) forgets it. See
+  [Per-project tooling](#per-project-tooling).
 - `init <project> [git-url] [--build] [--unrestricted] [--allow=host,…] [--app-path=/path]` — scaffold the
   project, prompt for git name/email, assign a stable random SSH port, and
   optionally clone `git-url` into the app volume. `--build` also builds the
@@ -824,6 +826,81 @@ Override via environment variables:
   published; used by restricted projects).
 
 Projects always live in `~/.nixenv/projects` (not configurable).
+
+## Backup and migrate (`export` / `import`)
+
+Move a whole project to another machine, or keep a backup:
+
+```sh
+nixenv stop myapp                     # a live database tars inconsistently
+nixenv export myapp                   # → nixenv-myapp-20260927-101500.tar
+# ...copy it across...
+nixenv import nixenv-myapp-20260927-101500.tar
+nixenv build myapp && nixenv run myapp
+```
+
+`import <file> <new-name>` clones a project under a different name on the same
+machine — handy for forking a database-heavy environment. Importing onto a name
+that already exists needs `--force`, which **replaces that project's volumes** —
+it warns and asks first (`--yes` to skip the prompt).
+
+**What travels by default:** the `app` and `databases` volumes, plus the portable
+host-side state (`ports`, `app_mount`, `hosts.extra`, `allowed_hosts`,
+`unrestricted`, `extra-parameters`).
+
+**A token in the repo's `.git/config` is the other leak.** If you ever cloned
+with `https://user:token@host/…`, git stored that URL verbatim — and the app
+volume is in every archive. `export` refuses when it finds one and tells you how
+to fix the remote; `import` strips any it finds. Only `http(s)` URLs are touched
+(`ssh://git@host` is a username, not a secret).
+
+**The home volume is opt-in.** It holds `~/.ssh` and `~/.git-credentials`, so
+including it by default would make every backup a credential leak. A default
+archive is safe to hand to a colleague; `import` builds a fresh home instead —
+skeleton dotfiles, `.ssh/` at mode 700, and a prompt for your git identity.
+
+```sh
+nixenv export myapp --with-home       # keeps shell history, nvim plugins,
+                                      # ~/.local/bin — and the secrets. ⚠️
+```
+
+Without `--with-home` you lose shell history, installed nvim plugins and
+anything you dropped in `~/.local/bin`; everything else in that volume is
+reseeded. After such an import, to restore outbound git auth:
+
+If the project clones over HTTPS, `import` notices and prompts for a username
+and token itself. For git-over-ssh you still need a key:
+
+```sh
+nixenv ssh myapp && ssh-keygen -t ed25519
+```
+
+**What never travels, and why:**
+
+- **The shared Nix store.** Gigabytes, and fully reproducible — that's what
+  `nixenv build` is for. An archive is the size of your data, not your toolchain.
+- **`passwd`/`group`/`shadow`.** Generated from your uid. `import` regenerates
+  them and **chowns the restored volumes to your uid**, which is what makes a
+  cross-machine move work at all — the archive's files carry the *exporting*
+  machine's ownership.
+- **The SSH port.** `import` assigns a fresh free one and prints it; the exported
+  port may already be taken here.
+
+`export` refuses while the project is running, because copying a live Postgres or
+MySQL data directory is crash-consistent at best. `--force` overrides it with a
+warning, which is fine for a code-only project and not fine for a database.
+
+Both commands report progress as they go, so a multi-GB volume doesn't look like a
+hang:
+
+```
+==> Archiving nixenv_myapp_databases
+   archiving databases… 48312 files
+   databases.tar.gz  1.4G
+```
+
+On a terminal that's a single self-updating line. Piped or in CI it prints a line
+periodically instead, so logs stay readable. `NIXENV_PROGRESS=0` turns it off.
 
 ## Reclaiming disk space
 
