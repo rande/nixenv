@@ -386,7 +386,7 @@ e.g. https://myapp-3000.nixenv.localhost/   →  your dev server on :3000
 Every project container automatically joins a shared network (`nixenv_net`) on
 `run`, and the proxy **auto-starts with the first project** (disable with
 `PROXY_AUTOSTART=0`), so usually there's nothing to do. Manage it explicitly
-with `nixenv proxy up | stop | status | logs`. New projects need no proxy
+with `nixenv proxy up | reload | stop | status | logs`. New projects need no proxy
 configuration — the routing is dynamic. Your app must listen on `0.0.0.0` (not
 `127.0.0.1`) inside its container so the proxy can reach it.
 
@@ -435,6 +435,22 @@ For plain service-to-service calls you don't need any of this:
 `http://nixenv-myapp:8000/` already resolves over the shared network and skips
 the hairpin. Use the public URL when the app genuinely needs it — absolute link
 generation, OAuth redirects, tests hitting the real hostname.
+
+### Projects can't reach each other by default
+
+A **restricted** project (the default) can reach only its *own* public URLs
+through the proxy: from `myapp`, `https://other-8000.nixenv.localhost/` returns
+`403`. That stops one compromised project from driving another's admin UI. Your
+browser on the host is never affected. To let projects talk, list the callers in
+the **target's** `accept-from` file and reload the proxy (no restart):
+
+```sh
+echo myapp >> ~/.nixenv/projects/other/accept-from   # '*' = every project
+nixenv proxy reload
+```
+
+Unrestricted projects share one flat network and can reach each other directly
+(`http://nixenv-other:8000/`), so this guard doesn't apply to them.
 
 ### Trusted certificates (mkcert)
 

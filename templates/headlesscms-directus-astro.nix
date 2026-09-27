@@ -8,6 +8,7 @@
 #   ./nixenv.sh run  mysite
 #       frontend (Astro)   →  https://mysite-4321.nixenv.localhost/
 #       CMS      (Directus)→  https://mysite-8055.nixenv.localhost/    admin@example.com / directus
+#       (a default password — change it at first login)
 #
 #   # from a local checkout / your own fork:
 #   ./nixenv.sh init mysite --template=./templates/headlesscms-directus-astro.nix

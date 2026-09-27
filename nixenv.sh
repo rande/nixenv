@@ -2426,7 +2426,7 @@ write_egress_configs() {
   # (a live 'squid -k reconfigure' would then read the OLD config forever).
   # Overwriting files in place keeps the mount coherent.
   mkdir -p "$edir"
-  EGRESS_PUB=(); EGRESS_PROJECTS=""
+  EGRESS_PUB=(); EGRESS_PROJECTS=""; EGRESS_SUBNETS=""
   local relays="" acls="" gates="" allows="" all_srcs="" d pdir name subnet aclname doms ips sshport _line _spec hp cp
 
   for pdir in "$PROJECTS_DIR"/*/; do
@@ -2440,6 +2440,9 @@ write_egress_configs() {
       continue
     fi
     EGRESS_PROJECTS="$EGRESS_PROJECTS $name"
+    # "<name> <subnet>" per line — write_caddyfile uses it for the SEC-06 guard.
+    EGRESS_SUBNETS="$EGRESS_SUBNETS$name $subnet
+"
     aclname="$(printf '%s' "$name" | tr -c 'a-zA-Z0-9' '_')"
 
     # Split allowed_hosts into domains and IPs. Domain matching is EXACT unless
@@ -2498,7 +2501,7 @@ http_access deny p_$aclname"
     sshport="$(project_port "$name")"
     EGRESS_PUB+=(-p "127.0.0.1:$sshport:$sshport")
     relays="$relays
-\"\$PROFILE/bin/socat\" TCP-LISTEN:$sshport,fork,reuseaddr TCP:$(container_name "$name"):$SSHD_PORT &"
+\"\$PROFILE/bin/socat\" TCP-LISTEN:$sshport,fork,reuseaddr\${RELAY_BIND:+,bind=\$RELAY_BIND} TCP:$(container_name "$name"):$SSHD_PORT &"
 
     # Extra declared ports (<project>/ports) relayed the same way.
     if [ -f "$pdir/ports" ]; then
@@ -2512,7 +2515,7 @@ http_access deny p_$aclname"
         esac
         EGRESS_PUB+=(-p "127.0.0.1:$hp:$hp")
         relays="$relays
-\"\$PROFILE/bin/socat\" TCP-LISTEN:$hp,fork,reuseaddr TCP:$(container_name "$name"):$cp &"
+\"\$PROFILE/bin/socat\" TCP-LISTEN:$hp,fork,reuseaddr\${RELAY_BIND:+,bind=\$RELAY_BIND} TCP:$(container_name "$name"):$cp &"
       done < "$pdir/ports"
     fi
   done
@@ -2575,14 +2578,75 @@ if [ -f /etc/egress/squid.conf ]; then
   rm -f /data/run/squid.pid
   # stdout/err to a host-visible file so startup FATALs are diagnosable
   "\$PROFILE/bin/squid" -f /etc/egress/squid.conf -N >>/data/squid-out.log 2>&1 &
-fi$relays
+fi
+# SEC-06: the relays listen ONLY on the primary ($PROXY_NET, eth0) address —
+# the one the host's published ports arrive on. Restricted projects reach this
+# container through their --internal nets (eth1+), which have no route to that
+# address, so they can't use another project's relay to hit its services.
+# Empty (address undetectable) falls back to listening everywhere.
+RELAY_BIND="\$(hostname -I 2>/dev/null | awk '{print \$1}')"
+[ -n "\$RELAY_BIND" ] || echo "nixenv: could not detect the proxy address — relays listen on all interfaces" >&2$relays
 exec "\$PROFILE/bin/caddy" run --config /etc/caddy/Caddyfile --adapter caddyfile
 EOF
 }
 
+# SEC-06 opt-in: <target>/accept-from lists the projects allowed to reach the
+# target's web services through the proxy (names, whitespace/newline separated,
+# '#' comments; '*' = every project). Absent → only the target itself.
+# Anything that isn't a valid project name is dropped: these end up in a regex.
+project_accept_from() {
+  local f; f="$(project_dir "$1")/accept-from"
+  [ -f "$f" ] || return 0
+  sed 's/#.*//' "$f" | tr ' \t' '\n\n' | while IFS= read -r t; do
+    case "$t" in
+      "") ;;
+      \*) echo '*' ;;
+      -*|*[!a-zA-Z0-9_-]*) echo "nixenv: $f: ignoring invalid project name '$t'" >&2 ;;
+      *) echo "$t" ;;
+    esac
+  done
+}
+# Does <target> accept requests from <origin>?
+project_accepts() {
+  project_accept_from "$1" 2>/dev/null | grep -qxF -e "$2" -e '*'
+}
+
+# Caddy matchers + deny lines for the SEC-06 guard, from EGRESS_SUBNETS (set by
+# write_egress_configs). Prints two sections separated by a line "--": the
+# named matchers, then the respond lines. A request arriving from a restricted
+# project's --internal subnet may only target that project, or a project whose
+# accept-from names it.
+caddy_isolation_rules() {
+  local dom_re="$1" name subnet id targets tdir t matchers="" denies=""
+  while read -r name subnet; do
+    [ -n "$name" ] && [ -n "$subnet" ] || continue
+    case "$name" in -*|*[!a-zA-Z0-9_-]*) continue;; esac
+    targets="$name"
+    for tdir in "$PROJECTS_DIR"/*/; do
+      [ -d "$tdir" ] || continue
+      t="$(basename "$tdir")"
+      [ "$t" = "$name" ] && continue
+      case "$t" in -*|*[!a-zA-Z0-9_-]*) continue;; esac
+      project_accepts "$t" "$name" && targets="$targets|$t"
+    done
+    id="$(printf '%s' "$name" | tr -c 'a-zA-Z0-9' '_')"
+    matchers="$matchers
+	@xproj_$id {
+		remote_ip $subnet
+		not header_regexp Host ^($targets)-[0-9]+\\.$dom_re(:[0-9]+)?\$
+	}"
+    denies="$denies
+		respond @xproj_$id \"nixenv proxy: project '$name' may not reach {host} (add '$name' to the target's accept-from)\" 403"
+  done <<EOF
+${EGRESS_SUBNETS:-}
+EOF
+  printf '%s\n--\n%s\n' "$matchers" "$denies"
+}
+
 # Write $PROXY_DIR/Caddyfile. $1=1 → use the mkcert wildcard cert, else internal.
+# Call write_egress_configs FIRST: the SEC-06 guard needs EGRESS_SUBNETS.
 write_caddyfile() {
-  local tls_line dom_re
+  local tls_line dom_re rules guards denies
   mkdir -p "$PROXY_DIR"
   dom_re="$(printf '%s' "$PROXY_DOMAIN" | sed 's/\./\\./g')"
   if [ "${1:-0}" = 1 ]; then
@@ -2590,6 +2654,9 @@ write_caddyfile() {
   else
     tls_line="tls internal"
   fi
+  rules="$(caddy_isolation_rules "$dom_re")"
+  guards="$(printf '%s\n' "$rules" | sed '/^--$/,$d')"
+  denies="$(printf '%s\n' "$rules" | sed '1,/^--$/d')"
   # Unquoted heredoc: $vars expand; Caddy's {re.route.N}/{host} have no $ so stay
   # literal; \. and \$ are preserved/reduced to regex-correct forms.
   cat > "$PROXY_DIR/Caddyfile" <<CADDY
@@ -2604,9 +2671,17 @@ write_caddyfile() {
 
 *.$PROXY_DOMAIN {
 	$tls_line
-	@route header_regexp route Host ^(.+)-([0-9]+)\.$dom_re(:[0-9]+)?\$
-	handle @route {
-		reverse_proxy $CONTAINER_PREFIX-{re.route.1}:{re.route.2} {
+	# Project names are [a-zA-Z0-9_-] (valid_project_name) — nothing looser.
+	@route header_regexp route Host ^([a-zA-Z0-9_-]+)-([0-9]+)\.$dom_re(:[0-9]+)?\$
+$guards
+	# 'route' keeps this order literally (Caddy would otherwise sort directives).
+	route {
+		# SEC-06: a restricted project may only reach ITSELF through the proxy,
+		# unless the target lists it in <target>/accept-from. Identified by the
+		# source subnet of its --internal network. Host requests and unrestricted
+		# projects (flat $PROXY_NET, reachable directly anyway) are not guarded.
+$denies
+		reverse_proxy @route $CONTAINER_PREFIX-{re.route.1}:{re.route.2} {
 			# Caddy already adds X-Forwarded-For/Proto/Host; make the TLS-terminated
 			# scheme explicit (443 is mapped to caddy's 8443) and add a couple more
 			# so backends (e.g. Symfony behind trusted_proxies) generate https URLs.
@@ -2617,8 +2692,6 @@ write_caddyfile() {
 			# SSE, chunked output, dev-server live reload. WebSockets need nothing.
 			flush_interval -1
 		}
-	}
-	handle {
 		respond "nixenv proxy: no route for {host} — use <project>-<port>.$PROXY_DOMAIN" 502
 	}
 }
@@ -2634,8 +2707,8 @@ cmd_proxy() {
       ensure_proxy_net
       mkdir -p "$PROXY_DIR/data"
       local cert=0; proxy_make_cert && cert=1 || cert=0
-      write_caddyfile "$cert"
-      write_egress_configs   # squid ACLs + relays + start.sh (fills EGRESS_PUB/EGRESS_PROJECTS)
+      write_egress_configs   # squid ACLs + relays + start.sh (fills EGRESS_PUB/PROJECTS/SUBNETS)
+      write_caddyfile "$cert"   # after: its SEC-06 guard needs EGRESS_SUBNETS
       local certmount; certmount=()
       [ "$cert" = 1 ] && certmount=(-v "$PROXY_DIR/certs:/certs:ro")
       "$ENGINE" rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
@@ -2676,6 +2749,29 @@ cmd_proxy() {
       [ -n "$EGRESS_PROJECTS" ] && echo "   egress: squid allowlist on :$EGRESS_PORT for:$EGRESS_PROJECTS  (log: $0 egress <project>)"
       echo "   note:   *.localhost auto-resolves to 127.0.0.1 in Chrome/Firefox (Safari needs an /etc/hosts line)"
       ;;
+    reload)
+      # Regenerate Caddyfile + squid.conf and hot-reload both IN the running
+      # container — no recreate, so relayed ssh/zmx sessions survive. Covers
+      # routing/isolation (accept-from) and allowlists; NEW published ports or
+      # relays (a project newly restricted, a <project>/ports edit) still need
+      # 'proxy up', since published ports are fixed at container creation.
+      container_running "$PROXY_NAME" || die "proxy not running — start it with '$0 proxy up'"
+      local rcert=0 rp
+      [ -f "$PROXY_DIR/certs/wildcard.pem" ] && rcert=1
+      write_egress_configs
+      write_caddyfile "$rcert"
+      for rp in $EGRESS_PROJECTS; do
+        "$ENGINE" network connect "$(internal_net "$rp")" "$PROXY_NAME" >/dev/null 2>&1 || true
+      done
+      "$ENGINE" exec "$PROXY_NAME" "$PROFILE/bin/caddy" reload \
+          --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null \
+        || die "caddy rejected the new config (the old one stays active) — see '$0 proxy logs'"
+      if [ -f "$PROXY_DIR/egress/squid.conf" ]; then
+        "$ENGINE" exec "$PROXY_NAME" "$PROFILE/bin/squid" -f /etc/egress/squid.conf -k reconfigure >/dev/null 2>&1 \
+          || warn "squid did not reload (not running in this proxy?) — use '$0 proxy up'"
+      fi
+      ok "proxy config reloaded (no restart)"
+      ;;
     stop|down)
       "$ENGINE" rm -f "$PROXY_NAME" >/dev/null 2>&1 && ok "proxy stopped" || log "proxy not running"
       ;;
@@ -2712,7 +2808,7 @@ cmd_proxy() {
     logs)
       exec "$ENGINE" logs -f "$PROXY_NAME"
       ;;
-    *) die "usage: $0 proxy [up|stop|status|logs|renew|remove-cert]";;
+    *) die "usage: $0 proxy [up|reload|stop|status|logs|renew|remove-cert]";;
   esac
 }
 
@@ -2928,7 +3024,7 @@ cmd_delete() {
 # Only these host-side files travel. Anything not listed is machine-specific or
 # regenerated, so the list is an allowlist rather than an exclude list: a new
 # per-project file is left behind until someone adds it here deliberately.
-EXPORT_META_FILES="ports app_mount hosts.extra allowed_hosts unrestricted extra-parameters flake_dir"
+EXPORT_META_FILES="ports app_mount hosts.extra allowed_hosts unrestricted extra-parameters flake_dir accept-from"
 
 # Outer archive is NOT gzipped: each volume inside is already a .tar.gz, so
 # compressing twice costs time and saves nothing.
@@ -3638,7 +3734,7 @@ Commands:
                             <project>/hosts.extra; the entrypoint merges that file
                             into /etc/hosts at start. Edit the file by hand too.
                             Restarts a running project to apply
-  proxy [up|stop|status|logs|renew|remove-cert]
+  proxy [up|reload|stop|status|logs|renew|remove-cert]
                             Shared Caddy reverse proxy. 'up' starts it and routes
                             https://<project>-<port>.$PROXY_DOMAIN → nixenv-<project>:<port>
                             over network '$PROXY_NET' (projects auto-join on 'run').
@@ -3647,7 +3743,11 @@ Commands:
                             (explains before 'mkcert -install'; PROXY_MKCERT_INSTALL=0
                             to skip trusting), else Caddy's internal CA.
                             'renew' reissues the cert; 'remove-cert' deletes it
-                            (falls back to the internal CA)
+                            (falls back to the internal CA). 'reload' applies
+                            routing/allowlist changes without restarting it.
+                            A restricted project may only reach its OWN URLs through
+                            the proxy; list other projects in <target>/accept-from
+                            ('*' = all), then 'proxy reload'
   restrict <project> [on|off]
                             Egress restriction — ON BY DEFAULT for every project:
                             it runs on its own INTERNAL network (no route out) and

@@ -335,7 +335,29 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   `curl https://<allowed-host>/` succeeds while `ping` does not. `getent hosts
   nixenv-proxy` (works) vs `getent hosts google.com` (fails) is the quickest way
   to tell this apart from a real DNS problem.
-- Shared reverse proxy (`cmd_proxy`, `nixenv proxy up|stop|status|logs`): a single
+- **Cross-project isolation at the proxy (SEC-06).** Restricted projects reach
+  other projects ONLY through the proxy (their internal net has no other route),
+  so that's where it's enforced. The Caddy route regex is limited to project-name
+  characters (`[a-zA-Z0-9_-]+`, never `(.+)`). `write_egress_configs` records
+  `EGRESS_SUBNETS` ("name subnet" lines); `caddy_isolation_rules` turns each into
+  a named matcher `@xproj_<id>` = `remote_ip <subnet>` AND `not header_regexp
+  Host ^(<self>|<peers>)-[0-9]+\.<domain>…$`, answered with `respond … 403`.
+  Peers come from the TARGET's `<target>/accept-from` (names or `*`; anything
+  else is dropped because it lands in a regex — `project_accept_from`). The
+  denies sit inside a `route {}` block BEFORE `reverse_proxy`: `route` keeps
+  literal order, whereas Caddy sorts bare directives and `handle`s. Hence
+  `cmd_proxy up` must call `write_egress_configs` BEFORE `write_caddyfile`. Host
+  requests and unrestricted projects are deliberately unguarded — the host's
+  source address differs per engine (docker gateway, Docker Desktop, rootless
+  podman), and unrestricted projects share flat `nixenv_net` and can hit
+  `nixenv-<other>:<port>` directly anyway. The proxy's socat port relays were the
+  second path in: they now bind `RELAY_BIND` = the proxy's first `hostname -I`
+  address (eth0 = `$PROXY_NET`, where published ports land); internal nets are
+  eth1+ and have no route to it. `proxy reload` regenerates both configs and
+  hot-reloads caddy (`caddy reload`) + squid (`-k reconfigure`) without
+  recreating the container; new relays/published ports still need `proxy up`.
+  `accept-from` is in `EXPORT_META_FILES`. Tests: unit `07`, integration `16`.
+- Shared reverse proxy (`cmd_proxy`, `nixenv proxy up|reload|stop|status|logs`): a single
   `${PREFIX}-proxy` Caddy container (caddy is in the base flake, run from the store)
   on a shared user network `PROXY_NET` (`nixenv_net`) that every project container
   auto-joins (`ensure_proxy_net` + `--network` in `cmd_run`). Caddy serves
@@ -407,7 +429,7 @@ README back to `./nixenv.sh`.
 `build [project]`, `init <project> [git-url] [--build]`, `run <project>`,
 `ssh <project>`, `ssh-config [--install]`, `shell <project>`,
 `expose <project> <port>…`, `host <project> <name:ip>…`,
-`proxy [up|stop|status|logs|renew|remove-cert]`, `restrict <project> [on|off]`,
+`proxy [up|reload|stop|status|logs|renew|remove-cert]`, `restrict <project> [on|off]`,
 `allow <project> <host>…`, `egress <project> [-f]`, `up`, `stop`, `logs`,
 `delete`/`rm`, `export <project>`, `import <file>`, `sync-home <project>`,
 `projects`, `update`, `status`,

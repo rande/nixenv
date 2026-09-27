@@ -42,9 +42,9 @@ assert_not_contains "$conf" "pinger_enable" "no icmp directive"
 assert_not_contains "$conf" "dns_v4_first" "no removed directives"
 
 # relays + host-port publishes (ssh + declared ports)
-assert_contains "$startsh" "TCP-LISTEN:23456,fork,reuseaddr TCP:nxt-alpha:2222" "ssh relay"
-assert_contains "$startsh" "TCP-LISTEN:3000,fork,reuseaddr TCP:nxt-alpha:3000" "bare port relay"
-assert_contains "$startsh" "TCP-LISTEN:15432,fork,reuseaddr TCP:nxt-alpha:5432" "mapped port relay"
+assert_contains "$startsh" 'TCP-LISTEN:23456,fork,reuseaddr${RELAY_BIND:+,bind=$RELAY_BIND} TCP:nxt-alpha:2222' "ssh relay"
+assert_contains "$startsh" 'TCP-LISTEN:3000,fork,reuseaddr${RELAY_BIND:+,bind=$RELAY_BIND} TCP:nxt-alpha:3000' "bare port relay"
+assert_contains "$startsh" 'TCP-LISTEN:15432,fork,reuseaddr${RELAY_BIND:+,bind=$RELAY_BIND} TCP:nxt-alpha:5432' "mapped port relay"
 assert_contains "$startsh" "rm -f /data/run/squid.pid" "stale pidfile cleared"
 assert_contains "${EGRESS_PUB[*]}" "127.0.0.1:23456:23456"
 sh -n "$PROXY_DIR/egress/start.sh" || fail "start.sh parses"
