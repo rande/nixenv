@@ -71,10 +71,25 @@ scan_line="$(printf '%s\n' "$ep" | grep -n 'for d in "\$SVROOT"/\*/' | cut -d: -
 [ "$path_line" -lt "$hook_line" ] || fail "PATH must be exported before hooks run"
 [ "$hook_line" -lt "$scan_line" ] || fail "hook must run before the service scan"
 
-# open ssh: empty password + loopback-only is host-side; config flags here
-assert_contains "$ep" 'PermitEmptyPasswords yes'
+# ssh is KEY-ONLY (SEC-02): sshd listens on every interface, so it is reachable
+# from other projects on nixenv_net and through the proxy relays. It must accept
+# only the host-generated key mounted read-only — never a password, never a key
+# the container could write itself.
+assert_contains "$ep" 'PermitEmptyPasswords no'
+assert_contains "$ep" 'PasswordAuthentication no'
+assert_contains "$ep" 'KbdInteractiveAuthentication no'
+assert_contains "$ep" 'AuthenticationMethods publickey'
+assert_contains "$ep" 'AuthorizedKeysFile /etc/nixenv/authorized_keys'
 assert_contains "$ep" 'PermitRootLogin no'
 assert_contains "$ep" 'AcceptEnv LANG LC_* ZMX_SESSION'
+epc="$(printf '%s' "$ep" | code_only)"
+for bad in 'PermitEmptyPasswords yes' 'PasswordAuthentication yes' \
+           'AuthorizedKeysFile .ssh/authorized_keys'; do
+  assert_not_contains "$epc" "$bad" "sshd must not have: $bad"
+done
+# The old "merge ~/.ssh/*.pub into authorized_keys" block let the container
+# authorise its own keys. It must stay gone.
+assert_not_contains "$epc" '/.ssh/authorized_keys' "entrypoint builds no authorized_keys"
 
 # zshrc: PATH layering keeps project profile first; cd to app mount
 zshrc="$(cat "$CONTEXT_DIR/home-skel/.zshrc")"

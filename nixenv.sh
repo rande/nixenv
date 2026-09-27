@@ -497,14 +497,9 @@ for t in ed25519 rsa; do
   [ -f "$f" ] || "$SSHKEYGEN" -t "$t" -f "$f" -N "" -q
 done
 
-# Build authorized_keys from any *.pub the project provided (optional — login is
-# open via the empty-password 'none' method too).
-if [ ! -f "$HOME_DIR/.ssh/authorized_keys" ]; then
-  for pub in "$HOME_DIR"/.ssh/*.pub; do
-    [ -f "$pub" ] || continue
-    cat "$pub" >> "$HOME_DIR/.ssh/authorized_keys" 2>/dev/null || true
-  done
-fi
+# No authorized_keys is built from the home volume: the container must never be
+# able to authorise a key itself. sshd reads ONLY the host-generated file that
+# cmd_run bind-mounts read-only at /etc/nixenv/authorized_keys (SEC-02).
 
 SFTP="$(ls "$PROFILE"/libexec/sftp-server 2>/dev/null || ls "$PROFILE"/libexec/openssh/sftp-server 2>/dev/null || true)"
 
@@ -514,14 +509,17 @@ SFTP="$(ls "$PROFILE"/libexec/sftp-server 2>/dev/null || ls "$PROFILE"/libexec/o
   echo "HostKey $HOME_DIR/.ssh/ssh_host_rsa_key"
   echo "PidFile $SSHRUN/sshd.pid"
   echo "PermitRootLogin no"
-  # Open local-dev login: no key and no password. The app account has an empty
-  # password (mounted /etc/shadow) and sshd permits empty passwords, so the SSH
-  # 'none' method succeeds. Pubkey still works if keys are present.
+  # KEY-ONLY login (SEC-02). This sshd listens on every interface in the
+  # container, so it is reachable from other projects on nixenv_net and — for
+  # restricted projects — through the proxy's relays. The only key it accepts is
+  # the per-project one nixenv generated on the HOST, mounted read-only: another
+  # project has no copy of it, and nothing inside this container can add one.
   echo "PubkeyAuthentication yes"
-  echo "PasswordAuthentication yes"
-  echo "PermitEmptyPasswords yes"
+  echo "AuthenticationMethods publickey"
+  echo "PasswordAuthentication no"
+  echo "PermitEmptyPasswords no"
   echo "KbdInteractiveAuthentication no"
-  echo "AuthorizedKeysFile .ssh/authorized_keys"
+  echo "AuthorizedKeysFile /etc/nixenv/authorized_keys"
   echo "AllowUsers $APP_USER"
   echo "UsePAM no"
   echo "StrictModes no"          # bind-mounted HOME perms vary; don't reject keys
@@ -650,7 +648,7 @@ for d in "$SVROOT"/*/; do
   project_services="$project_services $sname"
 done
 
-echo "nixenv: unprivileged sshd ready on :$SSHD_PORT as '$APP_USER' (no key/password)"
+echo "nixenv: unprivileged sshd ready on :$SSHD_PORT as '$APP_USER' (per-project key only)"
 [ -n "$project_services" ] && echo "nixenv: project services:$project_services"
 
 # runsvdir would be the natural multi-service supervisor, but in this container
@@ -1317,8 +1315,10 @@ ensure_volumes() {
 
 # Generate the /etc/passwd, /etc/group, /etc/shadow that the container runs with.
 # The container runs as the host uid/gid; these files give that id the name
-# 'app' (home /home/app, shell = shared zsh) and an EMPTY password so the open
-# SSH 'none' method works. They are bind-mounted read-only into the container.
+# 'app' (home /home/app, shell = shared zsh). Both accounts have NO usable
+# password ('*'): login is by the per-project ssh key only (SEC-02). OpenSSH
+# treats '*' as "no password", not "locked" (locked is a '!' prefix), so pubkey
+# auth still works. They are bind-mounted read-only into the container.
 write_passwd_files() {
   local pdir="$1" uid gid sh="$PROFILE/bin/zsh"
   uid="$(id -u)"; gid="$(id -g)"
@@ -1332,7 +1332,7 @@ $APP_USER:x:$gid:
 EOF
   cat > "$pdir/shadow" <<EOF
 root:*:19000:0:99999:7:::
-$APP_USER::19000:0:99999:7:::
+$APP_USER:*:19000:0:99999:7:::
 EOF
   chmod 644 "$pdir/passwd" "$pdir/group" "$pdir/shadow"
 }
@@ -1344,12 +1344,62 @@ container_running() { "$ENGINE" ps    --format '{{.Names}}' | grep -qx "$1"; }
 # clobbers your edits), so `ssh <project>` connects to the container. Your
 # ~/.ssh/config picks it up via `Include ~/.nixenv/projects/*/ssh/config`
 # (run: nixenv ssh-config --install).
+# Per-project ssh key (SEC-02): the ONLY credential the container's sshd accepts.
+# Generated on the HOST and kept in <project>/ssh/, which never travels in an
+# export — so another project, or someone handed an archive, has no copy.
+#
+# <project>/ssh/authorized_keys is what gets bind-mounted read-only into the
+# container: the project key, plus any lines YOU put in
+# <project>/ssh/authorized_keys.extra (e.g. your own key for VS Code). Rewritten
+# IN PLACE on every run, so the running container's bind mount sees updates.
+ensure_project_ssh_key() {
+  local pdir="$1" sd key name
+  sd="$pdir/ssh"; key="$sd/id_ed25519"; name="$(basename "$pdir")"
+  mkdir -p "$sd"; chmod 700 "$sd"
+  if [ ! -f "$key" ]; then
+    if have ssh-keygen; then
+      ssh-keygen -q -t ed25519 -N '' -C "nixenv-$name" -f "$key" \
+        || die "could not generate $key"
+    else
+      # No host ssh-keygen: use the store's (openssh is in the base flake).
+      "$ENGINE" run --rm --user "$(id -u):$(id -g)" $(engine_userns) \
+        -v "$NIX_VOLUME":/nix:ro -v "$sd":/out "$(img "$RUNTIME_IMAGE")" \
+        "$PROFILE/bin/ssh-keygen" -q -t ed25519 -N '' -C "nixenv-$name" -f /out/id_ed25519 \
+        || die "could not generate $key (and no ssh-keygen on the host)"
+    fi
+    chmod 600 "$key"
+    ok "generated the project ssh key: $key"
+  fi
+  # (if/fi, not `[ -f ] && …`: inside a { } group a false test would make the
+  # whole group fail and skip writing the file.)
+  {
+    cat "$key.pub"
+    if [ -f "$sd/authorized_keys.extra" ]; then
+      grep -v '^[[:space:]]*#' "$sd/authorized_keys.extra" | grep -v '^[[:space:]]*$' || true
+    fi
+  } > "$sd/authorized_keys"
+  chmod 644 "$sd/authorized_keys"
+}
+
 write_host_ssh_config() {
   local name="$1" port pdir sd
   port="$(project_port "$name")"
   pdir="$(project_dir "$name")"; sd="$pdir/ssh"
   mkdir -p "$sd"
-  [ -f "$sd/config" ] && return 0
+  if [ -f "$sd/config" ]; then
+    # Written before key auth (SEC-02): add the IdentityFile lines after 'User',
+    # leaving any hand edits alone. Without them `ssh <project>` would offer the
+    # wrong keys and be refused.
+    if ! grep -q 'IdentityFile' "$sd/config"; then
+      awk -v k="$sd/id_ed25519" '
+        { print }
+        /^[[:space:]]*User[[:space:]]/ && !done {
+          print "    IdentityFile \"" k "\""; print "    IdentitiesOnly yes"; done=1 }
+      ' "$sd/config" > "$sd/config.tmp" && mv "$sd/config.tmp" "$sd/config"
+      ok "added the project key to $sd/config"
+    fi
+    return 0
+  fi
   cat > "$sd/config" <<EOF
 # nixenv: ssh config for project '$name' (auto-created when missing — edit freely).
 #   ssh $name         → attaches a persistent zmx session named '$name'
@@ -1360,6 +1410,8 @@ Host $name $name.*
     HostName 127.0.0.1
     Port $port
     User $APP_USER
+    IdentityFile "$sd/id_ed25519"
+    IdentitiesOnly yes
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     LogLevel ERROR
@@ -1726,7 +1778,7 @@ cmd_init() {
   echo "   home → /home/$APP_USER  (volume $(home_volume "$name"); seed: $pdir/home)"
   echo "   repo → $(project_app_mount "$name")             (volume $(app_volume "$name"))"
   echo "   db   → /databases       (volume $(db_volume "$name"))"
-  echo "   ssh  → host port $port  (connects as '$APP_USER', no key/password)"
+  echo "   ssh  → host port $port  (connects as '$APP_USER' with the key in $pdir/ssh/)"
   echo "   alias→ ssh $name        (after: $0 ssh-config --install)"
   if is_restricted "$name"; then
     echo "   egress→ RESTRICTED (default-deny; allowed: $(tr '\n' ' ' < "$pdir/allowed_hosts" 2>/dev/null))"
@@ -1930,6 +1982,7 @@ cmd_run() {
   # of colliding in one cwd-encoded folder shared by every project.
   mkdir -p "$CLAUDE_DIR/projects/nixenv-$name"
   write_passwd_files "$pdir"    # /etc/passwd|group|shadow giving our uid the name 'app'
+  ensure_project_ssh_key "$pdir" # the ONLY key sshd accepts (SEC-02); before the config
   write_host_ssh_config "$name" # <project>/ssh/config for `ssh <project>`
   write_extra_parameters "$name" # <project>/extra-parameters (empty scaffold)
 
@@ -1998,6 +2051,13 @@ cmd_run() {
 
   if container_running "$cname"; then
     ok "Project '$name' already running as '$cname'"
+    # A container created before key auth (SEC-02) still runs the old, open sshd
+    # — the fix only applies at creation. Say so, since nothing else would.
+    if ! "$ENGINE" inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$cname" 2>/dev/null \
+         | grep -q '/etc/nixenv/authorized_keys'; then
+      warn "'$name' was started before key-only ssh — it still accepts password-less logins"
+      echo "    apply it with: $0 stop $name && $0 run $name"
+    fi
   else
     container_exists "$cname" && "$ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
     log "Starting service '$cname' ($RUNTIME_IMAGE) as uid $(id -u) — sshd on 127.0.0.1:$port, volumes $appv → $appmnt, $homev → /home/$APP_USER"
@@ -2028,6 +2088,7 @@ cmd_run() {
       -v "$pdir/passwd":/etc/passwd:ro \
       -v "$pdir/group":/etc/group:ro \
       -v "$pdir/shadow":/etc/shadow:ro \
+      -v "$pdir/ssh/authorized_keys":/etc/nixenv/authorized_keys:ro \
       -v "$CLAUDE_DIR":/home/"$APP_USER"/.claude \
       -v "$CLAUDE_DIR/projects/nixenv-$name":/home/"$APP_USER"/.claude/projects \
       -v "$CLAUDE_JSON":/home/"$APP_USER"/.claude.json \
@@ -2056,7 +2117,7 @@ cmd_run() {
   else
     ensure_proxy_running   # bring the shared proxy up on first project start
   fi
-  echo "   ssh:    ssh -p $port $APP_USER@127.0.0.1   (or: $0 ssh $name)"
+  echo "   ssh:    $0 ssh $name   (or: ssh -p $port -i $pdir/ssh/id_ed25519 $APP_USER@127.0.0.1)"
   echo "   shell:  $0 shell $name   ($ENGINE exec, no key needed)"
   if [ "$restricted" = 1 ]; then
     echo "   egress: RESTRICTED — allowed: $(tr '\n' ' ' < "$pdir/allowed_hosts" 2>/dev/null || echo '(none)')"
@@ -2729,7 +2790,10 @@ cmd_ssh() {
   port="$(project_port "$name")"
   sleep 1   # give sshd a moment to come up on first start
   log "Connecting to '$name' on port $port"
-  exec ssh -p "$port" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+  local pdir; pdir="$(project_dir "$name")"
+  ensure_project_ssh_key "$pdir"
+  exec ssh -p "$port" -i "$pdir/ssh/id_ed25519" -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
     "$APP_USER@127.0.0.1"
 }
 
@@ -3625,9 +3689,10 @@ Per-project (runtime runs as non-root user '$APP_USER'):
                           init seeds the forge domain from the clone URL)
 
 SSH: each project gets a random host port (stored once in <project>/port). The
-container runs an unprivileged sshd (port 2222) via runit as '$APP_USER', open
-login (no key/password) on 127.0.0.1. Use 'ssh-config --install' + 'ssh <project>'
-for the zmx workflow.
+container runs an unprivileged sshd (port 2222) via runit as '$APP_USER', key-only:
+nixenv generates a per-project key in <project>/ssh/ and nothing else is accepted
+(add your own keys to <project>/ssh/authorized_keys.extra). Use 'ssh-config
+--install' + 'ssh <project>' for the zmx workflow.
 
 Environment overrides:
   CONTAINER_ENGINE=${CONTAINER_ENGINE:-auto}   (docker|podman; auto-detects, asks if both)

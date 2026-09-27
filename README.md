@@ -189,19 +189,33 @@ maps that host port to port **2222** inside the container.
 
 ```sh
 nixenv ssh myapp                       # convenience wrapper
-ssh -p <port> app@127.0.0.1                 # equivalent
+ssh -p <port> -i ~/.nixenv/projects/myapp/ssh/id_ed25519 app@127.0.0.1   # equivalent
 ```
 
-**Open local login.** For local-dev convenience there is no key and no password:
-the `app` account has an empty password (via the bind-mounted `/etc/shadow`) and
-sshd permits the empty-password ("none") method, so you connect with no prompt.
-The published port is bound to **`127.0.0.1` only**, so the container is
-reachable from your machine but not
-from the network. Root login is disabled.
+**Key-only login, with no setup.** The first `run` generates an ed25519 key for
+the project on your machine, in `~/.nixenv/projects/<name>/ssh/id_ed25519`, and
+wires it into both `nixenv ssh` and the generated `~/.ssh` config — so
+`ssh <project>`, zmx and VS Code Remote-SSH connect with no prompt, as before.
+The container's sshd accepts **only** that key: passwords are off, and the key
+list is a read-only file mounted from your machine, so nothing inside a
+container can authorise a key of its own.
 
-> This is intentionally insecure and meant for a trusted local machine. If you
-> later want key-only access, drop your public key into `home/.ssh/authorized_keys`
-> and ask to re-enable `AuthenticationMethods publickey`.
+That matters because sshd is reachable from more than your machine. Projects on
+the shared network can reach each other, and restricted projects can reach each
+other through the proxy's relays — with an open login, any project could get a
+shell in any other. The published port is still bound to **`127.0.0.1` only**,
+and root login is disabled.
+
+To use your own key as well (say, one already loaded in your agent), add it to
+`~/.nixenv/projects/<name>/ssh/authorized_keys.extra`, one per line. It's picked
+up on the next `run`, without a restart if the container is already up.
+
+The key never leaves your machine: it isn't part of an `export`, so an imported
+project gets a new one.
+
+> A container started before this change still runs the old password-less sshd.
+> `nixenv run <name>` warns about it; `nixenv stop <name> && nixenv run <name>`
+> applies the fix.
 
 ## Terminal sessions (zmx) via `ssh <project>`
 

@@ -66,8 +66,28 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   `--user $(id -u):$(id -g)` (+ `--userns=keep-id` for podman, via
   `engine_userns`) and `--hostname <project>`. The login user `app` comes from
   generated `passwd`/`group`/`shadow` files (`write_passwd_files`, in
-  `<project>/`) bind-mounted at `/etc/passwd|group|shadow`; `shadow` has an empty
-  password for the open SSH login. Code, home, and databases are **named
+  `<project>/`) bind-mounted at `/etc/passwd|group|shadow`; both accounts have
+  `*` (no usable password — NOT `!`, which OpenSSH treats as locked and would
+  refuse even pubkey logins). **SSH is key-only (SEC-02).** The container's sshd
+  listens on every interface, so it is reachable from other projects on
+  `nixenv_net` and — for restricted projects — through the proxy's relays, which
+  bind no specific interface. An open login therefore meant any project could get
+  a shell in any other. `ensure_project_ssh_key` generates
+  `<project>/ssh/id_ed25519` on the HOST (host `ssh-keygen`, falling back to the
+  store's), and writes `<project>/ssh/authorized_keys` = the project key + the
+  user's `authorized_keys.extra` — rewritten IN PLACE so a running container's
+  bind mount keeps the inode. `cmd_run` mounts it read-only at
+  `/etc/nixenv/authorized_keys`, which is sshd's ONLY `AuthorizedKeysFile`
+  (`AuthenticationMethods publickey`, passwords off); the entrypoint no longer
+  merges `~/.ssh/*.pub`, because a writable keys file inside the container let it
+  authorise itself. `write_host_ssh_config` adds `IdentityFile`/`IdentitiesOnly`
+  — for configs written before this it inserts them after `User` and keeps hand
+  edits — and `cmd_ssh` passes `-i`. The key must be generated BEFORE the ssh
+  config is written. It never travels in an export (`ssh` is not in
+  `EXPORT_META_FILES`). A container created before this still runs the old open
+  sshd; `cmd_run`'s already-running branch detects the missing mount and warns.
+  `25-ssh-key-auth.sh` covers the host side; `integration/15-ssh-keyauth.sh`
+  proves project A can't ssh into B. Code, home, and databases are **named
   volumes** `nixenv_<project>_app` → `/app`, `nixenv_<project>_home` →
   `/home/app`, `nixenv_<project>_databases` → `/databases`
   (`app_volume`/`home_volume`/`db_volume`). The app volume's container mount path
