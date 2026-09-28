@@ -1,0 +1,723 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nixenv — one Nix store, a room for every project</title>
+<meta name="description" content="nixenv spins up disposable, per-project dev containers that all share one pinned Nix toolchain. Docker or Podman, non-root, egress-restricted by default.">
+<meta property="og:title" content="nixenv — one Nix store, a room for every project">
+<meta property="og:description" content="Disposable per-project dev containers sharing one pinned Nix store. Single bash script, Docker or Podman.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='3' width='26' height='26' fill='none' stroke='%231d4ed8' stroke-width='3'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%231d4ed8'/%3E%3C/svg%3E">
+<style>
+/* ── Two sheets: drafting paper (light) and blueprint (dark) ─────────────── */
+:root {
+  --paper: #f4f1e8;
+  --paper-2: #ebe6d6;
+  --ink: #1b2a4a;
+  --ink-soft: #4a5873;
+  --line: #1d4ed8;
+  --line-soft: rgba(29, 78, 216, .16);
+  --grid: rgba(29, 78, 216, .07);
+  --accent: #d9480f;          /* the red pencil */
+  --ok: #2b8a3e;
+  --code-bg: #1b2a4a;
+  --code-ink: #e9eef9;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  color-scheme: light;
+}
+:root[data-sheet="blueprint"] {
+  --paper: #0f2f5c;
+  --paper-2: #0c2750;
+  --ink: #e6efff;
+  --ink-soft: #a9bfe3;
+  --line: #9cc3ff;
+  --line-soft: rgba(156, 195, 255, .22);
+  --grid: rgba(156, 195, 255, .09);
+  --accent: #ffb86b;
+  --ok: #8ce99a;
+  --code-bg: #081d3d;
+  --code-ink: #e6efff;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background-color: var(--paper);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 120px 120px, 120px 120px, 24px 24px, 24px 24px;
+  color: var(--ink);
+  font: 17px/1.6 var(--sans);
+  transition: background-color .5s, color .5s;
+}
+a { color: var(--line); text-underline-offset: 3px; }
+a:hover { color: var(--accent); }
+code, kbd, pre { font-family: var(--mono); font-size: .88em; }
+:not(pre) > code { background: var(--line-soft); padding: .1em .35em; border-radius: 3px; }
+
+.sheet { max-width: 1160px; margin: 0 auto; padding: 0 28px; }
+
+/* ── Title block (top bar, like a drawing's frame) ───────────────────────── */
+.frame {
+  position: sticky; top: 0; z-index: 10;
+  background: color-mix(in srgb, var(--paper) 88%, transparent);
+  backdrop-filter: blur(6px);
+  border-bottom: 1.5px solid var(--ink);
+}
+.frame .sheet { display: flex; align-items: stretch; gap: 0; }
+.frame .cell {
+  padding: 10px 16px; border-right: 1px solid var(--line-soft);
+  font: 11px/1.3 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-soft);
+}
+.frame .cell b { display: block; color: var(--ink); font-size: 13px; letter-spacing: .04em; }
+.frame .brand b { font-size: 16px; text-transform: none; letter-spacing: 0; }
+.frame nav { margin-left: auto; display: flex; align-items: center; gap: 4px; padding-left: 12px; }
+.frame nav a {
+  font: 12px var(--mono); text-decoration: none; color: var(--ink-soft);
+  padding: 6px 10px; border-radius: 4px;
+}
+.frame nav a:hover { color: var(--ink); background: var(--line-soft); }
+.toggle {
+  font: 11px var(--mono); text-transform: uppercase; letter-spacing: .08em;
+  background: none; border: 1px solid var(--ink); color: var(--ink);
+  padding: 6px 10px; border-radius: 999px; cursor: pointer; margin-left: 8px;
+}
+.toggle:hover { background: var(--ink); color: var(--paper); }
+@media (max-width: 820px) {
+  .frame .cell:not(.brand) { display: none; }
+  .frame nav a.hide-sm { display: none; }
+}
+
+/* ── Hero ────────────────────────────────────────────────────────────────── */
+.hero { display: grid; grid-template-columns: 1fr 1.08fr; gap: 48px; align-items: center; padding: 72px 0 48px; }
+@media (max-width: 960px) { .hero { grid-template-columns: 1fr; padding-top: 44px; } }
+.eyebrow {
+  font: 12px var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--accent);
+  display: inline-flex; align-items: center; gap: 10px;
+}
+.eyebrow::before { content: ""; width: 28px; height: 1.5px; background: currentColor; }
+h1 {
+  font: 400 clamp(40px, 6vw, 68px)/1.02 var(--serif);
+  letter-spacing: -.02em; margin: 18px 0 20px;
+}
+h1 em { font-style: italic; color: var(--line); }
+.lede { font-size: 19px; color: var(--ink-soft); max-width: 34em; margin: 0 0 28px; }
+.lede strong { color: var(--ink); font-weight: 600; }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px; text-decoration: none;
+  font: 600 14px var(--sans); padding: 12px 18px; border-radius: 6px;
+  border: 1.5px solid var(--ink); color: var(--ink);
+}
+.btn.solid { background: var(--ink); color: var(--paper); }
+.btn:hover { transform: translate(-2px, -2px); box-shadow: 3px 3px 0 var(--accent); color: inherit; }
+.btn.solid:hover { color: var(--paper); }
+.oneliner {
+  font: 14px var(--mono); padding: 12px 14px; border: 1.5px dashed var(--line);
+  border-radius: 6px; display: inline-flex; gap: 10px; align-items: center; background: var(--paper);
+}
+.oneliner span { color: var(--ink-soft); user-select: none; }
+
+/* ── The plan (hero diagram) ─────────────────────────────────────────────── */
+.plan { position: relative; }
+.plan svg { width: 100%; height: auto; display: block; overflow: visible; }
+.plan .caption {
+  font: 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-soft);
+  display: flex; justify-content: space-between; border-top: 1px solid var(--ink); padding-top: 8px; margin-top: 6px;
+}
+.s-ink { stroke: var(--ink); } .f-ink { fill: var(--ink); }
+.s-line { stroke: var(--line); } .f-line { fill: var(--line); }
+.s-acc { stroke: var(--accent); } .f-acc { fill: var(--accent); }
+.s-ok { stroke: var(--ok); } .f-ok { fill: var(--ok); }
+.f-paper { fill: var(--paper); }
+.f-soft { fill: var(--line-soft); }
+.t { font-family: var(--mono); font-size: 12px; fill: var(--ink); }
+.t-sm { font-family: var(--mono); font-size: 10px; fill: var(--ink-soft); letter-spacing: .06em; }
+.t-serif { font-family: var(--serif); font-size: 17px; fill: var(--ink); font-style: italic; }
+.flow { stroke-dasharray: 5 7; animation: flow 1.6s linear infinite; }
+.flow.slow { animation-duration: 3s; }
+@keyframes flow { to { stroke-dashoffset: -24; } }
+.room { cursor: pointer; transition: transform .25s; transform-box: fill-box; transform-origin: center; }
+.room:hover, .room.on { transform: translateY(-3px); }
+.room:hover rect.body, .room.on rect.body { fill: var(--line-soft); }
+.blocked { animation: blink 2.4s ease-in-out infinite; }
+@keyframes blink { 0%, 60%, 100% { opacity: 1; } 75% { opacity: .25; } }
+.note {
+  min-height: 3.2em; margin-top: 10px; font-size: 14.5px; color: var(--ink-soft);
+  border-left: 3px solid var(--accent); padding: 4px 0 4px 12px;
+}
+.note b { color: var(--ink); }
+
+/* ── Sections ────────────────────────────────────────────────────────────── */
+section { padding: 64px 0; border-top: 1.5px solid var(--ink); position: relative; }
+.sec-head { display: grid; grid-template-columns: 120px 1fr; gap: 24px; margin-bottom: 36px; }
+@media (max-width: 720px) { .sec-head { grid-template-columns: 1fr; gap: 6px; } }
+.sec-no {
+  font: 12px var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--accent); padding-top: 12px;
+}
+h2 { font: 400 clamp(30px, 4vw, 42px)/1.1 var(--serif); margin: 0 0 10px; letter-spacing: -.01em; }
+.sec-head p { margin: 0; color: var(--ink-soft); max-width: 42em; }
+
+/* How it works — numbered detail callouts */
+.steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; border: 1.5px solid var(--ink); }
+@media (max-width: 900px) { .steps { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 560px) { .steps { grid-template-columns: 1fr; } }
+.step { padding: 22px 20px 24px; border-right: 1px solid var(--line-soft); position: relative; background: var(--paper); }
+.step:last-child { border-right: 0; }
+@media (max-width: 900px) { .step { border-bottom: 1px solid var(--line-soft); } }
+.step .n {
+  width: 34px; height: 34px; border: 1.5px solid var(--ink); border-radius: 50%;
+  display: grid; place-items: center; font: 600 14px var(--mono); margin-bottom: 14px;
+}
+.step h3 { font: 600 16px var(--sans); margin: 0 0 6px; }
+.step p { margin: 0; font-size: 14.5px; color: var(--ink-soft); }
+
+/* Terminal */
+.term-wrap { display: grid; grid-template-columns: 1.25fr 1fr; gap: 36px; align-items: start; }
+@media (max-width: 900px) { .term-wrap { grid-template-columns: 1fr; } }
+.term {
+  background: var(--code-bg); color: var(--code-ink); border-radius: 8px;
+  box-shadow: 8px 8px 0 var(--line-soft); overflow: hidden; border: 1.5px solid var(--ink);
+}
+.term .bar {
+  display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+  border-bottom: 1px solid rgba(255,255,255,.1); font: 12px var(--mono); color: #9fb0d0;
+}
+.term .bar i { width: 10px; height: 10px; border-radius: 50%; background: #3b4f78; display: inline-block; }
+.term .bar button {
+  margin-left: auto; background: none; color: #cfe0ff; border: 1px solid #3b4f78;
+  font: 11px var(--mono); padding: 3px 8px; border-radius: 4px; cursor: pointer;
+}
+.term pre { margin: 0; padding: 18px 18px 22px; min-height: 360px; white-space: pre-wrap; line-height: 1.55; font-size: 13.5px; }
+.term .p { color: #7fb4ff; }
+.term .c { color: #8a9bbd; }
+.term .g { color: #8ce99a; }
+.term .y { color: #ffd479; }
+.term .cursor { display: inline-block; width: 8px; background: #cfe0ff; animation: cur 1s steps(1) infinite; }
+@keyframes cur { 50% { opacity: 0; } }
+.explain ol { margin: 0; padding: 0; list-style: none; counter-reset: e; }
+.explain li { counter-increment: e; padding: 12px 0 12px 44px; position: relative; border-bottom: 1px dashed var(--line-soft); cursor: pointer; }
+.explain li::before {
+  content: counter(e); position: absolute; left: 0; top: 12px; width: 28px; height: 28px; border-radius: 50%;
+  border: 1.5px solid var(--line); color: var(--line); display: grid; place-items: center; font: 600 12px var(--mono);
+}
+.explain li.on::before { background: var(--line); color: var(--paper); }
+.explain li b { font-family: var(--mono); font-size: 14px; }
+.explain li span { display: block; font-size: 14.5px; color: var(--ink-soft); }
+
+/* Features — a "room schedule" */
+.schedule { width: 100%; border-collapse: collapse; border: 1.5px solid var(--ink); background: var(--paper); }
+.schedule th, .schedule td { text-align: left; padding: 14px 16px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+.schedule th {
+  font: 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-soft);
+  border-bottom: 1.5px solid var(--ink); background: var(--paper-2);
+}
+.schedule td:first-child { font: 12px var(--mono); color: var(--accent); width: 64px; }
+.schedule td:nth-child(2) { font-weight: 600; width: 28%; }
+.schedule td:last-child { color: var(--ink-soft); font-size: 15px; }
+.schedule tr:hover td { background: var(--line-soft); }
+@media (max-width: 640px) {
+  .schedule td:first-child { display: none; }
+  .schedule td:nth-child(2) { width: 38%; }
+}
+
+/* Security — margin notes in red pencil */
+.notes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+@media (max-width: 900px) { .notes { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 600px) { .notes { grid-template-columns: 1fr; } }
+.pin {
+  border: 1.5px solid var(--ink); background: var(--paper); padding: 20px; position: relative;
+  box-shadow: 5px 5px 0 var(--line-soft);
+}
+.pin::after {
+  content: attr(data-tag); position: absolute; top: -11px; right: 14px; background: var(--paper);
+  border: 1.5px solid var(--accent); color: var(--accent); font: 10px var(--mono); letter-spacing: .1em;
+  text-transform: uppercase; padding: 2px 8px; border-radius: 999px;
+}
+.pin h3 { margin: 0 0 6px; font: 600 16px var(--sans); }
+.pin p { margin: 0; color: var(--ink-soft); font-size: 14.5px; }
+.honest {
+  margin-top: 28px; padding: 16px 20px; border: 1.5px dashed var(--accent); font-size: 15px; color: var(--ink-soft);
+}
+.honest b { color: var(--accent); font-family: var(--mono); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; margin-right: 8px; }
+
+/* Install */
+.tabs { display: flex; gap: 0; border: 1.5px solid var(--ink); border-bottom: 0; width: fit-content; }
+.tabs button {
+  font: 13px var(--mono); background: var(--paper); color: var(--ink-soft); border: 0; border-right: 1px solid var(--line-soft);
+  padding: 10px 16px; cursor: pointer;
+}
+.tabs button:last-child { border-right: 0; }
+.tabs button[aria-selected="true"] { background: var(--ink); color: var(--paper); }
+.panel { display: none; }
+.panel.on { display: block; }
+.codeblock { position: relative; background: var(--code-bg); color: var(--code-ink); border: 1.5px solid var(--ink); }
+.codeblock pre { margin: 0; padding: 18px 20px; overflow-x: auto; line-height: 1.6; }
+.codeblock .c { color: #8a9bbd; }
+.copy {
+  position: absolute; top: 10px; right: 10px; font: 11px var(--mono); background: transparent; color: #cfe0ff;
+  border: 1px solid #3b4f78; padding: 4px 9px; border-radius: 4px; cursor: pointer;
+}
+.copy:hover { background: #3b4f78; }
+.install-grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 36px; align-items: start; }
+@media (max-width: 900px) { .install-grid { grid-template-columns: 1fr; } }
+.req { list-style: none; margin: 0; padding: 0; }
+.req li { padding: 10px 0; border-bottom: 1px dashed var(--line-soft); display: flex; gap: 12px; }
+.req li::before { content: "✓"; color: var(--ok); font-weight: 700; }
+
+/* Footer */
+footer { border-top: 1.5px solid var(--ink); padding: 28px 0 60px; font: 12px var(--mono); color: var(--ink-soft); }
+footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: space-between; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+  html { scroll-behavior: auto; }
+}
+</style>
+</head>
+<body>
+
+<header class="frame">
+  <div class="sheet">
+    <div class="cell brand"><span>project</span><b>nixenv</b></div>
+    <div class="cell"><span>rev</span><b id="rev">0.1.0</b></div>
+    <div class="cell"><span>licence</span><b>GPL-3.0+</b></div>
+    <nav>
+      <a href="#how" class="hide-sm">How</a>
+      <a href="#try" class="hide-sm">Try</a>
+      <a href="#security" class="hide-sm">Security</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/rande/nixenv">GitHub ↗</a>
+      <button class="toggle" id="sheetToggle" aria-label="Switch between paper and blueprint">Blueprint</button>
+    </nav>
+  </div>
+</header>
+
+<main class="sheet">
+
+  <!-- ═══ Hero ═══════════════════════════════════════════════════════════ -->
+  <div class="hero">
+    <div>
+      <span class="eyebrow">Per-project dev containers</span>
+      <h1>One Nix store.<br>A <em>room</em> for every project.</h1>
+      <p class="lede">
+        nixenv downloads your whole toolchain <strong>once</strong>, into a single Nix store,
+        and gives each project a small, disposable container that mounts it
+        <strong>read-only</strong>. Containers start in seconds, every project runs the
+        same pinned tools, and none of them can see the others.
+      </p>
+      <div class="cta">
+        <a class="btn solid" href="#install">Install nixenv</a>
+        <a class="btn" href="https://github.com/rande/nixenv">Read the source</a>
+      </div>
+      <p style="margin-top:22px">
+        <span class="oneliner"><span>$</span> brew install rande/nixenv/nixenv</span>
+      </p>
+    </div>
+
+    <figure class="plan" style="margin:0">
+      <svg viewBox="0 0 560 500" role="img" aria-labelledby="planTitle">
+        <title id="planTitle">Plan: three example projects, each in its own container. A projects gateway brings HTTPS in to every project, an exit proxy is every project's only way out to the internet, and all projects mount one shared Nix store read-only.</title>
+        <defs>
+          <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="f-line"/>
+          </marker>
+          <marker id="arrO" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="f-ok"/>
+          </marker>
+          <marker id="arrA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="f-acc"/>
+          </marker>
+          <marker id="arrI" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="f-ink"/>
+          </marker>
+          <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+            <line x1="0" y1="0" x2="0" y2="6" class="s-line" stroke-width="1" opacity=".45"/>
+          </pattern>
+        </defs>
+
+        <!-- outer wall: your machine -->
+        <rect x="8" y="8" width="544" height="484" fill="none" class="s-ink" stroke-width="2"/>
+        <text x="20" y="26" class="t-sm">YOUR MACHINE · DOCKER OR PODMAN</text>
+
+        <!-- outside world, top -->
+        <g class="room" data-note="<b>Your browser</b> — opens <code>https://myapp-3000.nixenv.localhost</code> and lands on port 3000 inside <b>myapp</b>, with a trusted certificate. Every port of every project gets an address like this.">
+          <text x="40" y="54" class="t" style="fill:var(--line)">your browser</text>
+        </g>
+        <path d="M140,60 V76" fill="none" class="s-line flow" stroke-width="1.5" marker-end="url(#arr)"/>
+        <text x="330" y="54" class="t" style="fill:var(--ok)">internet</text>
+        <path d="M420,78 V60" fill="none" class="s-ok flow" stroke-width="1.5" marker-end="url(#arrO)"/>
+        <text x="428" y="68" class="t-sm">allowed hosts</text>
+        <g class="blocked">
+          <path d="M510,78 V62" class="s-acc" stroke-width="1.5"/>
+          <path d="M503,48 L517,62 M517,48 L503,62" class="s-acc" stroke-width="2"/>
+        </g>
+
+        <!-- projects gateway -->
+        <g class="room" data-note="<b>Projects gateway</b> — the way IN. It gives every port of every project an HTTPS address: <code>https://&lt;project&gt;-&lt;port&gt;.nixenv.localhost</code>. A restricted project can only reach its <b>own</b> addresses through it, never another project's.">
+          <rect class="body f-paper s-ink" x="30" y="78" width="220" height="58" stroke-width="1.5"/>
+          <text x="44" y="100" class="t" style="font-weight:600">Projects gateway</text>
+          <text x="44" y="120" class="t-sm">&lt;project&gt;-&lt;port&gt;.nixenv.localhost</text>
+        </g>
+
+        <!-- exit proxy -->
+        <g class="room" data-note="<b>Exit proxy</b> — the way OUT. Projects have <b>no direct route</b> to the internet: every outbound request goes through here, and only the hosts on that project's allowlist get through. A refused name is never even looked up.">
+          <rect class="body f-paper s-ink" x="310" y="78" width="220" height="58" stroke-width="1.5"/>
+          <text x="324" y="100" class="t" style="font-weight:600">Exit proxy</text>
+          <text x="324" y="120" class="t-sm">per-project allowlist · deny rest</text>
+        </g>
+
+        <!-- inbound: gateway → every project -->
+        <path d="M140,136 V162 M95,162 H435" fill="none" class="s-line" stroke-width="1.5"/>
+        <path d="M95,162 V190"  fill="none" class="s-line flow" stroke-width="1.5" marker-end="url(#arr)"/>
+        <path d="M265,162 V190" fill="none" class="s-line flow" stroke-width="1.5" marker-end="url(#arr)"/>
+        <path d="M435,162 V190" fill="none" class="s-line flow" stroke-width="1.5" marker-end="url(#arr)"/>
+
+        <!-- outbound: every project → exit proxy (bridges over the inbound bus) -->
+        <path d="M150,192 V150 M320,192 V150 M490,192 V150" fill="none" class="f-paper" style="stroke:var(--paper)" stroke-width="6"/>
+        <path d="M150,192 V150 M320,192 V150 M490,192 V150 M150,150 H490" fill="none" class="s-ok flow" stroke-width="1.5"/>
+        <path d="M420,150 V138" fill="none" class="s-ok" stroke-width="1.5" marker-end="url(#arrO)"/>
+
+        <!-- the projects -->
+        <rect x="24" y="178" width="512" height="124" fill="none" class="s-ink" stroke-width="1" stroke-dasharray="2 4"/>
+        <text x="36" y="296" class="t-sm">YOUR PROJECTS · ONE CONTAINER EACH · 3 EXAMPLES</text>
+
+        <g class="room" data-note="<b>myapp</b> — an <b>example project</b>. Every project you create is its own container, running as <b>your user</b> (never root), with its own code, home and database volumes.">
+          <rect class="body f-paper s-ink" x="40" y="192" width="140" height="86" stroke-width="1.5"/>
+          <text x="52" y="208" class="t-sm">PROJECT</text>
+          <text x="52" y="228" class="t" style="font-size:15px;font-weight:600">myapp</text>
+          <text x="52" y="248" class="t-sm">dev server :3000</text>
+          <text x="52" y="266" class="t-sm" style="fill:var(--ok)">● your uid · no root</text>
+        </g>
+        <g class="room" data-note="<b>api</b> — a second <b>example project</b>. Its repo's flake adds Node and Postgres to <b>this project only</b>; myapp and blog never see them, and it can't reach them directly.">
+          <rect class="body f-paper s-ink" x="210" y="192" width="140" height="86" stroke-width="1.5"/>
+          <text x="222" y="208" class="t-sm">PROJECT</text>
+          <text x="222" y="228" class="t" style="font-size:15px;font-weight:600">api</text>
+          <text x="222" y="248" class="t-sm">+ node · postgres</text>
+          <text x="222" y="266" class="t-sm" style="fill:var(--ok)">● own tools &amp; data</text>
+        </g>
+        <g class="room" data-note="<b>blog</b> — a third <b>example project</b>. Its flake adds PHP and MariaDB, run as services that start with the container and restart if they crash.">
+          <rect class="body f-paper s-ink" x="380" y="192" width="140" height="86" stroke-width="1.5"/>
+          <text x="392" y="208" class="t-sm">PROJECT</text>
+          <text x="392" y="228" class="t" style="font-size:15px;font-weight:600">blog</text>
+          <text x="392" y="248" class="t-sm">+ php · mariadb</text>
+          <text x="392" y="266" class="t-sm" style="fill:var(--ok)">● own tools &amp; data</text>
+        </g>
+
+        <!-- projects can't talk sideways -->
+        <g class="blocked">
+          <path d="M180,236 L210,236 M350,236 L380,236" class="s-acc" stroke-width="1.5" stroke-dasharray="3 4"/>
+          <path d="M189,229 L201,243 M201,229 L189,243 M359,229 L371,243 M371,229 L359,243" class="s-acc" stroke-width="2"/>
+        </g>
+
+        <!-- read-only mounts -->
+        <path d="M110,278 C110,340 190,340 202,378" fill="none" class="s-ink flow slow" stroke-width="1.2" marker-end="url(#arrI)" opacity=".7"/>
+        <path d="M280,278 V372" fill="none" class="s-ink flow slow" stroke-width="1.2" marker-end="url(#arrI)" opacity=".7"/>
+        <path d="M450,278 C450,340 370,340 358,378" fill="none" class="s-ink flow slow" stroke-width="1.2" marker-end="url(#arrI)" opacity=".7"/>
+        <text x="290" y="340" class="t-sm">read-only</text>
+
+        <!-- the store -->
+        <g class="room" data-note="<b>The shared Nix store</b> — one volume holding the base toolchain and every project's extra tools, pinned by flakes. Built once, then mounted <b>read-only</b> into every project, so nothing is downloaded twice.">
+          <rect x="184" y="392" width="192" height="56" class="f-paper"/>
+          <rect x="184" y="392" width="192" height="56" fill="url(#hatch)"/>
+          <path d="M184,392 V448 A96,16 0 0 0 376,448 V392" fill="none" class="s-ink" stroke-width="1.5"/>
+          <ellipse cx="280" cy="392" rx="96" ry="16" class="f-soft s-ink" stroke-width="1.5"/>
+          <text x="280" y="428" text-anchor="middle" class="t-serif">/nix</text>
+          <text x="280" y="446" text-anchor="middle" class="t-sm">SHARED STORE · READ-ONLY</text>
+        </g>
+
+        <!-- you, terminal -->
+        <g class="room" data-note="<b>Your terminal</b> — <code>ssh myapp</code> lands in a persistent session inside the project. Login uses a key generated for that project on your machine, and the container's identity is checked too.">
+          <circle cx="36" cy="476" r="4" class="f-acc"/>
+          <text x="46" y="480" class="t" style="fill:var(--accent)">your terminal · ssh myapp</text>
+        </g>
+        <path d="M40,468 C28,400 30,330 56,280" fill="none" class="s-acc flow" stroke-width="1.5" marker-end="url(#arrA)"/>
+
+        <!-- legend -->
+        <g transform="translate(400,462)">
+          <line x1="0" y1="0" x2="18" y2="0" class="s-line" stroke-width="2"/><text x="24" y="3" class="t-sm">in (https)</text>
+          <line x1="0" y1="14" x2="18" y2="14" class="s-ok" stroke-width="2"/><text x="24" y="17" class="t-sm">out (allowlisted)</text>
+        </g>
+      </svg>
+      <figcaption class="caption"><span>Fig. 1 — three example projects on one machine</span><span>hover any part</span></figcaption>
+      <div class="note" id="planNote" aria-live="polite">Hover (or tap) any part of the plan to read what it does.</div>
+    </figure>
+  </div>
+
+  <!-- ═══ How it works ═══════════════════════════════════════════════════ -->
+  <section id="how">
+    <div class="sec-head">
+      <div class="sec-no">§ 01</div>
+      <div>
+        <h2>How it works</h2>
+        <p>No images to rebuild, no host Nix install. Everything happens in containers, driven by one bash script that carries its own flake, entrypoint and dotfiles.</p>
+      </div>
+    </div>
+    <div class="steps">
+      <div class="step"><div class="n">1</div><h3>Build once</h3><p>A short-lived <code>nixos/nix</code> container realises the pinned flake into a named volume: shell, editor, git, Claude CLI, the projects gateway, the exit proxy and friends.</p></div>
+      <div class="step"><div class="n">2</div><h3>Mount everywhere</h3><p>Each project is a <code>debian:stable-slim</code> container with <code>/nix</code> mounted read-only. Nix binaries carry their own libraries, so the base image barely matters.</p></div>
+      <div class="step"><div class="n">3</div><h3>Add per project</h3><p>A <code>flake.nix</code> in your repo adds that project's runtimes and services into its own profile, layered ahead of the base — and shared paths aren't rebuilt.</p></div>
+      <div class="step"><div class="n">4</div><h3>Work inside</h3><p><code>ssh myapp</code> drops you into a persistent zmx session; your dev server is at <code>https://myapp-3000.nixenv.localhost</code> with a trusted cert.</p></div>
+    </div>
+  </section>
+
+  <!-- ═══ Try it ═════════════════════════════════════════════════════════ -->
+  <section id="try">
+    <div class="sec-head">
+      <div class="sec-no">§ 02</div>
+      <div>
+        <h2>Five commands, start to finish</h2>
+        <p>From nothing to a shell inside a project, with HTTPS routing and an egress allowlist already in place. Click a step to jump the replay.</p>
+      </div>
+    </div>
+    <div class="term-wrap">
+      <div class="term" aria-label="Terminal replay">
+        <div class="bar"><i></i><i></i><i></i><span>~/work — zsh</span><button id="replay">↻ replay</button></div>
+        <pre id="screen" aria-live="off"></pre>
+      </div>
+      <div class="explain">
+        <ol id="stepsList">
+          <li data-step="0"><b>nixenv build</b><span>Downloads the shared toolchain into the store volume. Slow once, then never again.</span></li>
+          <li data-step="1"><b>nixenv init myapp &lt;git-url&gt;</b><span>Clones into the project's own volume, asks for a git identity, and allows the forge in the egress list.</span></li>
+          <li data-step="2"><b>nixenv run myapp</b><span>Starts the container as your user, with sshd under runit and the shared HTTPS proxy.</span></li>
+          <li data-step="3"><b>nixenv allow myapp registry.npmjs.org</b><span>Opens one more host. Everything else stays denied — watch it with <code>nixenv egress myapp</code>.</span></li>
+          <li data-step="4"><b>ssh myapp</b><span>A persistent terminal session. Close the laptop, reconnect, and it's still there.</span></li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ Features ═══════════════════════════════════════════════════════ -->
+  <section id="features">
+    <div class="sec-head">
+      <div class="sec-no">§ 03</div>
+      <div>
+        <h2>Room schedule</h2>
+        <p>What every project gets, without configuring anything.</p>
+      </div>
+    </div>
+    <table class="schedule">
+      <thead><tr><th>Ref</th><th>Item</th><th>Specification</th></tr></thead>
+      <tbody>
+        <tr><td>R-01</td><td>One pinned toolchain</td><td>Built once from a flake, mounted read-only into every project. Update it in one place; every container sees it on the next start.</td></tr>
+        <tr><td>R-02</td><td>Per-project flakes</td><td>Node, PHP, Python, Go, databases — whatever the repo declares, in a profile of its own, ahead of the base on <code>PATH</code>.</td></tr>
+        <tr><td>R-03</td><td>Docker or Podman</td><td>Auto-detected. Everything runs as your uid; nothing in a project container is root.</td></tr>
+        <tr><td>R-04</td><td>SSH + persistent sessions</td><td><code>ssh myapp</code> and <code>ssh myapp.tests</code> attach named zmx sessions. VS Code Remote-SSH works from the same config.</td></tr>
+        <tr><td>R-05</td><td>HTTPS for every port</td><td><code>https://&lt;project&gt;-&lt;port&gt;.nixenv.localhost</code>, routed by the projects gateway, trusted via mkcert — reachable from inside containers too.</td></tr>
+        <tr><td>R-06</td><td>Egress allowlist by default</td><td>Projects reach only the hosts you allow. <code>nixenv egress</code> shows what was denied, so the list writes itself.</td></tr>
+        <tr><td>R-07</td><td>Services under runit</td><td>Declare <code>sv/&lt;name&gt;/run</code> in the repo or flake; databases and workers start with the container and restart if they die.</td></tr>
+        <tr><td>R-08</td><td>Export / import</td><td>Move a project between machines as one archive. Secrets stay out unless you ask, and imported settings are checked, not trusted.</td></tr>
+        <tr><td>R-09</td><td>Claude CLI built in</td><td>One login for all projects; settings, hooks and MCP servers stay per project.</td></tr>
+        <tr><td>R-10</td><td>A single file</td><td>The whole tool is one bash script (Bash 3.2 compatible), with its flake, entrypoint and dotfiles embedded.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ═══ Security ═══════════════════════════════════════════════════════ -->
+  <section id="security">
+    <div class="sec-head">
+      <div class="sec-no">§ 04</div>
+      <div>
+        <h2>Built for code you only half trust</h2>
+        <p>A project container runs cloned repos, their dependencies and their setup scripts. So each one is treated as a sandbox: it shouldn't reach your machine, another project, or the internet beyond what you allowed.</p>
+      </div>
+    </div>
+    <div class="notes">
+      <div class="pin" data-tag="network"><h3>Default-deny egress</h3><p>Restricted projects sit on an internal network with no route out. The only exit is an allowlist proxy, and a refused name is never resolved — so DNS can't be used to leak data.</p></div>
+      <div class="pin" data-tag="isolation"><h3>Projects can't reach each other</h3><p>A restricted project gets a 403 for another project's URLs unless that project opts in. The proxy's port relays aren't reachable from project networks.</p></div>
+      <div class="pin" data-tag="ssh"><h3>Key-only SSH, pinned host keys</h3><p>Each project has its own key, generated on your machine and mounted read-only. The container's host key is pinned, so a squatter on the port is refused.</p></div>
+      <div class="pin" data-tag="runtime"><h3>Hardened containers</h3><p>Non-root, all capabilities dropped, no privilege gain through setuid binaries, and a process limit so one runaway project can't take the rest down.</p></div>
+      <div class="pin" data-tag="supply chain"><h3>Pinned downloads</h3><p>The base build is pure: every fetch is hash-pinned. A swapped upstream file fails the build instead of reaching your containers.</p></div>
+      <div class="pin" data-tag="import"><h3>Imports are checked</h3><p>An archive from someone else can't turn on privileged flags, publish ports to your LAN, lift the egress restriction or smuggle symlinks — those need your say-so.</p></div>
+    </div>
+    <p class="honest"><b>Stated limits</b>Building a project's flake runs its code with write access to the shared store, every project can read the shared Claude login, and an allowlist can't police the hosts you allowed. These are documented in the README rather than glossed over.</p>
+  </section>
+
+  <!-- ═══ Install ════════════════════════════════════════════════════════ -->
+  <section id="install">
+    <div class="sec-head">
+      <div class="sec-no">§ 05</div>
+      <div>
+        <h2>Install</h2>
+        <p>Three ways, one script. Pick whichever suits the machine.</p>
+      </div>
+    </div>
+    <div class="install-grid">
+      <div>
+        <div class="tabs" role="tablist">
+          <button role="tab" aria-selected="true" data-tab="brew">Homebrew</button>
+          <button role="tab" aria-selected="false" data-tab="file">Single file</button>
+          <button role="tab" aria-selected="false" data-tab="clone">From a clone</button>
+        </div>
+        <div class="panel on" id="tab-brew"><div class="codeblock"><button class="copy" data-copy="c-brew">copy</button><pre id="c-brew">brew install rande/nixenv/nixenv
+brew install --cask docker     <span class="c"># or: brew install podman</span>
+brew install mkcert            <span class="c"># optional: trusted HTTPS</span>
+nixenv build</pre></div></div>
+        <div class="panel" id="tab-file"><div class="codeblock"><button class="copy" data-copy="c-file">copy</button><pre id="c-file">curl -fsSLO https://github.com/rande/nixenv/releases/latest/download/nixenv.sh
+chmod +x nixenv.sh
+./nixenv.sh --version
+./nixenv.sh build</pre></div></div>
+        <div class="panel" id="tab-clone"><div class="codeblock"><button class="copy" data-copy="c-clone">copy</button><pre id="c-clone">git clone https://github.com/rande/nixenv && cd nixenv
+./nixenv.sh install            <span class="c"># → /usr/local/bin/nixenv</span>
+nixenv build</pre></div></div>
+      </div>
+      <div>
+        <ul class="req">
+          <li><span><b>Docker or Podman</b> — either works, auto-detected.</span></li>
+          <li><span><b>Bash</b> — the one macOS ships is fine.</span></li>
+          <li><span><b>No Nix on the host</b> — all Nix work happens in containers.</span></li>
+          <li><span><b>mkcert</b> (optional) — for browser-trusted HTTPS.</span></li>
+        </ul>
+        <p style="color:var(--ink-soft);font-size:15px;margin-top:18px">Full documentation — commands, networking, export/import — lives in the <a href="https://github.com/rande/nixenv#readme">README</a>.</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="sheet">
+    <span>nixenv · GPL-3.0-or-later · a single bash script</span>
+    <span><a href="https://github.com/rande/nixenv">github.com/rande/nixenv</a> · <a href="https://github.com/rande/nixenv/releases">releases</a></span>
+    <span>Drawn to no particular scale.</span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+  var root = document.documentElement;
+
+  /* ── Paper / blueprint ─────────────────────────────────────────────── */
+  var toggle = document.getElementById("sheetToggle");
+  function setSheet(s) {
+    if (s === "blueprint") root.setAttribute("data-sheet", "blueprint");
+    else root.removeAttribute("data-sheet");
+    toggle.textContent = s === "blueprint" ? "Paper" : "Blueprint";
+  }
+  var dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  setSheet(dark ? "blueprint" : "paper");
+  toggle.addEventListener("click", function () {
+    setSheet(root.getAttribute("data-sheet") === "blueprint" ? "paper" : "blueprint");
+  });
+
+  /* ── Plan annotations ──────────────────────────────────────────────── */
+  var note = document.getElementById("planNote");
+  var rooms = document.querySelectorAll(".plan .room");
+  var defaultNote = note.innerHTML;
+  rooms.forEach(function (r) {
+    function show() {
+      rooms.forEach(function (o) { o.classList.remove("on"); });
+      r.classList.add("on");
+      note.innerHTML = r.getAttribute("data-note");
+    }
+    r.addEventListener("mouseenter", show);
+    r.addEventListener("click", show);
+    r.addEventListener("mouseleave", function () { r.classList.remove("on"); });
+  });
+  document.querySelector(".plan svg").addEventListener("mouseleave", function () { note.innerHTML = defaultNote; });
+
+  /* ── Terminal replay ───────────────────────────────────────────────── */
+  var esc = function (s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); };
+  var script = [
+    { cmd: "nixenv build", out: [
+      ["c", "==> Building flake deps into volume 'nixenv__nixos_store' (slow the first time)"],
+      ["", "--- nix profile install into shared profile ---"],
+      ["g", "✓ Dependencies downloaded into volume 'nixenv__nixos_store'"] ] },
+    { cmd: "nixenv init myapp git@github.com:me/myapp.git", out: [
+      ["", "Git name for this project: Ada Lovelace"],
+      ["g", "✓ allowed host: github.com"],
+      ["g", "✓ Cloned into volume nixenv_myapp_app"] ] },
+    { cmd: "nixenv run myapp", out: [
+      ["c", "==> Starting the egress proxy first (restricted project needs it to reach the network)"],
+      ["g", "✓ Started 'nixenv-myapp'"],
+      ["", "   ssh:    nixenv ssh myapp"],
+      ["", "   egress: RESTRICTED — allowed: github.com"],
+      ["", "   proxy:  https://myapp-<port>.nixenv.localhost/"] ] },
+    { cmd: "nixenv allow myapp registry.npmjs.org", out: [
+      ["g", "✓ allowed host: registry.npmjs.org"],
+      ["c", "==> egress allowlist reloaded (no proxy restart)"] ] },
+    { cmd: "ssh myapp", out: [
+      ["y", "[myapp] app@myapp /app $ npm run dev -- --host 0.0.0.0"],
+      ["", "  ➜  Local:   http://localhost:3000/"],
+      ["g", "  ➜  Public:  https://myapp-3000.nixenv.localhost/"] ] }
+  ];
+  var screen = document.getElementById("screen");
+  var items = document.querySelectorAll("#stepsList li");
+  var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var timer = null, html = "", run = 0;
+
+  function mark(i) { items.forEach(function (li, k) { li.classList.toggle("on", k === i); }); }
+  function render(extra) { screen.innerHTML = html + (extra || "") + '<span class="cursor">&nbsp;</span>'; }
+  function lineFor(o) { return (o[0] ? '<span class="' + o[0] + '">' : "") + esc(o[1]) + (o[0] ? "</span>" : "") + "\n"; }
+
+  function play(from) {
+    clearTimeout(timer); run++; var me = run;
+    html = "";
+    for (var k = 0; k < from; k++) {           // steps before the chosen one appear instantly
+      html += '<span class="p">❯</span> ' + esc(script[k].cmd) + "\n";
+      script[k].out.forEach(function (o) { html += lineFor(o); });
+      html += "\n";
+    }
+    step(from, me);
+  }
+  function step(i, me) {
+    if (me !== run) return;
+    if (i >= script.length) { mark(-1); render(); return; }
+    mark(i);
+    var cmd = script[i].cmd, c = 0;
+    if (reduce) { c = cmd.length; }
+    (function type() {
+      if (me !== run) return;
+      if (c <= cmd.length) {
+        render('<span class="p">❯</span> ' + esc(cmd.slice(0, c)));
+        c++; timer = setTimeout(type, 34 + Math.random() * 40); return;
+      }
+      html += '<span class="p">❯</span> ' + esc(cmd) + "\n";
+      var o = 0;
+      (function out() {
+        if (me !== run) return;
+        if (o < script[i].out.length) { html += lineFor(script[i].out[o++]); render(); timer = setTimeout(out, reduce ? 0 : 260); return; }
+        html += "\n"; timer = setTimeout(function () { step(i + 1, me); }, reduce ? 0 : 900);
+      })();
+    })();
+  }
+  document.getElementById("replay").addEventListener("click", function () { play(0); });
+  items.forEach(function (li) { li.addEventListener("click", function () { play(+li.getAttribute("data-step")); }); });
+
+  // Start the replay when the terminal scrolls into view (once).
+  var started = false;
+  if ("IntersectionObserver" in window) {
+    new IntersectionObserver(function (es, ob) {
+      if (es[0].isIntersecting && !started) { started = true; play(0); ob.disconnect(); }
+    }, { threshold: .35 }).observe(screen);
+  } else { play(0); }
+  render();
+
+  /* ── Install tabs ──────────────────────────────────────────────────── */
+  document.querySelectorAll(".tabs button").forEach(function (b) {
+    b.addEventListener("click", function () {
+      document.querySelectorAll(".tabs button").forEach(function (o) { o.setAttribute("aria-selected", o === b); });
+      document.querySelectorAll(".panel").forEach(function (p) { p.classList.toggle("on", p.id === "tab-" + b.getAttribute("data-tab")); });
+    });
+  });
+
+  /* ── Copy buttons ──────────────────────────────────────────────────── */
+  document.querySelectorAll(".copy").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var text = document.getElementById(b.getAttribute("data-copy")).innerText
+        .split("\n").map(function (l) { return l.replace(/\s+#.*$/, ""); }).join("\n").trim();
+      var done = function () { b.textContent = "copied"; setTimeout(function () { b.textContent = "copy"; }, 1400); };
+      if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, done); else done();
+    });
+  });
+})();
+</script>
+</body>
+</html>
