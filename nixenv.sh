@@ -56,6 +56,8 @@ CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.nixenv/claude}"     # shared Claude CLI creds/c
 CLAUDE_JSON="${CLAUDE_JSON:-$HOME/.nixenv/claude.json}" # shared Claude global config file (~/.claude.json)
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-}"             # docker|podman; empty = auto-detect
 ENGINE_FILE="$HOME/.nixenv/engine"                   # remembered engine choice
+GITHUB_TOKEN_FILE="${GITHUB_TOKEN_FILE:-$HOME/.nixenv/github_token}"  # optional, raises GitHub's API limit
+GITHUB_TOKEN_SKIP="${GITHUB_TOKEN_SKIP:-$HOME/.nixenv/github_token.skip}" # "don't ask again" marker
 ENGINE=""                                            # resolved at runtime
 
 # --- Reverse proxy (nixenv proxy) --------------------------------------------
@@ -1069,13 +1071,138 @@ builder_priv() {
   [ "$BUILDER_PRIVILEGED" = 1 ] && printf '%s' "--privileged"
 }
 
-# NIX_CONFIG for builder containers. Honours GITHUB_TOKEN: resolving un-locked
-# `github:` flake inputs hits api.github.com, which rate-limits anonymous IPs
-# (CI/docker-in-docker environments hit this quickly).
+# ── GitHub token (optional) ──────────────────────────────────────────────────
+# Resolving `github:` flake inputs (nixpkgs) goes through api.github.com, which
+# allows 60 anonymous requests per hour PER IP ADDRESS. Behind a shared IP — an
+# office network, a VPN, CI — everyone shares those 60, and `build`/`update`
+# fail with "API rate limit exceeded". A token lifts it to 5,000/hour.
+# Source order: $GITHUB_TOKEN, then $GITHUB_TOKEN_FILE. It is given ONLY to
+# builds of nixenv's own flake, never to a project's (untrusted) flake.
+GITHUB_TOKEN_URL="https://github.com/settings/personal-access-tokens/new?name=nixenv&description=Read-only%20access%20to%20public%20repositories%2C%20so%20Nix%20can%20resolve%20nixpkgs%20without%20hitting%20GitHub%27s%20anonymous%20API%20rate%20limit.&expires_in=366"
+
+github_token() {
+  if [ -n "${GITHUB_TOKEN:-}" ]; then printf '%s' "$GITHUB_TOKEN"; return 0; fi
+  [ -f "$GITHUB_TOKEN_FILE" ] && tr -d '[:space:]' < "$GITHUB_TOKEN_FILE"
+  return 0
+}
+
+# A token goes into NIX_CONFIG, so only accept the characters GitHub uses —
+# anything else (a stray newline, a pasted command) could inject nix settings.
+valid_github_token() {
+  case "$1" in
+    ""|*[!A-Za-z0-9_]*) return 1;;
+    ghp_*|github_pat_*|gho_*|ghu_*|ghs_*) return 0;;
+  esac
+  return 1
+}
+
+save_github_token() {
+  mkdir -p "$(dirname "$GITHUB_TOKEN_FILE")"
+  ( umask 077; printf '%s\n' "$1" > "$GITHUB_TOKEN_FILE" )
+  chmod 600 "$GITHUB_TOKEN_FILE" 2>/dev/null || true
+  rm -f "$GITHUB_TOKEN_SKIP"
+  ok "GitHub token saved to $GITHUB_TOKEN_FILE (mode 600)"
+}
+
+github_rate_limit_note() {
+  warn "Nix looks up nixpkgs through GitHub's API, which allows only 60 anonymous"
+  warn "requests per hour per IP address. On a shared IP (office network, VPN, CI)"
+  warn "everyone shares those 60, so 'build' and 'update' can fail with"
+  warn "\"API rate limit exceeded\". A GitHub token raises the limit to 5,000/hour."
+  echo "    Optional — create one (public repositories, read-only, nothing else):"
+  echo "      $GITHUB_TOKEN_URL"
+  echo "    It is stored in $GITHUB_TOKEN_FILE and only used for nixenv's own"
+  echo "    toolchain, never for a project's flake."
+}
+
+# Ask ONCE, on the first build/update without a token. Enter skips and is
+# remembered; `github-token` sets or changes it later. Never prompts without a TTY.
+ensure_github_token() {
+  [ -n "$(github_token)" ] && return 0
+  [ -f "$GITHUB_TOKEN_SKIP" ] && return 0
+  echo
+  github_rate_limit_note
+  if [ ! -t 0 ]; then
+    echo "    (no terminal — continuing without a token; set GITHUB_TOKEN or run '$0 github-token')"
+    echo
+    return 0
+  fi
+  local tok=""
+  printf '    Paste a token, or press Enter to continue without one: '
+  read -rs tok || true
+  echo
+  tok="$(printf '%s' "$tok" | tr -d '[:space:]')"
+  if [ -z "$tok" ]; then
+    mkdir -p "$(dirname "$GITHUB_TOKEN_SKIP")"; : > "$GITHUB_TOKEN_SKIP"
+    log "continuing without a token (won't ask again — add one any time: $0 github-token)"
+  elif valid_github_token "$tok"; then
+    save_github_token "$tok"
+  else
+    warn "that doesn't look like a GitHub token (expected ghp_… or github_pat_…) — not saved"
+  fi
+  echo
+}
+
+# github-token [--clear|--status] — set, replace, remove or inspect the token.
+cmd_github_token() {
+  case "${1:-}" in
+    --clear|clear)
+      rm -f "$GITHUB_TOKEN_FILE"; ok "removed $GITHUB_TOKEN_FILE" ;;
+    --status|status)
+      if [ -n "${GITHUB_TOKEN:-}" ]; then ok "using \$GITHUB_TOKEN from the environment"
+      elif [ -s "$GITHUB_TOKEN_FILE" ]; then ok "token stored in $GITHUB_TOKEN_FILE"
+      else warn "no GitHub token — builds use GitHub's anonymous limit (60 requests/hour per IP)"; fi ;;
+    "")
+      rm -f "$GITHUB_TOKEN_SKIP"
+      github_rate_limit_note
+      [ -t 0 ] || die "needs a terminal — or put the token in $GITHUB_TOKEN_FILE yourself"
+      local tok=""
+      printf '    Paste the token: '
+      read -rs tok || true; echo
+      tok="$(printf '%s' "$tok" | tr -d '[:space:]')"
+      valid_github_token "$tok" || die "that doesn't look like a GitHub token (expected ghp_… or github_pat_…)"
+      save_github_token "$tok" ;;
+    *) die "usage: $0 github-token [--clear|--status]" ;;
+  esac
+}
+
+# Run a builder command, echoing its output, and explain a GitHub rate limit or
+# a rejected token if that's what made it fail. $1 = base|project.
+run_builder() {
+  local kind="$1" log rc=0; shift
+  log="$(mktemp)"
+  if "$@" 2>&1 | tee "$log"; then rc=0; else rc=$?; fi
+  if [ "$rc" != 0 ]; then
+    if grep -q 'rate limit exceeded' "$log" 2>/dev/null; then
+      echo
+      if [ "$kind" = project ]; then
+        warn "GitHub's API rate limit was hit while resolving this PROJECT's flake inputs."
+        warn "Project builds never get your token (a project's flake is untrusted), so:"
+        echo "    wait for the limit to reset (up to an hour), or lock the inputs once in"
+        echo "    the repo ('nix flake lock') so a build doesn't need to look them up."
+      elif [ -n "$(github_token)" ]; then
+        warn "GitHub's API rate limit was hit even with a token — wait a little and retry."
+      else
+        github_rate_limit_note
+        echo "    Then:  $0 github-token   (or: GITHUB_TOKEN=\$(gh auth token) $0 …)"
+      fi
+    elif grep -qE 'Bad credentials|HTTP error 401' "$log" 2>/dev/null && [ -n "$(github_token)" ]; then
+      echo
+      warn "GitHub rejected the stored token — it has probably expired or been revoked."
+      echo "    Replace it:  $0 github-token      Remove it:  $0 github-token --clear"
+    fi
+  fi
+  rm -f "$log"
+  return "$rc"
+}
+
+# NIX_CONFIG for builder containers. Carries the optional GitHub token (see
+# github_token) so `github:` inputs don't hit the anonymous API limit.
 nix_config() {
   printf 'experimental-features = nix-command flakes\nmax-jobs = auto'
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    printf '\naccess-tokens = github.com=%s' "$GITHUB_TOKEN"
+  local tok; tok="$(github_token)"
+  if [ -n "$tok" ] && valid_github_token "$tok"; then
+    printf '\naccess-tokens = github.com=%s' "$tok"
   fi
 }
 
@@ -1987,8 +2114,9 @@ cmd_build() {
   # Mount:
   #   - the volume at /nix          → the shared store gets populated here
   #   - the flake dir at /flake (rw) → so nix can write/refresh flake.lock
+  ensure_github_token
   "$ENGINE" rm -f "${CONTAINER_PREFIX}__build" >/dev/null 2>&1 || true
-  "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__build" \
+  run_builder base "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__build" \
     $(builder_priv) \
     -v "$NIX_VOLUME":/nix \
     -v "$FLAKE_DIR":/flake \
@@ -2010,7 +2138,7 @@ cmd_build() {
       nix store optimise || true
       echo "--- installed profile contents ---"
       ls -1 "'"$PROFILE"'/bin" | head -n 40
-    '
+    ' || die "building the shared toolchain failed"
 
   ok "Dependencies downloaded into volume '$NIX_VOLUME'"
   log "Profile available inside the store at: $PROFILE"
@@ -2095,7 +2223,7 @@ cmd_build_project() {
     : > "$pdir/.flake-trust-noted" 2>/dev/null || true
   fi
   "$ENGINE" rm -f "${CONTAINER_PREFIX}__build-$name" >/dev/null 2>&1 || true
-  "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__build-$name" \
+  run_builder project "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__build-$name" \
     -v "$NIX_VOLUME":/nix \
     -v "$fdir":/flake \
     -w /flake \
@@ -2112,7 +2240,7 @@ cmd_build_project() {
       nix store optimise || true
       echo "--- project tooling on PATH ---"
       ls -1 "'"$prof"'/bin" 2>/dev/null | head -n 40 || true
-    '
+    ' || die "building '$name''s flake failed"
 
   ok "Project '$name' extra tooling built → $prof"
   log "It loads ahead of the base toolchain on the next 'run'/'ssh'/'shell' of '$name'"
@@ -3856,11 +3984,13 @@ cmd_update() {
   require_engine
   [ -f "$FLAKE_DIR/flake.nix" ] || die "no flake.nix in $FLAKE_DIR"
   log "Updating flake.lock in $FLAKE_DIR"
+  ensure_github_token
   "$ENGINE" rm -f "${CONTAINER_PREFIX}__update" >/dev/null 2>&1 || true
-  "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__update" \
+  run_builder base "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__update" \
     -v "$FLAKE_DIR":/flake -w /flake \
     -e NIX_CONFIG="$(nix_config)" \
-    "$(img "$BUILDER_IMAGE")" nix flake update
+    "$(img "$BUILDER_IMAGE")" nix flake update \
+    || die "updating the shared toolchain's flake.lock failed"
   cmd_build
 }
 
@@ -4152,6 +4282,11 @@ Commands:
                             keeps plugins/history/creds
   projects                  List projects with their SSH port and state
   update                    Refresh flake.lock, then rebuild into the volume
+  github-token [--clear|--status]
+                            Store a GitHub token (asked once on the first build).
+                            Optional: lifts GitHub's anonymous API limit of 60
+                            requests/hour per IP — often hit behind a shared
+                            office/VPN address. Stored in ~/.nixenv/github_token
   status                    Show context + volume + shared-profile state
   gc [--dry-run]            Garbage-collect the store: delete old generations and
                             every path no live profile needs — reclaims the space
@@ -4260,6 +4395,7 @@ main() {
     import)   cmd_import "$@";;
     projects) cmd_projects "$@";;
     update)   cmd_update "$@";;
+    github-token) cmd_github_token "$@";;
     status)   cmd_status "$@";;
     gc)       cmd_gc "$@";;
     clean)    cmd_clean "$@";;

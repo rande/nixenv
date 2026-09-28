@@ -412,6 +412,21 @@ the forge host, no file = old behaviour), and denies to
   default; wrapped in a subshell so a `cmd_proxy` `die` can't fail `run`; no-op when
   already running).
 
+- **GitHub token (optional).** `github:` flake inputs resolve through
+  api.github.com: 60 anonymous requests/hour PER IP, which a shared office/VPN
+  address exhausts fast. `github_token` reads `$GITHUB_TOKEN`, then
+  `$GITHUB_TOKEN_FILE` (`~/.nixenv/github_token`, 600); `nix_config` adds it as
+  `access-tokens` only if `valid_github_token` (charset + `ghp_`/`github_pat_`…
+  prefix — it lands in NIX_CONFIG, so no newlines). `ensure_github_token` runs at
+  the start of base `build`/`update`: explains the limit, prints
+  `GITHUB_TOKEN_URL` (a pre-filled fine-grained token page with NO permission
+  params = public repos read-only), and prompts once; Enter writes
+  `$GITHUB_TOKEN_SKIP`; no TTY = explain but never prompt and never write the
+  skip marker. `github-token [--clear|--status]` manages it. `run_builder
+  base|project <cmd…>` tees builder output and, on failure, explains "rate limit
+  exceeded" (project builds: they never get the token, by design) or a 401 from
+  an expired token. `33-github-token.sh`.
+
 ## Commands
 
 **When working IN this repo, always invoke the tool as `./nixenv.sh <command>` —

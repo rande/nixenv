@@ -174,3 +174,24 @@ Rough guidance, given users pin nothing and `brew upgrade` is the norm:
 
 Bumping the pinned nixpkgs in the base flake deserves at least a minor, since it
 rebuilds every user's shared store.
+
+## Bumping a pinned binary (zmx)
+
+The base flake installs zmx as a prebuilt tarball pinned by sha256, so
+the base build stays pure and a replaced upstream file fails the build. To
+upgrade, change `zmxVersion` **and** both entries of `zmxHashes` in the
+`NIXENV_FLAKE` heredoc of `nixenv.sh`:
+
+```sh
+v=0.8.1
+for a in x86_64 aarch64; do
+  curl -fsSL "https://zmx.sh/a/zmx-$v-linux-$a.tar.gz.sha256"   # upstream's published hash
+  curl -fsSL "https://github.com/neurosnap/zmx/releases/download/v$v/zmx-$v-linux-$a.tar.gz" \
+    | shasum -a 256                                             # what you actually download
+done
+```
+
+The two must agree (they're also shown as `sha256:` digests on the GitHub
+release page). Then update the hashes in `tests/unit/26-pinned-fetches.sh`,
+run `./nixenv.sh build`, and release as a **minor** — every user's store
+rebuilds the zmx path.

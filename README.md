@@ -46,6 +46,30 @@ the answer in `~/.nixenv/engine`. Override anytime with
 `CONTAINER_ENGINE=docker|podman`, or delete that file to be asked again. For
 Podman, image names are automatically qualified with `docker.io/`.
 
+### GitHub token (optional, recommended on shared networks)
+
+Nix looks up nixpkgs through GitHub's API, which allows only **60 anonymous
+requests per hour per IP address**. On a shared address (an office network, a
+VPN, CI) everyone behind it shares those 60, so `nixenv build` or `update` can
+fail with `API rate limit exceeded`. A token raises the limit to 5,000/hour.
+
+The first `build` or `update` without one explains this and asks for a token —
+press Enter to skip, and it won't ask again. The link it prints opens GitHub's
+token page already filled in: a fine-grained token named `nixenv` with **no
+permissions**, which means read-only access to public repositories, all Nix
+needs. Manage it any time:
+
+```sh
+nixenv github-token            # set or replace it
+nixenv github-token --status
+nixenv github-token --clear
+GITHUB_TOKEN=$(gh auth token) nixenv update   # or pass one for a single run
+```
+
+It's stored in `~/.nixenv/github_token` (mode 600) and only given to nixenv's
+own toolchain builds — never to a project's flake. If a build does hit the limit,
+or the token has expired, nixenv says so under the error.
+
 ## Install
 
 Three ways, all of which put `nixenv` on your `PATH`. Pick one.
