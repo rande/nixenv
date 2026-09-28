@@ -620,8 +620,10 @@ publishing notes) and ships via a personal tap
 (`rande/homebrew-nixenv` → `brew install rande/nixenv/nixenv`), not homebrew-core.
 The formula has NO dependencies — that is load-bearing on the Bash 3.2 rule, so
 `21-homebrew-formula.sh` fails if anyone adds `depends_on "bash"` without also
-changing the shebang. It also asserts the formula's `url` tag equals
-`NIXENV_VERSION`, since a drifted formula only breaks on users' machines.
+changing the shebang. It also asserts the formula's `url` tag is NOT AHEAD of
+`NIXENV_VERSION` — it may lag, because on the release commit (what `verify`
+tests) the formula still names the previous tag until the `formula` job moves
+it; requiring equality blocked every release.
 `update-formula.sh <version>` rewrites `url`+`sha256` together from the real
 GitHub tarball and refuses when the script's version, the requested version, or
 the version *inside* the downloaded tarball disagree. Release order is fixed:

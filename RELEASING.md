@@ -11,7 +11,7 @@ sed -i '' 's/^NIXENV_VERSION=.*/NIXENV_VERSION="0.2.0"/' nixenv.sh
 ./tests/run.sh
 
 # 3. commit, then tag
-git commit -am "release 0.2.0"
+git commit -m "release 0.2.0"
 git tag -a v0.2.0 -m "nixenv 0.2.0"
 git push && git push --tags
 ```

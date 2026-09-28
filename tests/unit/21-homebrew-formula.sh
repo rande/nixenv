@@ -13,7 +13,30 @@ url="$(sed -n 's/^  url "\(.*\)"$/\1/p' "$f")"
 [ -n "$url" ] || fail "formula has no url"
 tag="$(printf '%s' "$url" | sed -n 's|.*/tags/v\([0-9][0-9.]*\)\.tar\.gz$|\1|p')"
 [ -n "$tag" ] || fail "url does not point at a vX.Y.Z tag tarball: $url"
-assert_eq "$tag" "$NIXENV_VERSION" "formula url tag matches NIXENV_VERSION"
+# The formula may LAG the script, but never lead it. Release order is: bump
+# NIXENV_VERSION → commit → tag → update-formula.sh (the sha256 only exists once
+# the tag does), so on the release commit itself — which is what the release
+# workflow's `verify` job tests — the formula still points at the previous
+# release. The `formula` job then moves it forward. Requiring equality here made
+# every release fail its own verify step.
+# Compare X.Y.Z numerically (Bash 3.2: no `sort -V` guarantee on macOS).
+ver_gt() {  # ver_gt A B → true when A > B
+  local IFS=. a b i
+  a=($1); b=($2)
+  for i in 0 1 2; do
+    [ "${a[$i]:-0}" -gt "${b[$i]:-0}" ] && return 0
+    [ "${a[$i]:-0}" -lt "${b[$i]:-0}" ] && return 1
+  done
+  return 1
+}
+if ver_gt "$tag" "$NIXENV_VERSION"; then
+  fail "formula points at v$tag, AHEAD of NIXENV_VERSION=$NIXENV_VERSION — the script was downgraded or the formula edited by hand"
+fi
+# self-check of the comparison
+ver_gt 0.2.0 0.1.0   || fail "ver_gt: 0.2.0 > 0.1.0"
+ver_gt 0.10.0 0.9.0  || fail "ver_gt: numeric, not lexical"
+ver_gt 0.1.0 0.1.0   && fail "ver_gt: equal is not greater"
+ver_gt 0.1.0 0.2.0   && fail "ver_gt: 0.1.0 < 0.2.0"
 
 # --- sha256 must at least be well-formed (update-formula.sh fills the real one)
 sha="$(sed -n 's/^  sha256 "\(.*\)"$/\1/p' "$f")"
