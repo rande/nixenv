@@ -25,6 +25,9 @@ export NIXENV_PROJECTS_DIR="$NIXTEST_HOME/projects"
 export PROXY_DIR="$NIXTEST_HOME/proxy"
 export CLAUDE_DIR="$NIXTEST_HOME/claude"
 export CLAUDE_JSON="$NIXTEST_HOME/claude.json"
+export GITHUB_TOKEN_FILE="$NIXTEST_HOME/github_token"
+export GITHUB_TOKEN_SKIP="$NIXTEST_HOME/github_token.skip"
+unset GITHUB_TOKEN
 export CONTEXT_DIR="$NIXTEST_HOME/context"
 export CONTAINER_PREFIX="nxt"                 # containers nxt-*, volumes nxt_*, nets nxt_*
 export PROXY_HTTP_PORT=18080 PROXY_HTTPS_PORT=18443

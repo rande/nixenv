@@ -41,9 +41,8 @@ class Nixenv < Formula
       (slow once, then shared by every project):
         nixenv build
 
-      This release's templates are installed locally. To use them instead of
-      fetching from GitHub — pinning templates to the nixenv version you have:
-        export TEMPLATE_BASE="file://#{opt_pkgshare}/templates"
+      This release's templates are installed locally and used automatically,
+      so `init --template=<name>` matches the nixenv version you have.
     EOS
   end
 

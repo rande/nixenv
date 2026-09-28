@@ -66,16 +66,10 @@ write nothing.
   recommended deps, and a cask can't be a formula dep, so the engine is a
   caveat. `nixenv` already fails with a clear message when no engine is found.
 - **Templates are installed to `share/nixenv/templates`** so a release pins its
-  own templates. Normally `resolve_template` fetches them from `TEMPLATE_BASE`
-  over https, which means a tagged nixenv can otherwise pull templates from
-  `main` that have moved on. Opt into the local copies with:
-
-  ```sh
-  export TEMPLATE_BASE="file://$(brew --prefix)/share/nixenv/templates"
-  ```
-
-  (`resolve_template` builds `$TEMPLATE_BASE/<name>.nix` and curls it; curl
-  handles `file://`, so short names keep working offline.)
+  own templates. nixenv picks them up automatically: when
+  `TEMPLATE_BASE` is unset it looks for `../share/nixenv/templates` next to the
+  script, which is exactly where brew links `pkgshare`. `file://` bases are
+  read directly (no curl), so short names work offline.
 - **`nixenv install` is blocked** under a Homebrew prefix. It would copy the
   script to `/usr/local/bin`, creating a second copy that `brew upgrade` never
   touches and that shadows — or is shadowed by — the managed one.
