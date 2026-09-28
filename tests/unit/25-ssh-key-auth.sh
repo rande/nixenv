@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SEC-02: ssh into a project is KEY-ONLY. sshd listens on every interface in the
+# Ssh into a project is KEY-ONLY. sshd listens on every interface in the
 # container, so other projects can reach it (nixenv_net, proxy relays). The only
 # key it accepts is generated on the host and mounted read-only.
 source "$(dirname "$0")/../lib.sh"
@@ -54,7 +54,7 @@ cfg="$(cat "$sd/config")"
 assert_contains "$cfg" "IdentityFile \"$sd/id_ed25519\"" "new config uses the project key"
 assert_contains "$cfg" "IdentitiesOnly yes"             "and only that key"
 
-# Migration: a config written before SEC-02 gains the lines once, after User,
+# Migration: a config written before key-only auth gains the lines once, after User,
 # with hand edits preserved.
 cat > "$sd/config" <<EOF
 # hand-edited
@@ -84,7 +84,7 @@ assert_contains "$run_fn" 'ensure_project_ssh_key "$pdir"' "run ensures the key 
 k_ln="$(printf '%s\n' "$run_fn" | grep -n 'ensure_project_ssh_key' | head -1 | cut -d: -f1)"
 c_ln="$(printf '%s\n' "$run_fn" | grep -n 'write_host_ssh_config' | head -1 | cut -d: -f1)"
 [ "$k_ln" -lt "$c_ln" ] || fail "key must be generated before the ssh config"
-assert_contains "$run_fn" 'started before key-only ssh' "warns about pre-SEC-02 containers"
+assert_contains "$run_fn" 'started before key-only ssh' "warns about pre-key-auth containers"
 
 ssh_fn="$(printf '%s' "$body" | sed -n '/^cmd_ssh()/,/^}/p' | code_only)"
 assert_contains "$ssh_fn" '-i "$pdir/ssh/id_ed25519"' "nixenv ssh uses the project key"

@@ -26,7 +26,7 @@ resolve_template "ftp://x/y.nix"  >/dev/null 2>&1 && fail "bad scheme must fail"
 
 # a short name (no slash, no .nix, doesn't exist locally) must go to the base URL
 # — proven by pointing the base at an unreachable host and expecting a fetch fail
-( TEMPLATE_BASE="http://127.0.0.1:9/nonexistent" TEMPLATE_CACHE="$tmp/cache"
+( TEMPLATE_BASE="https://127.0.0.1:9/nonexistent" TEMPLATE_CACHE="$tmp/cache"
   resolve_template "wordpress" >/dev/null 2>&1 ) && fail "short name should try to fetch" || true
 
 # template_meta
@@ -44,3 +44,22 @@ assert_eq "$(template_meta "$tmp/sp.nix" port)" "42" "tolerates spacing, takes t
 for t in wordpress cloudflare symfony headlesscms-directus-astro; do
   assert_file "$REPO_DIR/templates/$t.nix" "templates/$t.nix is shipped"
 done
+
+# --- Supply chain -------------------------------------------------------
+resolve_template "http://example.com/x.nix" >/dev/null 2>&1 && fail "plain http template must be refused"
+out="$(resolve_template "http://example.com/x.nix" 2>&1 || true)"
+assert_contains "$out" "refusing a template over plain http" "says why"
+( TEMPLATE_BASE="http://127.0.0.1:9/t" TEMPLATE_CACHE="$tmp/cache"
+  resolve_template wordpress >/dev/null 2>&1 ) && fail "an http TEMPLATE_BASE must be refused" || true
+# From a clone, short names resolve to the templates next to the script.
+assert_eq "$TEMPLATE_BASE" "file://$REPO_DIR/templates" "a clone uses its own templates"
+assert_eq "$(resolve_template wordpress 2>/dev/null)" "$REPO_DIR/templates/wordpress.nix" \
+  "file:// base is read directly"
+# The fallback default is the version TAG, never main.
+defaults="$(sed -n '/^if \[ -z "${TEMPLATE_BASE:-}" \]; then/,/^fi/p' "$REPO_DIR/nixenv.sh" | code_only)"
+assert_contains "$defaults" 'rande/nixenv/v$NIXENV_VERSION/templates' "pinned to the release tag"
+assert_not_contains "$defaults" "/main/" "never defaults to main"
+assert_contains "$defaults" '../share/nixenv/templates' "Homebrew's pkgshare is picked up"
+# A clone whose path has spaces still resolves (no curl on file://).
+sp="$tmp/with space/templates"; mkdir -p "$sp"; cp "$tmp/demo.nix" "$sp/demo.nix"
+( TEMPLATE_BASE="file://$sp"; assert_eq "$(resolve_template demo 2>/dev/null)" "$sp/demo.nix" "spaces in a file:// base" )

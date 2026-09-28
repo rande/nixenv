@@ -71,7 +71,7 @@ scan_line="$(printf '%s\n' "$ep" | grep -n 'for d in "\$SVROOT"/\*/' | cut -d: -
 [ "$path_line" -lt "$hook_line" ] || fail "PATH must be exported before hooks run"
 [ "$hook_line" -lt "$scan_line" ] || fail "hook must run before the service scan"
 
-# ssh is KEY-ONLY (SEC-02): sshd listens on every interface, so it is reachable
+# ssh is KEY-ONLY: sshd listens on every interface, so it is reachable
 # from other projects on nixenv_net and through the proxy relays. It must accept
 # only the host-generated key mounted read-only — never a password, never a key
 # the container could write itself.

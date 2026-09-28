@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SEC-02: one project must not be able to ssh into another. Before key-only
+# One project must not be able to ssh into another. Before key-only
 # auth, `ssh -p 2222 app@nixenv-<other>` from any unrestricted project landed a
 # password-less shell in the other one.
 source "$(dirname "$0")/../lib.sh" it

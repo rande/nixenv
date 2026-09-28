@@ -70,8 +70,7 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   `*` (no usable password — NOT `!`, which OpenSSH treats as locked and would
   refuse even pubkey logins). **SSH is key-only (SEC-02).** The container's sshd
   listens on every interface, so it is reachable from other projects on
-  `nixenv_net` and — for restricted projects — through the proxy's relays, which
-  bind no specific interface. An open login therefore meant any project could get
+  `nixenv_net` (and, before SEC-06 bound them, through the proxy's relays). An open login therefore meant any project could get
   a shell in any other. `ensure_project_ssh_key` generates
   `<project>/ssh/id_ed25519` on the HOST (host `ssh-keygen`, falling back to the
   store's), and writes `<project>/ssh/authorized_keys` = the project key + the
@@ -87,7 +86,22 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   `EXPORT_META_FILES`). A container created before this still runs the old open
   sshd; `cmd_run`'s already-running branch detects the missing mount and warns.
   `25-ssh-key-auth.sh` covers the host side; `integration/15-ssh-keyauth.sh`
-  proves project A can't ssh into B. Code, home, and databases are **named
+  proves project A can't ssh into B. **The HOST key is pinned too (SEC-10):**
+  `ensure_project_ssh_key` also generates `<project>/ssh/host_ed25519_key` on the
+  host (`gen_ed25519`) and writes `<project>/ssh/known_hosts` as
+  `nixenv-<name> <key>` (`ssh_host_alias`). `cmd_run` mounts it read-only at
+  `/etc/nixenv/ssh_host_ed25519_key`; the entrypoint COPIES it to
+  `$SSHRUN` and chmods 600 (sshd rejects a group/world-readable key and a bind
+  mount keeps the host's mode/owner), and offers only that key. Without the
+  mount (older containers) it falls back to keys generated in `~/.ssh`. The ssh
+  config uses `StrictHostKeyChecking yes` + `HostKeyAlias` + the per-project
+  `UserKnownHostsFile`; older configs get just those two generated lines swapped
+  (awk), hand edits kept. `cmd_ssh` passes the same options. `31-host-key-pinning.sh`.
+  **Runtime hardening (SEC-07):** `container_hardening_args` = `--cap-drop=ALL`,
+  `--security-opt=no-new-privileges`, `--pids-limit=${NIXENV_PIDS_LIMIT:-4096}`
+  (0 = none), applied to project containers (as the `harden` array, BEFORE
+  `extra_args` so a deliberate override wins) and to the proxy. Nothing needs a
+  capability: low ports and ping come from the sysctls. Code, home, and databases are **named
   volumes** `nixenv_<project>_app` → `/app`, `nixenv_<project>_home` →
   `/home/app`, `nixenv_<project>_databases` → `/databases`
   (`app_volume`/`home_volume`/`db_volume`). The app volume's container mount path
@@ -214,7 +228,14 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
 - Per-project tooling: `build <project> [--dir=<path>]` (`cmd_build_project`)
   copies the project flake into `<project>/flake/` and
   `nix profile install path:/flake#$PROJECT_ATTR` into `/nix/var/nix/profiles/proj-<name>`
-  (`project_profile`) in the same store. Default copies just `flake.nix`/`.lock`
+  (`project_profile`) in the same store. **Project flakes are untrusted (SEC-04):**
+  no `--accept-flake-config` (a flake's `nixConfig` could add a substituter AND
+  its signing key into the SHARED store), and `nix_config_project` — not
+  `nix_config` — so `GITHUB_TOKEN` never reaches a project build; it sets
+  `accept-flake-config = false`, `sandbox = true`, `sandbox-fallback = true`
+  (the unprivileged builder usually can't sandbox, so this often falls back —
+  documented, with a one-time warning per project via `.flake-trust-noted`).
+  The base build keeps both (nixenv's own flake). `29-project-build-trust.sh`. Default copies just `flake.nix`/`.lock`
   from `repo/`; `--dir=<path>` (relative to repo, or absolute) copies a WHOLE
   folder so a flake with local file references resolves. **`--dir` is remembered**
   in `<project>/flake_dir`, so a project whose flake lives in e.g. `infra/nixos`
@@ -238,12 +259,17 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   `.local/bin` first. `delete` removes the profile; `init --build` runs the
   default mode after scaffolding.
 - The Claude CLI (`claude-code` from `nixpkgs-unstable`) is on the shared
-  profile. Two shared paths are bind-mounted **rw** into every container so one
-  login + config is shared: `$HOME/.nixenv/claude` → `/home/app/.claude`
-  (`CLAUDE_DIR`) and `$HOME/.nixenv/claude.json` → `/home/app/.claude.json`
-  (`CLAUDE_JSON`). `.claude.json` lives in the home root (not inside `.claude`),
-  so it's shared as its own file; `prepare_claude_share` seeds it (restoring the
-  newest `.claude/backups/` if present) before each `run`.
+  profile. **Only the login is shared (SEC-03)**: sharing `~/.claude` and
+  `~/.claude.json` rw let one project plant hooks/MCP servers/CLAUDE.md that ran
+  in every other. `prepare_claude_profile` builds
+  `$CLAUDE_DIR/profiles/<name>/{dot-claude/,claude.json}` (`claude_profile_dir`)
+  → `/home/app/.claude` and `/home/app/.claude.json`, plus ONE shared file
+  `$CLAUDE_DIR/.credentials.json` → `/home/app/.claude/.credentials.json` (rw:
+  token refresh rewrites it — so every project can still READ the token; that
+  limit is documented, not solved). Mount targets are pre-created as files (else
+  the engine makes directories). A new profile is NOT seeded from the legacy
+  shared `CLAUDE_JSON` (it may be poisoned) — only `hasCompletedOnboarding`.
+  `delete` removes the profile, keeps transcripts. `28-claude-isolation.sh`.
   `CLAUDE_CODE_PROJECT_DIR_NAME=nixenv-<project>` is set in **two** places, and
   both are required: `cmd_run` passes it with `-e` (covers runit services and
   `shell`'s `docker exec`) and the entrypoint writes it into `.zshenv` (covers
@@ -252,13 +278,17 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   `$CLAUDE_DIR/projects/nixenv-<name>` mount or transcripts land outside the
   per-project dir; `10-entrypoint-content.sh` asserts all three agree.
 - Terminal session persistence uses **zmx** (github:neurosnap/zmx), installed in
-  the base flake as a **prebuilt static-musl binary** (`builtins.fetchTarball` +
+  the base flake as a **prebuilt static-musl binary** (`pkgs.fetchurl` +
   `runCommand`) because its source build needs bubblewrap/user namespaces the
-  builder container can't create. The base build therefore runs `--impure`
-  (fetchTarball has no pinned hash); `BUILDER_PRIVILEGED=1` is the fallback for
+  builder container can't create. It is **pinned (SEC-09)**: `zmxVersion` +
+  one sha256 per system in `zmxHashes`, GitHub release URL first and zmx.sh as
+  mirror, so the base build is PURE (no `--impure`) and a swapped upstream
+  tarball fails on hash mismatch. Upgrading = bump the version AND both hashes
+  (RELEASING.md); `26-pinned-fetches.sh` rejects `builtins.fetchTarball`,
+  `--impure`, and any system without a hash. `BUILDER_PRIVILEGED=1` is the fallback for
   other source builds that need bwrap. `write_host_ssh_config` writes
   `<project>/ssh/config` (Host
-  `<name>`/`<name>.*` → 127.0.0.1:port, `RemoteCommand zmx attach %k`,
+  `<name>`/`<name>.*` → 127.0.0.1:port, `RemoteCommand zmx attach %n` — `%n`, the host as typed, NOT `%k`: `%k` is the HostKeyAlias when set, which made every `ssh <p>.<x>` share one session; old configs are migrated),
   `ControlMaster`), and `ssh-config --install` adds the `Include` glob to
   `~/.ssh/config` so `ssh <project>` works. `./nixenv.sh ssh`/`shell` connect directly
   (plain zsh, no zmx). The prompt (starship) shows `$NIXENV_PROJECT`,
@@ -285,7 +315,9 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   **squid** (in the base flake, running inside the proxy container on
   `EGRESS_PORT` 3128, not published) with per-project ACLs keyed by the internal
   net's subnet (`net_subnet` — docker `.IPAM.Config` / podman `.Subnets`),
-  default-deny, CONNECT limited to 443/22/80/9418, and denies to
+  default-deny, CONNECT limited to 443/22/80/9418 (and port 22 only to the hosts
+in `<project>/ssh_hosts` when that file exists — SEC-11; `init` writes it with
+the forge host, no file = old behaviour), and denies to
   loopback/RFC1918 so projects can't reach other containers through the proxy.
   `write_egress_configs` generates `~/.nixenv/proxy/egress/{squid.conf,start.sh}`
   (start.sh = squid + socat relays + exec caddy — the proxy container's cmd) and
@@ -448,8 +480,9 @@ archive is a plain `.tar` (NOT gzipped — each volume inside is already a
 `.tar.gz`, so compressing twice costs time and saves nothing) containing
 `nixenv-export/{manifest,meta/,volumes/{app,databases[,home]}.tar.gz}`.
 `EXPORT_META_FILES` is an **allowlist** of the portable host-side files
-(`ports app_mount hosts.extra allowed_hosts unrestricted extra-parameters`), so a
-newly added per-project file stays behind until someone includes it deliberately;
+(`ports app_mount hosts.extra allowed_hosts unrestricted extra-parameters flake_dir
+accept-from ssh_hosts`), so a newly added per-project file stays behind until
+someone includes it deliberately;
 `23-export-import.sh` fails if machine-specific state (`passwd`/`shadow`/`port`/
 `etc-hosts`/`flake`/`ssh`/`home`) ever appears in it. Three things are
 REGENERATED on import rather than restored, and each would otherwise break a
@@ -468,6 +501,20 @@ untarring — so it warns, names the volumes it will replace, and confirms
 (`--yes` skips the prompt for scripts). The refusal message states whether the
 colliding name came from the archive or from the argument: "pick another name"
 reads as nonsense to someone who just passed one.
+
+**Imported meta files are untrusted (SEC-01)** — they decide how the container
+is CREATED on this host. `import_meta_files` replaces the old `cp -a` loop:
+regular files only (a symlinked `hosts.extra -> ~/.ssh/id_…` would be
+bind-mounted), copied with `cat`; `extra-parameters` lands INERT as
+`extra-parameters.imported` and is printed; `ports` keeps only loopback specs
+(`safe_port_spec`; bare `H:C` is rewritten to `127.0.0.1:H:C`, since docker binds
+`0.0.0.0` for it); `unrestricted` needs an interactive yes (`confirm_tty` —
+`--yes` does NOT grant it, no TTY = stays restricted); `allowed_hosts` entries go
+through `normalize_allowed_host`; `app_mount` through `valid_app_mount` (shared
+with `init --app-path`; rejects `:` which would smuggle mount options) and
+`flake_dir` must be relative without `..`. `cmd_run` refuses symlinked
+`ports`/`hosts.extra`/`extra-parameters`/`app_mount` and re-validates the app
+path. `27-import-hostile-meta.sh` builds a hostile meta dir.
 
 **A token can also hide in the APP volume**, which is in *every* archive: a
 clone URL like `https://user:token@host/repo.git` is written verbatim into
@@ -565,10 +612,12 @@ GitHub tarball and refuses when the script's version, the requested version, or
 the version *inside* the downloaded tarball disagree. Release order is fixed:
 bump `NIXENV_VERSION` → commit → tag → `update-formula.sh` (the sha256 cannot
 exist before the tag) → copy into the tap. The formula also installs
-`templates/` into `pkgshare`; `TEMPLATE_BASE="file://$(brew --prefix)/share/nixenv/templates"`
-pins templates to the installed release, because `resolve_template` otherwise
-curls them from `main` and a tagged nixenv can pull templates that moved on
-(curl handles `file://`, so short names keep working).
+`templates/` into `pkgshare`. **Templates are pinned (SEC-08)**: with
+`TEMPLATE_BASE` unset, the default is `file://$SCRIPT_DIR/templates` (a clone),
+else `file://$SCRIPT_DIR/../share/nixenv/templates` (brew's linked pkgshare),
+else `…/rande/nixenv/v$NIXENV_VERSION/templates` — never `main`. `file://` is
+read directly (no curl: paths with spaces), `http://` is refused unless
+`NIXENV_ALLOW_INSECURE_TEMPLATES=1`, and a fetched template's sha256 is logged.
 
 CI/release live in `.github/workflows/` and are covered by `22-workflows.sh`
 (trigger shape, job dependency chain, and that the guards exist). That test must

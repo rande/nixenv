@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SEC-06: a restricted project may reach only its OWN web services through the
+# A restricted project may reach only its OWN web services through the
 # proxy (Caddy + the port relays), unless the target opts in via accept-from.
 # The host keeps reaching everything.
 source "$(dirname "$0")/../lib.sh" it

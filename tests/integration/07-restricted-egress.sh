@@ -42,7 +42,7 @@ proxy_id="$("$E" inspect nxt-proxy --format '{{.Id}}')"
 nx allow p1 httpbin.org >/dev/null
 assert_eq "$("$E" inspect nxt-proxy --format '{{.Id}}')" "$proxy_id" "proxy NOT recreated by allow"
 
-# SEC-05: the reordered config (`dstdomain -n`, name gates before the only dst
+# The reordered config (`dstdomain -n`, name gates before the only dst
 # rule) must parse under the REAL squid. A config it rejects would take out all
 # egress, and the unit test can only check the text. The no-lookup property is
 # covered by tests/squid_acl_sim.py in unit/08.

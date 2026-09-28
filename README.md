@@ -67,12 +67,8 @@ brew install --cask docker        # or: brew install podman
 brew install mkcert               # optional: trusted HTTPS for *.nixenv.localhost
 ```
 
-Homebrew also installs this release's templates locally. To use those instead of
-fetching from GitHub — pinning templates to the nixenv version you actually have:
-
-```sh
-export TEMPLATE_BASE="file://$(brew --prefix)/share/nixenv/templates"
-```
+Homebrew also installs this release's templates locally, and nixenv uses them
+automatically, so templates always match the nixenv version you have.
 
 Don't run `nixenv install` on a Homebrew install; it refuses, because a second
 copy would never be upgraded by `brew`.
@@ -213,7 +209,17 @@ up on the next `run`, without a restart if the container is already up.
 The key never leaves your machine: it isn't part of an `export`, so an imported
 project gets a new one.
 
-> A container started before this change still runs the old password-less sshd.
+**The container is verified, too.** Its sshd host key is also generated on your
+machine and pinned in `~/.nixenv/projects/<name>/ssh/known_hosts` (under the
+alias `nixenv-<name>`, not the port). `ssh <project>` and `nixenv ssh` check it
+strictly, so if something else grabs the project's port while its container is
+stopped, ssh refuses to connect instead of handing your session to it.
+Hand-written ssh commands need `-o HostKeyAlias=nixenv-<name> -o
+UserKnownHostsFile=~/.nixenv/projects/<name>/ssh/known_hosts`, or use the
+generated config.
+
+> A container started before these changes still runs the old sshd (and, for
+> host-key pinning, the old host key, so `ssh` reports a changed key).
 > `nixenv run <name>` warns about it; `nixenv stop <name> && nixenv run <name>`
 > applies the fix.
 
@@ -276,8 +282,13 @@ Templates resolve three ways:
 --template=./templates/wordpress.nix        # local file (your own fork)
 ```
 
-Override the base for short names with `TEMPLATE_BASE`; fetched templates are
-cached in `~/.nixenv/templates/`. A template can declare metadata that nixenv
+Short names are pinned to the templates that shipped with your nixenv: the
+`templates/` folder next to the script (a clone, or Homebrew's copy), otherwise
+the GitHub tag matching `nixenv --version` — never the moving `main` branch.
+Override with `TEMPLATE_BASE` (e.g. `…/rande/nixenv/main/templates` to follow
+`main`). Plain `http://` templates are refused, since a template is code
+(`NIXENV_ALLOW_INSECURE_TEMPLATES=1` overrides). Fetched templates are cached in
+`~/.nixenv/templates/`, and their sha256 is printed. A template can declare metadata that nixenv
 reads *before* building — used to pre-fill the egress allowlist, the served port
 and the app path:
 
@@ -557,6 +568,31 @@ know: UDP (QUIC) isn't proxied (tools fall back to TCP); proxy-less raw-TCP
 clients can't reach external services (use ssh/CONNECT-capable paths); and the
 CONNECT ports are limited to 443/22/80/9418.
 
+**Port 22 only to your git host.** `init` writes the forge's hostname to
+`~/.nixenv/projects/<name>/ssh_hosts`, and only the hosts listed there can be
+reached on port 22 (git over ssh). Add a line per extra git host, then
+`nixenv proxy reload`. Projects created before this have no such file and keep
+the old behaviour, where every allowed host is reachable on 22.
+
+### What egress restriction does not protect against
+
+It is a *hostname* allowlist, so it stops code from reaching hosts you didn't
+allow. It can't judge what happens with the hosts you did allow:
+
+- **An allowed forge is a way out.** With `github.com` allowed (the default for
+  a GitHub clone), code can push to *any* repository or gist, not just yours.
+- **Wildcards are wide.** `.githubusercontent.com` or `.vsassets.io` cover huge
+  namespaces, parts of which other people control.
+- **Shared CDNs can front other sites.** An allowed CDN hostname can be used to
+  reach other customers of the same CDN (domain fronting).
+- **Port 22 reaches any sshd on an allowed name**, unless `ssh_hosts` narrows it
+  (see above).
+- **UDP and QUIC aren't proxied** — they just fail, so this isn't a leak, but
+  tools must fall back to TCP.
+
+`nixenv egress <project>` flags wildcard and forge entries in its summary, so
+you can review them.
+
 **Refused names are never looked up.** A DNS lookup is itself a way out: code
 that asks for `<secret>.attacker.example` delivers the secret to whoever runs
 that domain's nameserver, even though the request is then refused. So the proxy
@@ -693,6 +729,14 @@ There is no CLI flag for this on purpose; it's project state like `unrestricted`
 or `ports`. Parameters apply when the container is **created**, so re-run
 `nixenv run <project>` after editing. `run` echoes the active set.
 
+Every project container (and the proxy) starts hardened: `--cap-drop=ALL`,
+`--security-opt=no-new-privileges` and `--pids-limit=4096` (change it with
+`NIXENV_PIDS_LIMIT`; `0` removes it, which rootless podman without cgroup
+delegation needs). Your extra parameters come **after** these, so a
+`--cap-add=…` or `--security-opt=no-new-privileges=false` there wins — each one
+loosens the sandbox, so add only what you need. There's no default memory limit;
+add `--memory=4g` here if you want one.
+
 #### Running podman/docker inside a project
 
 That's what the commented example in the scaffolded file is for — uncomment it:
@@ -762,6 +806,16 @@ nixenv build myapp --dir=/abs/path  # or an absolute host path
 `--dir` copies the entire folder into the build, so relative references inside it
 (overlays, a vendored package, `./.`-style local inputs) work.
 
+**Only build flakes you trust.** Building a flake runs its build code as root,
+with write access to the Nix store that *every* project shares. nixenv limits
+what a project flake can do: its `nixConfig` is ignored (so it can't add its own
+binary cache and signing key), `GITHUB_TOKEN` is not passed to it, and builds
+are sandboxed when the builder can create namespaces. The builder container
+usually can't, and then Nix builds without a sandbox. So a malicious flake can
+still tamper with the shared store and, through it, other projects. `build`
+reminds you of this the first time you build each project. A template's flake,
+and any repo you `init … --build`, falls under the same rule.
+
 ## Toolchain
 
 The shared profile includes git, zsh + oh-my-zsh + starship, OpenSSH, runit,
@@ -812,34 +866,35 @@ in the home volume). On the **first** `nvim` launch, `lazy.nvim` downloads the
 plugins (needs network; a one-time step that persists in the home volume). For
 the icons to render, use a **Nerd Font** in your terminal.
 
-### Shared Claude credentials
+### Claude: one login, separate settings per project
 
-The Claude CLI keeps state in two places, and both are shared read-write so a
-single `claude` login and config carry across all projects (and survive
-container recreation):
-
-```
-~/.nixenv/claude        → /home/app/.claude        (credentials, settings, backups)
-~/.nixenv/claude.json   → /home/app/.claude.json   (global config file)
-```
-
-Both are created automatically on first `run`. `~/.claude.json` lives in the
-home root (not inside `.claude`), so it's shared as its own file; if it's ever
-missing, the newest backup from the shared `.claude/backups/` is restored
-automatically.
-
-**Session transcripts are per-project**: while credentials/settings are shared,
-`.claude/projects` is overlaid with a per-project directory, so every session's
-JSONL transcript is reviewable on the host at
+You log in to `claude` once and every project uses that login. Everything else
+Claude keeps — settings, hooks, MCP servers, `CLAUDE.md`, slash commands — is
+**per project**, so one project can't plant something that runs in another:
 
 ```
-~/.nixenv/claude/projects/nixenv-<project>/<encoded-cwd>/<session-id>.jsonl
+~/.nixenv/claude/.credentials.json          → shared by all projects (the login)
+~/.nixenv/claude/profiles/<project>/        → that project's ~/.claude + ~/.claude.json
+~/.nixenv/claude/projects/nixenv-<project>/ → that project's session transcripts
 ```
 
-(without this, all projects using the same in-container path would interleave
-their transcripts in one folder). Transcripts are auto-pruned after ~30 days;
-raise `"cleanupPeriodDays"` in `~/.nixenv/claude/settings.json` to keep them. (If you saw a "Claude configuration file not found" warning, it
-was because only `.claude` was shared before — this resolves it.)
+**What a project can still read:** the login token itself. Token refresh
+rewrites the credentials file, so it has to be shared read-write, and any code
+running in a project (a cloned repo's startup hook included) can read it. Only
+run `claude` in containers holding code you trust, or log in per project by
+deleting the shared file and logging in inside each one.
+
+New project profiles start empty (no settings are copied from anywhere). If you
+used nixenv before this change, your old shared config is still at
+`~/.nixenv/claude.json` and `~/.nixenv/claude/settings.json`; copy what you want
+into a project's profile by hand — and check it for `mcpServers` or `hooks`
+entries you don't recognise first. `delete <project>` removes its profile but
+keeps its transcripts.
+
+Transcripts are reviewable on the host at
+`~/.nixenv/claude/projects/nixenv-<project>/<encoded-cwd>/<session-id>.jsonl`
+and are auto-pruned after ~30 days; raise `"cleanupPeriodDays"` in the project's
+`profiles/<project>/dot-claude/settings.json` to keep them.
 
 ## Configuration
 

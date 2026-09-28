@@ -15,6 +15,7 @@ rm -rf "$NIXENV_PROJECTS_DIR"
 nx init alpha https://gitlab.example.com/team/app.git </dev/null >/dev/null 2>&1 || true
 assert_file "$NIXENV_PROJECTS_DIR/alpha/allowed_hosts"
 assert_contains "$(cat "$NIXENV_PROJECTS_DIR/alpha/allowed_hosts")" "gitlab.example.com" "forge seeded"
+assert_eq "$(cat "$NIXENV_PROJECTS_DIR/alpha/ssh_hosts" 2>/dev/null)" "gitlab.example.com" "forge is the only port-22 host"
 assert_file "$NIXENV_PROJECTS_DIR/alpha/home/.zshrc"
 assert_file "$NIXENV_PROJECTS_DIR/alpha/home/.gitconfig.identity"
 assert_contains "$(cat "$NIXENV_PROJECTS_DIR/alpha/home/.gitconfig.identity")" "test@nixenv.local"

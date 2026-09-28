@@ -27,7 +27,7 @@ assert_contains "$EGRESS_PROJECTS" "alpha"
 assert_not_contains "$EGRESS_PROJECTS" "open" "opted-out project excluded"
 
 # ACL semantics: exact stays exact, dot/star become subdomain form, IP separate
-# Names AND IPs share one `dstdomain -n` list (SEC-05): no `dst` ACL per project,
+# Names AND IPs share one `dstdomain -n` list: no `dst` ACL per project,
 # because a `dst` ACL resolves the requested hostname — for denied names too.
 assert_contains "$conf" "acl d_alpha dstdomain -n gitlab.example.com .yarnpkg.com .npmjs.org 10.0.0.5"
 assert_not_contains "$conf" "acl i_alpha" "no per-project dst ACL"
@@ -63,7 +63,7 @@ write_egress_configs
 ino2=$(ls -di "$PROXY_DIR/egress" | awk '{print $1}')
 assert_eq "$ino2" "$ino1" "egress dir inode preserved"
 
-# --- SEC-05: nothing may resolve a name before the name gate --------------------
+# --- Nothing may resolve a name before the name gate --------------------
 # squid stops at the first matching http_access rule, and ANDs a rule's ACLs
 # left to right. So the only `dst` rule (to_localnets, which resolves) must come
 # AFTER every per-project name gate, or a denied name gets looked up — a DNS
@@ -79,7 +79,7 @@ unknown="$(ln 'http_access deny !nixenv_projects')"
 printf '%s\n' "$conf" | awk -v stop="$local_ln" 'NR < stop && /^http_access/' \
   | grep -q 'to_localnets\|i_' && fail "a dst ACL is evaluated before the name gate"
 
-# --- SEC-05, behaviourally: model squid's evaluation on THIS generated config ---
+# --- Behaviourally: model squid's evaluation on THIS generated config ---
 # tests/squid_acl_sim.py reports the verdict and whether squid would have to
 # resolve a name to reach it.
 SIM="$TESTS_DIR/squid_acl_sim.py"
@@ -100,3 +100,21 @@ assert_eq "$(sim $A CONNECT gitlab.example.com 443 gitlab.example.com=10.1.2.3)"
 # 10.0.0.5 is in the allowlist but private — to_localnets still wins, and an
 # IP-literal request needs no lookup at all (-n: no reverse DNS).
 assert_eq "$(sim $A GET 10.0.0.5 80)" "deny dns=no" "private IP stays blocked, no lookup"
+
+# --- Port 22 only to declared git hosts --------------------------------
+# Without ssh_hosts (old projects): every allowed host is reachable on 22.
+assert_eq "$(sim $A CONNECT x.yarnpkg.com 22)" "allow dns=yes" "no ssh_hosts: old behaviour kept"
+printf 'gitlab.example.com\nbad host!\n' > "$PROJECTS_DIR/alpha/ssh_hosts"
+container_running() { return 1; }
+write_egress_configs >/dev/null 2>&1
+conf="$(cat "$cf")"
+assert_contains "$conf" "acl ssh_port port 22" "ssh port acl"
+assert_contains "$conf" "acl s_alpha dstdomain -n gitlab.example.com" "declared git host (invalid entry dropped)"
+assert_contains "$conf" "http_access deny p_alpha CONNECT ssh_port !s_alpha" "port 22 gated per project"
+assert_eq "$(sim $A CONNECT gitlab.example.com 22)" "allow dns=yes" "git over ssh to the forge works"
+assert_eq "$(sim $A CONNECT x.yarnpkg.com 22)"      "deny dns=no"   "other allowed hosts: no port 22, no lookup"
+assert_eq "$(sim $A CONNECT x.yarnpkg.com 443)"     "allow dns=yes" "…but 443 still works"
+: > "$PROJECTS_DIR/alpha/ssh_hosts"
+write_egress_configs >/dev/null 2>&1
+assert_eq "$(sim $A CONNECT gitlab.example.com 22)" "deny dns=no" "empty ssh_hosts: no port 22 at all"
+rm -f "$PROJECTS_DIR/alpha/ssh_hosts"

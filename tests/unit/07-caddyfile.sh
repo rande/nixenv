@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # write_caddyfile: routing regex, forwarded headers, streaming, tls modes,
-# and the SEC-06 cross-project guard.
+# and the cross-project guard.
 source "$(dirname "$0")/../lib.sh"
 source_nixenv
 
@@ -16,7 +16,7 @@ assert_contains "$cf" "http_port 80"
 assert_contains "$cf" "https_port 443"
 assert_contains "$cf" "*.$PROXY_DOMAIN"
 assert_contains "$cf" "tls internal" "internal CA mode"
-# SEC-06: only project-name characters, never (.+).
+# Only project-name characters, never (.+).
 assert_contains "$cf" '^([a-zA-Z0-9_-]+)-([0-9]+)\.nixenv\.localhost(:[0-9]+)?$' "route regex"
 assert_not_contains "$cf" '(.+)' "no catch-all project group"
 assert_contains "$cf" "reverse_proxy @route ${CONTAINER_PREFIX}-{re.route.1}:{re.route.2}" "dynamic upstream uses container prefix"
@@ -32,7 +32,7 @@ cf="$(cat "$PROXY_DIR/Caddyfile")"
 assert_contains "$cf" "tls /certs/wildcard.pem /certs/wildcard-key.pem" "mkcert mode"
 assert_not_contains "$cf" "tls internal" "no internal CA in cert mode"
 
-# --- SEC-06: per-project source guard -----------------------------------------
+# --- Per-project source guard -----------------------------------------
 mkdir -p "$PROJECTS_DIR/alpha" "$PROJECTS_DIR/beta" "$PROJECTS_DIR/gamma" "$PROJECTS_DIR/my-app"
 EGRESS_SUBNETS="alpha 10.89.1.0/24
 beta 10.89.2.0/24
