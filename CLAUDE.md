@@ -42,6 +42,8 @@ single-quoted heredocs in the `materialize_context()` function:
 On every command run, `materialize_context()` writes these into `$CONTEXT_DIR`
 (default `~/.nixenv/context`) and the build runs from there. There are **no
 standalone `flake.nix` / `runtime/` files in the repo** — do not recreate them.
+(`dev/flake.nix` and `examples/hello/flake.nix` are *project* flakes — the dev
+environment and an example — not copies of the base; they stay out of the root.)
 To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
 
 ## Editing embedded files — rules
@@ -123,8 +125,11 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   ignores it in the empty-check. `/databases` is empty per-project storage. This is
   what lets a non-root container use named volumes. The entrypoint does NO root
   ops; it writes `.zshenv`, sshd config, host keys, and the runit tree under the
-  writable `$HOME`. `init <git-url>` clones into the app volume via the runtime
-  image run as your uid. `build <project>` extracts the flake from the app volume.
+  writable `$HOME`. `init <git-url> [--branch=<name>]` clones into the app volume via the runtime
+  image run as your uid (`git clone [--branch B] -- <url>`: the `--` stops a URL
+  starting with `-` — e.g. `-u…` = `--upload-pack` — being read as an option;
+  `valid_git_branch` rejects a leading `-` and odd characters before anything is
+  created, and `--branch` without a URL is refused). `build <project>` extracts the flake from the app volume.
 - Git identity is per project in `home/.gitconfig.identity`, included by the
   project `.gitconfig`. `init` prompts for it (or uses `GIT_USER_NAME` /
   `GIT_USER_EMAIL`).
@@ -636,6 +641,19 @@ else `…/rande/nixenv/v$NIXENV_VERSION/templates` — never `main`. `file://` i
 read directly (no curl: paths with spaces), `http://` is refused unless
 `NIXENV_ALLOW_INSECURE_TEMPLATES=1`, and a fetched template's sha256 is logged.
 
+`release.sh` (repo root) is the local driver: preflight (default branch, clean,
+HEAD == origin, version == `NIXENV_VERSION`, unit suite) → annotated tag → `gh
+run watch` on `release.yml` (prints `--log-failed` on failure) → pull →
+`update-formula.sh` (the ONE sha256 implementation — `34-release-script.sh`
+rejects `shasum`/`sha256sum` in release.sh) → commit/push the formula here and to
+the tap clone in `./homebrew-nixenv/` (git-ignored; the check uses a trailing
+slash because a dir-only ignore pattern doesn't match a not-yet-existing path).
+Idempotent: a tag counts as THIS release when it's HEAD or an ancestor that
+differs only by the formula file (the post-release formula commit moves main
+past the tag); anything else needs `--retag`. The test runs the whole flow
+offline — bare repos for origin and tap, fake `gh`/`curl` on PATH, the fake curl
+serving `git archive` of the tag to the real update-formula.sh.
+
 CI/release live in `.github/workflows/` and are covered by `22-workflows.sh`
 (trigger shape, job dependency chain, and that the guards exist). That test must
 NOT depend on PyYAML: GitHub's **macOS** runner ships a `python3` with no `yaml`
@@ -722,6 +740,42 @@ of them. Add a `tests/unit/1N-template-<name>.sh` for every new template.
 - Metadata (`description`, `port`, `allow`, `app-path`) is parsed from leading
   `# nixenv:<key>` comments; the header should also show the `init` command.
   Only `@@PROJECT@@`, `@@APP_MOUNT@@`, `@@DOMAIN@@`, `@@PORT@@` are substituted.
+
+## Developing nixenv inside nixenv (`dev/`, `DEVELOPING.md`)
+
+A project container can't run an engine (non-root, `--cap-drop=ALL`), so
+`dev/engines.sh up <p>` (host side; it `source`s nixenv for naming helpers —
+`$NIXENV_SH`, else the repo it sits in, else the INSTALLED `nixenv`, because the
+Homebrew flow in DEVELOPING.md has no clone on the host, only this script copied
+out of the dev project with `docker exec … cat`; it refuses an installed nixenv
+that lacks the helpers it needs)
+starts two PRIVILEGED sidecars, `<prefix>__<p>-dind` and `<prefix>__<p>-podman`.
+They serve Unix sockets in the volume `<prefix>_<p>_engine`, which the project
+mounts at `/var/run/nixenv` via ONE line appended to its `extra-parameters`
+(`wire_project`, idempotent). Sockets are `0666`: the volume is the access
+boundary, and gid matching breaks under id remapping. The sidecars mount the
+project's home and app volumes at the SAME paths (`/home/app`, `project_app_mount`)
+— the nested nixenv bind-mounts files from its `~/.nixenv` and the repo, and the
+daemon resolves those paths on its own filesystem. `dev/flake.nix` (build with
+`--dir=dev`) wraps `docker`/`podman` to default to those sockets (podman via
+`--remote`; the real clients are referenced, not installed, to avoid `bin/`
+collisions), puts a `nixenv` command on PATH that execs the CHECKOUT's
+`${NIXENV_APP_MOUNT:-/app}/nixenv.sh` (never an installed copy; note that path
+is a double-quoted Nix string, so its literal `${` is escaped `\${`, not `''${`),
+and its hook writes `~/.nixenv/engine` once so the nested nixenv
+doesn't prompt. The podman sidecar is ROOTFUL, which is why `engine_userns` now
+asks `podman info` (`podman_rootless_probe`, cached as `ENGINE_ROOTLESS` by
+`require_engine` in the main shell) and skips `--userns=keep-id` when rootful —
+rootful podman rejects it. ONE ENGINE PER NESTED PROJECT: the dev flake's
+`nixenv-docker`/`nixenv-podman` run the checkout's `nixenv.sh` with
+`CONTAINER_ENGINE` set and `HOME=$real/.nixenv-dev/<engine>` — every nixenv
+state path follows `$HOME` (unit 35 asserts it), so each engine has its own
+projects, proxy dir and squid pid file; sharing one `~/.nixenv` between two
+engines would make their proxies fight over the same files. `examples/hello` is the nested smoke test (nginx on
+0.0.0.0:8080, paths under `/home/app/.nixenv-run/hello`, `-e` for the pre-config
+error log). Tests: unit `35`, integration `18` (path identity through the
+sidecar). Review skills live in `.claude/skills/` (principal engineer, security,
+linux/macOS).
 
 ## Conventions
 

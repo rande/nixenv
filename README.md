@@ -8,6 +8,9 @@ dependencies once into a standalone Docker volume (the Nix store) and lets each
 project container mount that store read-only. Containers start instantly and
 every project shares the same pinned toolchain.
 
+> Contributing? [DEVELOPING.md](DEVELOPING.md) covers the local setup, the
+> tests, and developing nixenv from inside a nixenv project.
+
 ## How it works
 
 1. **Self-contained script.** Everything — `flake.nix`, a reference
@@ -136,11 +139,12 @@ With the app listening on `:3000`, it's already reachable at
 `https://myapp-3000.nixenv.localhost/` (see
 [Reverse proxy](#reverse-proxy-httpsproject-portnixenvlocalhost)).
 
-Clone a repo while initialising (cloned into the project's app volume), and
-optionally pick where it mounts in the container:
+Clone a repo while initialising (cloned into the project's app volume),
+optionally pick the branch, and where it mounts in the container:
 
 ```sh
 nixenv init myapp git@github.com:me/app.git
+nixenv init myapp git@github.com:me/app.git --branch=develop   # a branch or tag, not the default one
 nixenv init web  git@github.com:me/web.git --app-path=/var/www/html
 ```
 

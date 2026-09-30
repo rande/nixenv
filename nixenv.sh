@@ -55,7 +55,7 @@ PROJECTS_DIR="${NIXENV_PROJECTS_DIR:-$HOME/.nixenv/projects}"
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.nixenv/claude}"     # shared Claude CLI creds/config dir (~/.claude)
 CLAUDE_JSON="${CLAUDE_JSON:-$HOME/.nixenv/claude.json}" # shared Claude global config file (~/.claude.json)
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-}"             # docker|podman; empty = auto-detect
-ENGINE_FILE="$HOME/.nixenv/engine"                   # remembered engine choice
+ENGINE_FILE="${ENGINE_FILE:-$HOME/.nixenv/engine}"   # remembered engine choice
 GITHUB_TOKEN_FILE="${GITHUB_TOKEN_FILE:-$HOME/.nixenv/github_token}"  # optional, raises GitHub's API limit
 GITHUB_TOKEN_SKIP="${GITHUB_TOKEN_SKIP:-$HOME/.nixenv/github_token.skip}" # "don't ask again" marker
 ENGINE=""                                            # resolved at runtime
@@ -1031,12 +1031,31 @@ img() {
 require_engine() {
   resolve_engine || die "neither docker nor podman found on PATH"
   "$ENGINE" info >/dev/null 2>&1 || die "$ENGINE not reachable (is the daemon running?)"
+  # Decided ONCE, here in the main shell: engine_userns runs inside $(…), where
+  # a cached answer would be lost and every call would re-ask the engine.
+  if [ "$ENGINE" = podman ] && [ -z "${ENGINE_ROOTLESS:-}" ]; then
+    ENGINE_ROOTLESS="$(podman_rootless_probe)"
+  fi
+}
+
+# true | false — is this podman rootless? Rootful podman (a system service, or
+# the dev environment's sidecar reached with --remote) REJECTS --userns=keep-id:
+# "keep-id is only supported in rootless mode". Unknown → assume rootless, the
+# common desktop case and the old behaviour.
+podman_rootless_probe() {
+  local r; r="$("$ENGINE" info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)"
+  case "$r" in false) printf false;; *) printf true;; esac
 }
 
 # Rootless podman remaps uids; --userns=keep-id makes the container see your real
-# host uid (so bind-mounted files stay writable). No-op for docker.
+# host uid (so bind-mounted files stay writable). No-op for docker and for
+# rootful podman, where the uid is already the real one.
 engine_userns() {
-  [ "$ENGINE" = podman ] && printf '%s' "--userns=keep-id"
+  [ "$ENGINE" = podman ] || return 0
+  local rootless="${ENGINE_ROOTLESS:-}"
+  [ -n "$rootless" ] || rootless="$(podman_rootless_probe)"
+  [ "$rootless" = true ] && printf '%s' "--userns=keep-id"
+  return 0
 }
 
 # Ensure the shared user network exists. Project containers and the proxy join it
@@ -1900,8 +1919,17 @@ install_template() {
 # runtime image as the non-root user with the shared store + project home, so it
 # uses the store's git and the project's SSH keys; the bind-mounted repo dir ends
 # up owned by your host uid.
+# A branch/tag name for `git clone --branch`. Conservative on purpose: it's
+# passed as an argument, and a leading '-' would be read as an option.
+valid_git_branch() {
+  case "$1" in
+    ""|-*|/*|*/|*.|*..*|*//*|*@\{*|*.lock|*[!A-Za-z0-9._/@-]*) return 1;;
+  esac
+  return 0
+}
+
 clone_repo() {
-  local url="$1" name="$2"
+  local url="$1" name="$2" branch="${3:-}"
   require_engine
   local pdir appv homev appmnt; pdir="$(project_dir "$name")"
   appv="$(app_volume "$name")"; homev="$(home_volume "$name")"
@@ -1909,7 +1937,7 @@ clone_repo() {
 
   if ! store_is_populated; then
     warn "shared store not built yet — skipping clone"
-    warn "run '$0 build', then '$0 init $name $url' to clone"
+    warn "run '$0 build', then '$0 init $name $url${branch:+ --branch=$branch}' to clone"
     return 0
   fi
   ensure_volumes "$name"
@@ -1920,7 +1948,7 @@ clone_repo() {
   fi
 
   write_passwd_files "$pdir"
-  log "Cloning $url → volume '$appv' (mounts at $appmnt) via $RUNTIME_IMAGE + shared git"
+  log "Cloning $url${branch:+ (branch $branch)} → volume '$appv' (mounts at $appmnt) via $RUNTIME_IMAGE + shared git"
   "$ENGINE" run --rm \
     --user "$(id -u):$(id -g)" \
     $(engine_userns) \
@@ -1937,7 +1965,12 @@ clone_repo() {
     -e NIXENV_APP_MOUNT="$appmnt" \
     -e GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" \
     "$(img "$RUNTIME_IMAGE")" \
-    sh /usr/local/bin/nixenv-entrypoint sh -c 'rm -f "$NIXENV_APP_MOUNT/.keep" 2>/dev/null; exec git clone "$1" "$NIXENV_APP_MOUNT"' _ "$url"
+    sh /usr/local/bin/nixenv-entrypoint sh -c '
+      rm -f "$NIXENV_APP_MOUNT/.keep" 2>/dev/null
+      # `--` so a URL starting with "-" is never read as an option (e.g. -u…
+      # would be --upload-pack, i.e. a command git runs).
+      if [ -n "$2" ]; then exec git clone --branch "$2" -- "$1" "$NIXENV_APP_MOUNT"; fi
+      exec git clone -- "$1" "$NIXENV_APP_MOUNT"' _ "$url" "$branch"
   ok "cloned into volume '$appv'"
 }
 
@@ -1945,12 +1978,12 @@ clone_repo() {
 #   usage: init <project> [git-repo-url]
 cmd_init() {
   local name="${1:-}"
-  [ -n "$name" ] || die "usage: $0 init <project> [git-repo-url] [--build] [--unrestricted] [--allow=host,…] [--app-path=/path]"
+  [ -n "$name" ] || die "usage: $0 init <project> [git-repo-url] [--branch=<name>] [--build] [--unrestricted] [--allow=host,…] [--app-path=/path]"
   valid_project_name "$name" || die "invalid project name: '$name'"
   shift
 
   local git_url="" do_build=0 do_open=0 app_mount="${APP_MOUNT:-}" allow_list="" \
-        template="" assume_yes=0 force=0 a
+        template="" assume_yes=0 force=0 branch="" a
   for a in "$@"; do
     case "$a" in
       --build) do_build=1;;
@@ -1959,12 +1992,20 @@ cmd_init() {
       # --allow=a.com,b.com (repeatable). Validated below, applied with the forge.
       --allow=*) allow_list="$allow_list $(printf '%s' "${a#*=}" | tr ',' ' ')";;
       --template=*) template="${a#*=}";;
+      --branch=*) branch="${a#*=}";;
+      --branch) die "use --branch=<name>";;
       --yes|-y) assume_yes=1;;
       --force) force=1;;
-      --*) die "unknown option: $a (usage: $0 init <project> [git-repo-url] [--template=<name|url|path>] [--build] [--unrestricted] [--allow=host,…] [--app-path=/path] [--force])";;
+      --*) die "unknown option: $a (usage: $0 init <project> [git-repo-url] [--branch=<name>] [--template=<name|url|path>] [--build] [--unrestricted] [--allow=host,…] [--app-path=/path] [--force])";;
       *) [ -z "$git_url" ] && git_url="$a" || die "unexpected argument: $a";;
     esac
   done
+
+  # --branch: checked before anything is created, like every other argument.
+  if [ -n "$branch" ]; then
+    [ -n "$git_url" ] || die "--branch needs a git URL to clone (init <project> <git-url> --branch=<name>)"
+    valid_git_branch "$branch" || die "invalid branch name: '$branch'"
+  fi
 
   # --- Refuse to touch an existing project ----------------------------------
   # Checked BEFORE anything is fetched, prompted for or created, so a typo'd
@@ -2048,7 +2089,7 @@ cmd_init() {
   configure_git_identity "$pdir"
   if [ -n "$git_url" ]; then
     configure_git_credentials "$pdir" "$git_url"
-    clone_repo "$git_url" "$name"
+    clone_repo "$git_url" "$name" "$branch"
   fi
 
   # Template: install as the project's flake.nix, then build it (the toolchain
@@ -4198,13 +4239,15 @@ Commands:
                             folder (flake.nix + local deps it references).
                             --dir is REMEMBERED per project, so later rebuilds
                             are just 'build <project>'; --dir= (empty) clears it
-  init <project> [git-url] [--template=<name|url|path>] [--build]
-       [--unrestricted] [--allow=host,…] [--app-path=/path] [--yes] [--force]
+  init <project> [git-url] [--branch=<name>] [--template=<name|url|path>]
+       [--build] [--unrestricted] [--allow=host,…] [--app-path=/path] [--yes] [--force]
                             Fails if <project> already exists (--force re-runs
                             the scaffold, keeping volumes and the SSH port).
                             Scaffold <project>/home + the <project>_app volume;
                             prompts for git name/email; clones git-url if given
                             (the forge domain is auto-added to allowed_hosts).
+                            --branch=<name> clones that branch (or tag) instead
+                            of the repository's default one.
                             --template=<t> installs a ready-to-run stack: ONE
                             file that becomes the project's flake.nix, declaring
                             the toolchain + a startup hook that installs the app

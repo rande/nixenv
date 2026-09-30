@@ -2,21 +2,40 @@
 
 Pushing a `vX.Y.Z` tag is the whole release. `.github/workflows/release.yml`
 verifies it, publishes a GitHub release, and updates the Homebrew tap.
+`./release.sh` drives all of it from your machine:
 
 ```sh
 # 1. bump the version IN the script — it is the single source of truth
 sed -i '' 's/^NIXENV_VERSION=.*/NIXENV_VERSION="0.2.0"/' nixenv.sh
+git commit -am "release 0.2.0" && git push
 
-# 2. prove it's releasable locally (the workflow runs the same suite)
+# 2. release
+./release.sh
+```
+
+`release.sh` checks you're on `main`, clean and pushed, that the version matches
+and the unit tests pass; asks once; pushes the tag; follows the **release**
+workflow with `gh` (printing the failing log if it breaks); then publishes the
+formula — to this repo and to the tap, which it clones into `./homebrew-nixenv/`
+(git-ignored). If the workflow's own formula job already did that (`TAP_TOKEN`
+set), those steps are no-ops.
+
+It's safe to re-run: it resumes where it stopped, and does nothing once the
+release is complete. If a release failed and you've pushed a fix, move the tag
+with `./release.sh --retag` (it also deletes the failed GitHub release, after
+confirming). `--yes` skips the prompt. It needs `git` and `curl`; `gh` (logged
+in) lets it follow the workflow instead of just waiting for the release page.
+
+Doing it by hand instead:
+
+```sh
 ./tests/run.sh
-
-# 3. commit, then tag
-git commit -m "release 0.2.0"
 git tag -a v0.2.0 -m "nixenv 0.2.0"
 git push && git push --tags
 ```
 
-Then watch **Actions → release**. That's it — steps 4+ are automatic.
+Then watch **Actions → release**; the rest is automatic when `TAP_TOKEN` is
+set (otherwise see "Manual fallback" below).
 
 ---
 

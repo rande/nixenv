@@ -29,6 +29,12 @@ export GITHUB_TOKEN_FILE="$NIXTEST_HOME/github_token"
 export GITHUB_TOKEN_SKIP="$NIXTEST_HOME/github_token.skip"
 unset GITHUB_TOKEN
 export CONTEXT_DIR="$NIXTEST_HOME/context"
+# The remembered engine choice too: with BOTH docker and podman on PATH and no
+# choice yet (the dev project — dev/flake.nix wraps both clients), nixenv asks
+# which to use. Unit tests send output to /dev/null, so that prompt was
+# invisible and the suite just hung; and answering it wrote the user's real
+# ~/.nixenv/engine.
+export ENGINE_FILE="$NIXTEST_HOME/engine"
 export CONTAINER_PREFIX="nxt"                 # containers nxt-*, volumes nxt_*, nets nxt_*
 export PROXY_HTTP_PORT=18080 PROXY_HTTPS_PORT=18443
 export PROXY_MKCERT_INSTALL=0                 # never touch trust stores in tests
@@ -56,7 +62,14 @@ assert_file()      { [ -f "$1" ] || fail "${2:-assert_file}: missing file $1"; }
 assert_no_file()   { [ ! -e "$1" ] || fail "${2:-assert_no_file}: $1 should not exist"; }
 
 # Run nixenv as a COMMAND (fresh process, isolated env above applies).
-nx() { bash "$NIXENV_SH" "$@"; }
+# A terminal stdin is detached: a test must never block on an interactive prompt
+# (its output usually goes to /dev/null, so you wouldn't even see it). Piped
+# stdin is kept — `printf 'y\n' | nx delete …` is how tests answer prompts.
+nx() {
+  if [ -t 0 ]; then bash "$NIXENV_SH" "$@" </dev/null
+  else bash "$NIXENV_SH" "$@"
+  fi
+}
 
 # Source nixenv.sh for unit tests (functions defined, nothing executed).
 source_nixenv() {

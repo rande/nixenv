@@ -1,0 +1,15 @@
+# Per-project working dirs — contain SSH keys, repos, local state.
+/projects/
+
+# Nix
+/result
+/result-*
+
+# Homebrew tap clone used by release.sh (a separate repository)
+/homebrew-nixenv/
+
+# project exports — they contain client code and data
+nixenv-*.tar
+
+# macOS Finder metadata
+.DS_Store
