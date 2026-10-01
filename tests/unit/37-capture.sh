@@ -167,6 +167,33 @@ assert_contains "$eg_fn" '--network-alias "$EGRESS_LINK"'
 assert_contains "$eg_fn" 'container_hardening_args' "egress container hardened"
 up_fn="$(printf '%s' "$body" | sed -n '/^egress_up()/,/^}/p' | code_only)"
 assert_not_contains "$up_fn$eg_fn" '-p "127.0.0.1:' "egress container publishes nothing (UI goes through Caddy)"
+assert_contains "$eg_fn" '--label "$EGRESS_SUM_LABEL=$(egress_script_sum)"' "egress container records its script"
+# A running egress container is reloaded only while it runs the CURRENT egress.sh:
+# the script is read once at start, so an older one (no/other label) must be
+# recreated, or e.g. the link-subnet fix never reaches it (502 on capture).
+eu_log="$NIXTEST_HOME/egress-up.log"
+(
+  EGRESS_PROJECTS=" alpha"
+  ensure_egress_net() { :; }
+  egress_connect_nets() { :; }
+  egress_reload() { echo reload >> "$eu_log"; }
+  egress_run() { echo run >> "$eu_log"; }
+  container_running() { [ "$1" = "$EGRESS_NAME" ]; }
+  docker() {
+    case "$1" in
+      port) ;;
+      inspect) printf '%s\n' "${FAKE_LABEL:-}";;
+      rm) ;;
+    esac
+  }
+  ENGINE=docker
+  : > "$eu_log"; FAKE_LABEL="";                    egress_up >/dev/null 2>&1
+  assert_eq "$(cat "$eu_log")" "run" "unlabelled (pre-fix) egress container is recreated"
+  : > "$eu_log"; FAKE_LABEL="$(egress_script_sum)"; egress_up >/dev/null 2>&1
+  assert_eq "$(cat "$eu_log")" "reload" "current egress.sh → reload in place"
+  : > "$eu_log"; FAKE_LABEL="1-2";                 egress_up >/dev/null 2>&1
+  assert_eq "$(cat "$eu_log")" "run" "changed egress.sh → recreated"
+) || fail "egress_up staleness check"
 cap_fn="$(printf '%s' "$body" | sed -n '/^cmd_capture()/,/^}/p' | code_only)"
 assert_contains "$cap_fn" 'capture_ui_url "$name"' "capture web prints the Caddy URL"
 assert_not_contains "$(printf '%s' "$body" | code_only)" 'CAPTURE_WEB_PORT' "no host-published UI port left"

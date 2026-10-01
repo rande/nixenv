@@ -1165,9 +1165,17 @@ egress_up() {
   ensure_egress_net
   if container_running "$EGRESS_NAME" \
      && ! "$ENGINE" port "$EGRESS_NAME" 2>/dev/null | grep -q .; then
-    egress_connect_nets
-    egress_reload && return 0
-    warn "recreating '$EGRESS_NAME'"
+    if [ "$(egress_script_sum)" != "$("$ENGINE" inspect -f "{{index .Config.Labels \"$EGRESS_SUM_LABEL\"}}" "$EGRESS_NAME" 2>/dev/null)" ]; then
+      # egress.sh is read ONCE, at container start (capture_loop lives in that
+      # shell's memory), so a rewritten script never reaches a running
+      # container: one predating the link-subnet fix kept binding mitmweb and
+      # the ingress listeners to 127.0.0.1 — 502 on <p>-<port> and <p>-mitm.
+      log "egress startup script changed — recreating '$EGRESS_NAME'"
+    else
+      egress_connect_nets
+      egress_reload && return 0
+      warn "recreating '$EGRESS_NAME'"
+    fi
   fi
   "$ENGINE" rm -f "$EGRESS_NAME" >/dev/null 2>&1 || true
   mkdir -p "$EGRESS_DATA_DIR"
@@ -1175,10 +1183,17 @@ egress_up() {
   egress_run || die "failed to start the egress proxy '$EGRESS_NAME'"
   egress_connect_nets
 }
+# Checksum of the egress.sh a container runs, stored as a label at creation
+# so egress_up can tell when the running one is stale. cksum: POSIX, on macOS too.
+EGRESS_SUM_LABEL="nixenv.egress-sh"
+egress_script_sum() {
+  cksum < "$PROXY_DIR/egress/egress.sh" 2>/dev/null | awk '{print $1 "-" $2}'
+}
 egress_run() {
   "$ENGINE" rm -f "$EGRESS_NAME" >/dev/null 2>&1 || true
   "$ENGINE" run -d \
     --name "$EGRESS_NAME" \
+    --label "$EGRESS_SUM_LABEL=$(egress_script_sum)" \
     --network "$EGRESS_NET" \
     --network-alias "$EGRESS_LINK" \
     --user "$(id -u):$(id -g)" \
