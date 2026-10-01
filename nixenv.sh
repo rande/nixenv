@@ -373,9 +373,9 @@ chmod 700 "$HOME_DIR/.ssh" 2>/dev/null || true
 # https://*.<proxy domain> is TRUSTED inside the container — curl, PHP, Node,
 # Python, git all read one of the vars exported below. Falls back to the store
 # bundle untouched when no proxy CA is mounted.
-# /etc/nixenv-capture-ca.crt is mitmproxy's CA, mounted only while 'nixenv
-# capture' is on for this project: it is what lets the egress container read
-# this project's HTTPS. Capture off + restart = no longer trusted.
+# /etc/nixenv-capture-ca.crt is mitmproxy's CA, mounted once 'nixenv capture'
+# has been on for this project: it is what lets the egress container read this
+# project's HTTPS. 'capture untrust' + restart = no longer trusted.
 _NIXENV_CA_BUNDLE="$PROFILE/etc/ssl/certs/ca-bundle.crt"
 _NIXENV_NODE_CA=""
 _extra_cas=""
@@ -1230,7 +1230,8 @@ container_needs_recreate() {
     warn "'$name' still points at the OLD egress proxy (squid now runs in '$EGRESS_NAME') — it has no network"
     stale=1
   fi
-  if [ "$restricted" = 1 ] && project_captures "$name" egress && ! printf '%s' "$mounts" | grep -q '/etc/nixenv-capture-ca.crt'; then
+  if [ "$restricted" = 1 ] && capture_ca_trusted "$name" && [ -s "$EGRESS_DATA_DIR/mitmproxy/mitmproxy-ca-cert.pem" ] \
+     && ! printf '%s' "$mounts" | grep -q '/etc/nixenv-capture-ca.crt'; then
     warn "'$name' does not trust the capture CA yet — its HTTPS requests fail while capture is on"
     stale=1
   fi
@@ -2570,10 +2571,15 @@ cmd_run() {
   # trust https://*.$PROXY_DOMAIN. The entrypoint merges it into a CA bundle.
   [ -f "$PROXY_DIR/certs/rootCA.pem" ] && hostsmount+=(-v "$PROXY_DIR/certs/rootCA.pem:/etc/nixenv-proxy-ca.crt:ro")
   # 'capture' on: trust mitmproxy's CA, or every HTTPS request fails its check.
-  # ONLY then — trusting it is what lets the egress container read the traffic.
+  # Trusting it is what lets the egress container read the traffic, so it is
+  # mounted only for a project that has captured (capture_ca_trusted). Wait for
+  # the CA only while capturing: with capture off mitmproxy isn't running and
+  # would never write it.
   local capca="$EGRESS_DATA_DIR/mitmproxy/mitmproxy-ca-cert.pem"
-  if [ "$restricted" = 1 ] && project_captures "$name" egress; then
-    capture_wait_ca || warn "capture CA not ready yet — HTTPS from '$name' will fail until '$0 stop $name && $0 run $name'"
+  if [ "$restricted" = 1 ] && capture_ca_trusted "$name"; then
+    if project_captures "$name" egress; then
+      capture_wait_ca || warn "capture CA not ready yet — HTTPS from '$name' will fail until '$0 stop $name && $0 run $name'"
+    fi
     [ -f "$capca" ] && hostsmount+=(-v "$capca:/etc/nixenv-capture-ca.crt:ro")
   fi
 
@@ -2925,7 +2931,7 @@ cmd_egress() {
 
 # =============================================================================
 # capture — record a restricted project's HTTP(S) traffic with mitmproxy.
-#   usage: capture <project> [on [egress|ingress]|off|status|web|log [-f]|tui|har <file>|clear]
+#   usage: capture <project> [on [egress|ingress]|off|untrust|status|web|log [-f]|tui|har <file>|clear]
 # =============================================================================
 # mitmproxy runs in the egress container BEHIND squid: squid still decides what
 # a project may reach (and refuses the rest without resolving it); only allowed
@@ -2935,7 +2941,7 @@ cmd_egress() {
 # through mitmproxy on the way in. Files: $EGRESS_DATA_DIR/captures/<p>.{flows,log}.
 cmd_capture() {
   local name="${1:-}" sub="${2:-status}"
-  [ -n "$name" ] || die "usage: $0 capture <project> [on [egress|ingress]|off|status|web|log [-f]|tui|har <file>|clear]"
+  [ -n "$name" ] || die "usage: $0 capture <project> [on [egress|ingress]|off|untrust|status|web|log [-f]|tui|har <file>|clear]"
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
   local pdir; pdir="$(project_dir "$name")"
   [ -d "$pdir" ] || die "unknown project '$name' — run '$0 init $name' first"
@@ -2959,6 +2965,8 @@ ingress";;
           test -x "$PROFILE/bin/mitmweb" >/dev/null 2>&1 \
         || die "mitmproxy is not in the shared store yet — run '$0 build' (or '$0 update') first"
       printf '%s\n' "$dirs" > "$pdir/capture"
+      # Keep trusting the CA after 'off', so the NEXT capture needs no restart.
+      project_captures "$name" egress && : > "$pdir/capture-trust"
       warn "Captures record EVERYTHING that crosses the wire — tokens, cookies, git"
       warn "credentials included. They stay on this machine (owner-only): $cdir"
       capture_apply "$name"
@@ -2966,6 +2974,7 @@ ingress";;
       if project_captures "$name" egress && container_running "$(container_name "$name")" \
          && ! container_needs_recreate "$name" 1 >/dev/null 2>&1; then
         warn "'$name' must restart to trust the capture CA — until then its HTTPS requests FAIL"
+        log  "(one time only: it keeps trusting the CA from now on — '$0 capture $name untrust' revokes)"
         if confirm_tty "Restart '$name' now?"; then
           cmd_stop "$name" && cmd_run "$name"
         else
@@ -2979,13 +2988,24 @@ ingress";;
       rm -f "$pdir/capture"
       capture_apply "$name"
       ok "capture OFF for '$name' (recorded files kept — '$0 capture $name clear' deletes them)"
+      if capture_ca_trusted "$name"; then
+        log "'$name' keeps trusting the capture CA, so the next 'capture on' needs no restart"
+        log "    revoke: $0 capture $name untrust"
+      fi
+      ;;
+    untrust)
+      project_captures "$name" egress && die "egress capture is on for '$name' — '$0 capture $name off' first"
+      [ -f "$pdir/capture-trust" ] || { log "'$name' does not keep the capture CA"; return 0; }
+      rm -f "$pdir/capture-trust"
+      ok "'$name' no longer trusts the capture CA after its next restart"
       if container_running "$(container_name "$name")" 2>/dev/null; then
-        log "'$name' still trusts the capture CA until it restarts ($0 stop $name && $0 run $name)"
+        echo "    apply it with: $0 stop $name && $0 run $name"
       fi
       ;;
     status)
       if [ -f "$pdir/capture" ]; then ok "capture ON for '$name' ($(capture_directions "$name"))"
       else log "capture OFF for '$name'"; fi
+      [ -f "$pdir/capture-trust" ] && echo "   trusts the capture CA (kept after the first capture; '$0 capture $name untrust' revokes)"
       [ -f "$flows" ] && echo "   flows: $flows ($(wc -c < "$flows" | tr -d ' ') bytes)"
       [ -f "$logf" ]  && echo "   log:   $logf ($(wc -l < "$logf" | tr -d ' ') requests)"
       return 0
@@ -3035,7 +3055,7 @@ ingress";;
       if resolve_engine 2>/dev/null && container_running "$EGRESS_NAME"; then capture_restart; fi
       ok "deleted the captures of '$name' (the UI restarted: its view of every project is cleared)"
       ;;
-    *) die "usage: $0 capture <project> [on [egress|ingress]|off|status|web|log [-f]|tui|har <file>|clear]";;
+    *) die "usage: $0 capture <project> [on [egress|ingress]|off|untrust|status|web|log [-f]|tui|har <file>|clear]";;
   esac
 }
 
@@ -3388,6 +3408,16 @@ project_captures() {
   [ -f "$f" ] || return 1
   grep -q '[a-z]' "$f" || return 0
   grep -qw -- "$2" "$f"
+}
+
+# Whether <project>'s container trusts the capture CA: while egress capture is
+# on, and — dev-only trade-off — for good once it has been on (the marker
+# <project>/capture-trust, written by 'capture on'). Trust needs a restart to
+# change, and that restart killed whatever ran in the container (a Claude
+# session); this way only the FIRST capture costs one. 'capture untrust' + a
+# restart revokes it. Not in EXPORT_META_FILES: trust is decided per machine.
+capture_ca_trusted() {
+  [ -f "$(project_dir "$1")/capture-trust" ] || project_captures "$1" egress
 }
 
 # The directions <project> captures, as words ("egress ingress").
@@ -5057,12 +5087,13 @@ Commands:
                             <project>/allowed_hosts and reload the proxy
   egress <project> [-f]     Show the project's egress log: allowed vs DENIED
                             domains (candidates to validate); -f follows live
-  capture <project> [on [egress|ingress]|off|status|web|log [-f]|tui|har <file>|clear]
+  capture <project> [on [egress|ingress]|off|untrust|status|web|log [-f]|tui|har <file>|clear]
                             Record a RESTRICTED project's HTTP(S) traffic with
                             mitmproxy, behind squid (its rules still apply).
                             'egress' = its outbound requests (HTTPS decrypted: the
-                            container trusts mitmproxy's CA while capture is on,
-                            restart it after 'on'); 'ingress' = requests to its
+                            container trusts mitmproxy's CA — restart it after
+                            the FIRST 'on'; the trust is then kept across 'off'
+                            until 'untrust'); 'ingress' = requests to its
                             public URLs (via Caddy). Default: both.
                             'web' prints the mitmweb UI URL (<project>-mitm.$PROXY_DOMAIN),
                             'log -f' follows a one-line-per-request log, 'tui'

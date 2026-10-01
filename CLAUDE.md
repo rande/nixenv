@@ -417,7 +417,7 @@ the forge host, no file = old behaviour), and denies to
   hot-reloads caddy (`caddy reload`) + squid (`-k reconfigure`) without
   recreating the container; new relays/published ports still need `proxy up`.
   `accept-from` is in `EXPORT_META_FILES`. Tests: unit `07`, integration `16`.
-- **Traffic capture (`capture <p> on [egress|ingress]|off|status|web|log [-f]|tui|har|clear`).**
+- **Traffic capture (`capture <p> on [egress|ingress]|off|untrust|status|web|log [-f]|tui|har|clear`).**
   mitmproxy (base flake; a Python app but nixpkgs wraps it — only `mitm*` on
   PATH) runs in the EGRESS container, supervised by `egress.sh`'s
   `capture_loop`, BEHIND squid — never instead of it: squid keeps every
@@ -457,9 +457,15 @@ the forge host, no file = old behaviour), and denies to
   loop restarts it. A project trusts the capture CA (mitmproxy writes
   `egress-data/mitmproxy/mitmproxy-ca-cert.pem` on first start;
   `capture_wait_ca`) only via `cmd_run` mounting it at
-  `/etc/nixenv-capture-ca.crt` while egress capture is on; the entrypoint
+  `/etc/nixenv-capture-ca.crt` when `capture_ca_trusted`: egress capture on, OR
+  the `<project>/capture-trust` marker that `capture on` writes. That marker is a
+  deliberate DEV-ONLY trade-off: trust is fixed at container creation, and the
+  restart it costs killed whatever ran inside (a Claude session), so only the
+  FIRST capture restarts; `capture untrust` + restart revokes (not exported).
+  `cmd_run` waits for the CA only while capturing (mitmproxy isn't running
+  otherwise). The entrypoint
   merges every extra CA into the bundle and into ONE `NODE_EXTRA_CA_CERTS`
-  file. So `capture on` needs a restart (it offers one). `delete` removes the
+  file. So the first `capture on` needs a restart (it offers one). `delete` removes the
   captures. Tests: unit `37` (+ `tests/capture_addon_test.py`, the addon
   against a stub mitmproxy), integration `19` (`NIXENV_TEST_PROFILE` = a profile
   with mitmproxy, when the shared one predates it).

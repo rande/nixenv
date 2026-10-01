@@ -183,7 +183,7 @@ interactive `zsh` via `docker exec` (no SSH key needed).
 - `restrict <project> [on|off]` / `allow <project> <host>…` /
   `egress <project> [-f]` — egress restriction to validated hosts only, ON by
   default (see [Egress restriction](#egress-restriction-default-validated-hosts-only)).
-- `capture <project> [on|off|web|log -f|tui|har <file>|clear]` — record a
+- `capture <project> [on|off|untrust|web|log -f|tui|har <file>|clear]` — record a
   restricted project's HTTP(S) traffic with mitmproxy, with a web UI and CLI
   views (see [Capturing traffic](#capturing-traffic-capture)).
 - `proxy [up|reload|stop|status|logs [egress]|renew|remove-cert]` — shared HTTPS
@@ -660,8 +660,11 @@ nixenv capture myapp clear         # delete the recordings
 - **Egress** — the project's outbound requests. mitmproxy sits *behind* squid,
   so the allowlist still decides first: a refused host gets its 403 and never
   reaches mitmproxy (or its DNS). HTTPS is decrypted, which only works because
-  the container trusts mitmproxy's CA while capture is on — after `capture on`
-  the project must restart once (`capture on` offers to do it). Apps that pin
+  the container trusts mitmproxy's CA — after the FIRST `capture on` the
+  project must restart once (`capture on` offers to do it). It then keeps
+  trusting the CA across `capture off`, so later captures need no restart (and
+  don't kill a running shell or Claude session); `nixenv capture myapp untrust`
+  plus a restart revokes it. Apps that pin
   certificates will refuse the connection; that shows as `TLS-REFUSED` in the
   log. ssh and `git://` are never captured.
 - **Ingress** — requests to the project's public URLs
