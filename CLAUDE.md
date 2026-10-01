@@ -25,7 +25,8 @@ nvim packs in the home skeleton mirror this (bash/lua only). Unit test
 `02-materialize-context.sh` enforces both lists, so don't reintroduce runtimes
 into the embedded flake. Note `claude-code` and the two language servers are
 node applications, but nixpkgs wraps them with their own interpreter — they work
-without Node on PATH.
+without Node on PATH. Same for `mitmproxy` (Python, for `capture`): only its
+`mitm*` wrappers land on PATH, no `python`.
 
 ## Single source of truth
 
@@ -317,19 +318,38 @@ To change any embedded file, edit the corresponding heredoc inside `nixenv.sh`.
   — kernel-enforced no-route-out — with NO published ports (`-p` doesn't work on
   internal networks); its ssh/extra ports are published by the PROXY container and
   socat-relayed over the internal net. The only way out is a single shared
-  **squid** (in the base flake, running inside the proxy container on
-  `EGRESS_PORT` 3128, not published) with per-project ACLs keyed by the internal
+  **squid** (in the base flake, running in its OWN container `${PREFIX}-egress`
+  = `EGRESS_NAME` on `EGRESS_PORT` 3128, not published) with per-project ACLs keyed by the internal
   net's subnet (`net_subnet` — docker `.IPAM.Config` / podman `.Subnets`),
   default-deny, CONNECT limited to 443/22/80/9418 (and port 22 only to the hosts
 in `<project>/ssh_hosts` when that file exists — SEC-11; `init` writes it with
 the forge host, no file = old behaviour), and denies to
   loopback/RFC1918 so projects can't reach other containers through the proxy.
-  `write_egress_configs` generates `~/.nixenv/proxy/egress/{squid.conf,start.sh}`
-  (start.sh = squid + socat relays + exec caddy — the proxy container's cmd) and
-  fills `EGRESS_PUB`/`EGRESS_PROJECTS`; `cmd_proxy up` mounts it at `/etc/egress`,
-  publishes the relay ports, and `network connect`s the proxy to every restricted
-  project's internal net (so caddy ingress keeps working too). `cmd_run` passes
-  `-e NIXENV_EGRESS_PROXY=http://<proxy>:3128`; the **entrypoint** then exports
+  `write_egress_configs` generates `~/.nixenv/proxy/egress/{squid.conf,start.sh,
+  egress.sh,capture.conf,nixenv_capture.py}` (start.sh = socat relays + exec
+  caddy — the PROXY container's cmd; egress.sh = mitmproxy loop + exec squid —
+  the EGRESS container's cmd) and fills `EGRESS_PUB`/`EGRESS_PROJECTS`; both
+  containers mount it at `/etc/egress`. **Two containers (split from one):**
+  `egress_up` starts `${PREFIX}-egress` on its own network `EGRESS_NET`
+  (`${PROXY_NET}-egress`, outbound; ONLY it and Caddy join it, Caddy via
+  alias `EGRESS_LINK` = `${PREFIX}__egress-link` — `__` so no project's
+  container name can shadow it) and `network connect`s it to every restricted
+  internal net. It is NOT recreated by `proxy up`/`reload` — squid reloads,
+  mitmproxy restarts in place — only when missing or when the capture UI port
+  must appear/disappear; so recreating Caddy (every restricted `run` does, for
+  its relays) no longer cuts egress. `proxy up` brings egress up FIRST.
+  'egress' is a reserved project name. Its data dir is `EGRESS_DATA_DIR`
+  (`~/.nixenv/proxy/egress-data`, 700) — separate from Caddy's `/data` so the
+  container parsing untrusted traffic never mounts Caddy's CA key. `cmd_proxy up`
+  publishes the relay ports on the PROXY container and connects it to every
+  restricted internal net (caddy ingress) and to `EGRESS_NET`. `cmd_run` passes
+  `-e NIXENV_EGRESS_PROXY=http://<egress>:3128`. **Migration:** that `-e` is
+  fixed at creation, and the entrypoint's `.npmrc`/`.yarnrc`/`.ssh/config`
+  blocks are written once into the home volume, so the entrypoint records the
+  address in `~/.nixenv-egress-proxy` and, when it changes, rewrites the old
+  address in those files in place; `container_needs_recreate` (in `cmd_run`'s
+  already-running branch) warns about a container still pointing at the old
+  `<prefix>-proxy:3128`; the **entrypoint** then exports
   HTTP(S)_PROXY into `.zshenv` and appends a marker-guarded `ProxyCommand socat -
   PROXY:…` block to `~/.ssh/config` (ssh/git-ssh tunnel via CONNECT to validated
   hosts). **Ordering matters**: `cmd_run` starts the proxy BEFORE the container
@@ -344,9 +364,10 @@ the forge host, no file = old behaviour), and denies to
   is also why `write_egress_configs` must never `rm -rf` the bind-mounted egress
   dir: replacing the dir inode would detach the mount and reloads would read
   stale config). Squid's access log is host-visible at
-  `~/.nixenv/proxy/data/egress.log`; `egress <p> [-f]` summarises allowed vs
+  `~/.nixenv/proxy/egress-data/egress.log` (`cmd_egress` falls back to the old
+  `proxy/data/egress.log`); `egress <p> [-f]` summarises allowed vs
   `TCP_DENIED` domains (filtered by the project's subnet). `delete` also removes
-  the internal network (disconnecting the proxy first). **Refused names must never be
+  the internal network (disconnecting both proxies first). **Refused names must never be
   resolved (SEC-05).** squid stops at the first matching `http_access` rule and
   ANDs a rule's ACLs left to right, and a `dst` ACL resolves the hostname — so
   the old order (`deny to_localnets` first) looked up EVERY requested name, and
@@ -388,13 +409,55 @@ the forge host, no file = old behaviour), and denies to
   source address differs per engine (docker gateway, Docker Desktop, rootless
   podman), and unrestricted projects share flat `nixenv_net` and can hit
   `nixenv-<other>:<port>` directly anyway. The proxy's socat port relays were the
-  second path in: they now bind `RELAY_BIND` = the proxy's first `hostname -I`
-  address (eth0 = `$PROXY_NET`, where published ports land); internal nets are
-  eth1+ and have no route to it. `proxy reload` regenerates both configs and
+  second path in: they now bind `RELAY_BIND` = the proxy's address INSIDE
+  `$PROXY_NET`'s subnet (where published ports land), picked by `pick_addr`
+  (`pick_addr_fn` emits it into the generated scripts) — by SUBNET, not
+  position: after a container restart `hostname -I` can list an internal net
+  first. Falls back to the first address. Internal nets have no route to it. `proxy reload` regenerates both configs and
   hot-reloads caddy (`caddy reload`) + squid (`-k reconfigure`) without
   recreating the container; new relays/published ports still need `proxy up`.
   `accept-from` is in `EXPORT_META_FILES`. Tests: unit `07`, integration `16`.
-- Shared reverse proxy (`cmd_proxy`, `nixenv proxy up|reload|stop|status|logs`): a single
+- **Traffic capture (`capture <p> on [egress|ingress]|off|status|web|log [-f]|tui|har|clear`).**
+  mitmproxy (base flake; a Python app but nixpkgs wraps it — only `mitm*` on
+  PATH) runs in the EGRESS container, supervised by `egress.sh`'s
+  `capture_loop`, BEHIND squid — never instead of it: squid keeps every
+  SEC-05/06/11 property, and a refused name never reaches mitmproxy.
+  `<project>/capture` lists directions (empty = both); restricted projects only
+  (an unrestricted one has no proxy in its path). NOT in `EXPORT_META_FILES`.
+  Per captured project n: egress listener `CAPTURE_EGRESS_BASE+n` on
+  **127.0.0.1** (squid's `cache_peer … name=cap_X` with `cache_peer_access`/
+  `never_direct allow p_X !nocapture_ports` — src+port ACLs only, so no new DNS;
+  `never_direct` = fail CLOSED; ports 22/9418 stay direct). Bound anywhere else,
+  a project could use it as a proxy and skip squid. Ingress listener
+  `CAPTURE_INGRESS_BASE+n` on the egress container's `EGRESS_NET` address;
+  Caddy routes `@cap_X` (inside `route{}`, after the SEC-06 denies, before the
+  generic route) via `transport http { forward_proxy_url
+  http://$EGRESS_LINK:<port> }`. Caddy sends the PUBLIC host as the proxy
+  target, not the upstream, so it sets `X-Nixenv-Upstream <prefix>-X:<port>`
+  (overwriting any client value) and the addon routes on it, accepting only
+  that project's container, and restores the public Host. `capture.conf`
+  (`egress|ingress <p> <port> [container]`, `link <subnet>`) drives both
+  egress.sh and the addon `nixenv_capture.py` (generated by
+  `write_capture_files`), which: tags flows (`flow.comment` = "<p> <dir>",
+  mitmweb filter `~comment <p>`); appends `captures/<p>.flows` + a one-line
+  `<p>.log` (umask 077); kills ingress connections not from the link subnet;
+  re-resolves egress names and refuses ANY non-global answer, pinning the
+  checked IP (DNS rebinding between squid's lookup and mitmproxy's); never
+  buffers `text/event-stream`. mitmweb UI: `web_host` = link address (never a
+  project-facing one), password = `egress-data/mitmweb.token` (`capture web`
+  prints `?token=`), host-published `127.0.0.1:CAPTURE_WEB_PORT` only while
+  something is captured. `write_capture_files` sets `CAPTURE_CHANGED` only when
+  capture.conf changes; `egress_reload` then kills mitmproxy (pid file) and the
+  loop restarts it. A project trusts the capture CA (mitmproxy writes
+  `egress-data/mitmproxy/mitmproxy-ca-cert.pem` on first start;
+  `capture_wait_ca`) only via `cmd_run` mounting it at
+  `/etc/nixenv-capture-ca.crt` while egress capture is on; the entrypoint
+  merges every extra CA into the bundle and into ONE `NODE_EXTRA_CA_CERTS`
+  file. So `capture on` needs a restart (it offers one). `delete` removes the
+  captures. Tests: unit `37` (+ `tests/capture_addon_test.py`, the addon
+  against a stub mitmproxy), integration `19` (`NIXENV_TEST_PROFILE` = a profile
+  with mitmproxy, when the shared one predates it).
+- Shared reverse proxy (`cmd_proxy`, `nixenv proxy up|reload|stop|status|logs [egress]`): a single
   `${PREFIX}-proxy` Caddy container (caddy is in the base flake, run from the store)
   on a shared user network `PROXY_NET` (`nixenv_net`) that every project container
   auto-joins (`ensure_proxy_net` + `--network` in `cmd_run`). Caddy serves
@@ -803,7 +866,15 @@ rootful podman rejects it. ONE ENGINE PER NESTED PROJECT: the dev flake's
 `CONTAINER_ENGINE` set and `HOME=$real/.nixenv-dev/<engine>` — every nixenv
 state path follows `$HOME` (unit 35 asserts it), so each engine has its own
 projects, proxy dir and squid pid file; sharing one `~/.nixenv` between two
-engines would make their proxies fight over the same files. `examples/hello` is the nested smoke test (nginx on
+engines would make their proxies fight over the same files. All three dev
+wrappers also default `CONTAINER_PREFIX=nixdev` (`devPrefix`; explicit value
+wins), and `NIX_VOLUME` (`<prefix>__nixos_store`) and `PROXY_NET`
+(`<prefix>_net`, hence `EGRESS_NET`) derive from the prefix — so nested
+containers/volumes/networks/store can never collide with a hosted nixenv on a
+shared engine. Default prefix = the historical names. `tests/lib.sh` pins
+`NIX_VOLUME=nixenv__nixos_store` so the `nxt` suite keeps reusing the built
+store. The entrypoint gets the prefix as `NIXENV_CONTAINER_PREFIX` (NO_PROXY and
+the ssh `!<prefix>-*` bypass). `examples/hello` is the nested smoke test (nginx on
 0.0.0.0:8080, paths under `/home/app/.nixenv-run/hello`, `-e` for the pre-config
 error log). Tests: unit `35`, integration `18` (path identity through the
 sidecar). Review skills live in `.claude/skills/` (principal engineer, security,

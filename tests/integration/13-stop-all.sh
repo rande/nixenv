@@ -6,7 +6,7 @@ sweep; trap 'sweep; "$E" rm -f nixenv-test-bystander >/dev/null 2>&1 || true' EX
 require_store
 
 mkproj a --unrestricted
-mkproj b --unrestricted
+mkproj b                    # restricted: brings up the egress container too
 nx run a >/dev/null
 nx run b >/dev/null
 
@@ -22,6 +22,7 @@ nx stop >/dev/null || fail "stop (no args) failed"
 [ "$(running nxt-a)" = 0 ] || fail "project a still running after stop"
 [ "$(running nxt-b)" = 0 ] || fail "project b still running after stop"
 [ "$(running nxt-proxy)" = 0 ] || fail "proxy still running after stop"
+[ "$(running nxt-egress)" = 0 ] || fail "egress proxy still running after stop"
 [ "$(running nixenv-test-bystander)" = 1 ] || fail "stop killed an unrelated container!"
 
 # volumes must survive, and projects must restart cleanly

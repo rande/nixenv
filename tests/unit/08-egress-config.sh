@@ -45,9 +45,15 @@ assert_not_contains "$conf" "dns_v4_first" "no removed directives"
 assert_contains "$startsh" 'TCP-LISTEN:23456,fork,reuseaddr${RELAY_BIND:+,bind=$RELAY_BIND} TCP:nxt-alpha:2222' "ssh relay"
 assert_contains "$startsh" 'TCP-LISTEN:3000,fork,reuseaddr${RELAY_BIND:+,bind=$RELAY_BIND} TCP:nxt-alpha:3000' "bare port relay"
 assert_contains "$startsh" 'TCP-LISTEN:15432,fork,reuseaddr${RELAY_BIND:+,bind=$RELAY_BIND} TCP:nxt-alpha:5432' "mapped port relay"
-assert_contains "$startsh" "rm -f /data/run/squid.pid" "stale pidfile cleared"
 assert_contains "${EGRESS_PUB[*]}" "127.0.0.1:23456:23456"
 sh -n "$PROXY_DIR/egress/start.sh" || fail "start.sh parses"
+# squid runs in its OWN container (egress.sh), not next to caddy: recreating the
+# ingress proxy must not cut every restricted project off the network.
+egresssh="$(cat "$PROXY_DIR/egress/egress.sh")"
+assert_not_contains "$(code_only < "$PROXY_DIR/egress/start.sh")" "squid" "no squid in the caddy container"
+assert_contains "$egresssh" "rm -f /data/run/squid.pid" "stale pidfile cleared"
+assert_contains "$egresssh" 'exec "$PROFILE/bin/squid" -f /etc/egress/squid.conf -N' "squid is the egress container's PID 1"
+sh -n "$PROXY_DIR/egress/egress.sh" || fail "egress.sh parses"
 
 # guard: a running old-style container (own published ports) → relays skipped
 container_running() { return 0; }

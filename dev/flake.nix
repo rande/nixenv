@@ -71,11 +71,22 @@
             fi
           '';
 
+          # Everything the nested nixenv creates is named nixdev-* / nixdev_*
+          # (containers, volumes, networks, store volume), never nixenv-*: if
+          # the engine is ever the one running the HOSTED nixenv — a shared
+          # docker socket — a nested 'stop' or 'delete' can't reach the hosted
+          # containers. An explicit CONTAINER_PREFIX (the test suite's nxt)
+          # still wins.
+          devPrefix = ''
+            export CONTAINER_PREFIX="''${CONTAINER_PREFIX:-nixdev}"
+          '';
+
           # `nixenv` — the LOCAL ./nixenv.sh on PATH, so the checkout you're
           # editing is what runs (never a stale installed copy). Uses ~/.nixenv
           # and the engine remembered in ~/.nixenv/engine.
           nixenv = pkgs.writeShellScriptBin "nixenv" ''
             ${requireCheckout}
+            ${devPrefix}
             exec "${checkout}" "$@"
           '';
 
@@ -90,6 +101,7 @@
             if [ -z "''${NIXENV_DEV_REAL_HOME:-}" ]; then
               export NIXENV_DEV_REAL_HOME="$HOME"
             fi
+            ${devPrefix}
             export CONTAINER_ENGINE=${engine}
             export HOME="$NIXENV_DEV_REAL_HOME/.nixenv-dev/${engine}"
             mkdir -p "$HOME"

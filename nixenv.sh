@@ -36,7 +36,6 @@ CONTEXT_DIR="${CONTEXT_DIR:-$HOME/.nixenv/context}"  # embedded files written he
 FLAKE_DIR="${FLAKE_DIR:-$CONTEXT_DIR}"               # dir containing flake.nix
 HOME_SKEL="${HOME_SKEL:-$CONTEXT_DIR/home-skel}"     # project home template
 ENTRYPOINT_FILE="${ENTRYPOINT_FILE:-$CONTEXT_DIR/entrypoint.sh}"
-NIX_VOLUME="${NIX_VOLUME:-nixenv__nixos_store}"      # standalone Docker volume for /nix
 BUILDER_IMAGE="${BUILDER_IMAGE:-nixos/nix:2.32.8}"
 # Some source builds sandbox with bubblewrap (needs user namespaces the builder
 # can't create). Set to 1 to run the nix builder --privileged if you hit that.
@@ -48,6 +47,12 @@ PROFILE="${PROFILE:-/nix/var/nix/profiles/shared}"  # base profile path INSIDE /
 PROJECT_ATTR="${PROJECT_ATTR:-default}"              # flake output attr installed from a project repo
 SSHD_PORT="${SSHD_PORT:-2222}"                       # unprivileged in-container sshd port (non-root)
 CONTAINER_PREFIX="${CONTAINER_PREFIX:-nixenv}"       # container name = <prefix>-<project>
+# Every engine-side name follows the prefix — containers, volumes, networks AND
+# the store — so two prefixes on one engine share nothing ('stop' with no
+# project only sweeps its own). dev/flake.nix's wrappers use 'nixdev', so a
+# nested nixenv can never touch the hosted one. With the default prefix these
+# are the historical names.
+NIX_VOLUME="${NIX_VOLUME:-${CONTAINER_PREFIX}__nixos_store}"  # standalone Docker volume for /nix
 APP_USER="${APP_USER:-app}"                          # non-root user in the runtime container
 # Projects always live in ~/.nixenv/projects. NIXENV_PROJECTS_DIR exists ONLY for
 # the test suite (isolation) — it is intentionally not a documented user setting.
@@ -61,14 +66,22 @@ GITHUB_TOKEN_SKIP="${GITHUB_TOKEN_SKIP:-$HOME/.nixenv/github_token.skip}" # "don
 ENGINE=""                                            # resolved at runtime
 
 # --- Reverse proxy (nixenv proxy) --------------------------------------------
-PROXY_NET="${PROXY_NET:-nixenv_net}"                 # shared user network all projects join
+PROXY_NET="${PROXY_NET:-${CONTAINER_PREFIX}_net}"    # shared user network all projects join
 PROXY_NAME="${CONTAINER_PREFIX}-proxy"               # the Caddy proxy container name
 PROXY_DIR="${PROXY_DIR:-$HOME/.nixenv/proxy}"        # Caddyfile + certs + caddy data
 PROXY_DOMAIN="${PROXY_DOMAIN:-nixenv.localhost}"     # base domain: <project>-<port>.<PROXY_DOMAIN>
 PROXY_HTTP_PORT="${PROXY_HTTP_PORT:-80}"             # host port → caddy 8080 (use 8080 for podman rootless)
 PROXY_HTTPS_PORT="${PROXY_HTTPS_PORT:-443}"          # host port → caddy 8443 (use 8443 for podman rootless)
 PROXY_AUTOSTART="${PROXY_AUTOSTART:-1}"              # auto-start the proxy on 'run' (0 to disable)
-EGRESS_PORT="${EGRESS_PORT:-3128}"                   # squid egress port INSIDE the proxy container (not published)
+EGRESS_PORT="${EGRESS_PORT:-3128}"                   # squid egress port INSIDE the egress container (not published)
+EGRESS_NAME="${CONTAINER_PREFIX}-egress"             # egress container: squid (+ mitmproxy while capturing)
+EGRESS_NET="${EGRESS_NET:-${PROXY_NET}-egress}"      # its own outbound network; only it + Caddy join it
+EGRESS_LINK="${CONTAINER_PREFIX}__egress-link"       # its alias on EGRESS_NET ('__': no project can own it)
+EGRESS_DATA_DIR="${EGRESS_DATA_DIR:-$PROXY_DIR/egress-data}"  # squid log, captures, mitmproxy CA
+CAPTURE_WEB_PORT="${CAPTURE_WEB_PORT:-8081}"         # host port (127.0.0.1) of the mitmweb UI while capturing
+CAPTURE_WEB_IN_PORT=8081                             # mitmweb UI port inside the egress container
+CAPTURE_EGRESS_BASE=8100                             # + n: project n's egress listener (loopback, squid's peer)
+CAPTURE_INGRESS_BASE=8200                            # + n: project n's ingress listener (Caddy only)
 
 # --- Templates (init --template=<name|url|path>) ------------------------------
 # A template is ONE file: the project's flake.nix. Short names resolve against
@@ -189,7 +202,9 @@ materialize_context() {
               iputils      # ping
               dnsutils     # host, dig, nslookup
               caddy        # ingress reverse proxy for the shared 'nixenv proxy' container
-              squid        # egress allowlist proxy (restricted projects), runs in the proxy container
+              squid        # egress allowlist proxy (restricted projects), runs in the egress container
+              mitmproxy    # 'nixenv capture': records restricted projects' traffic, behind squid.
+                           # A Python app, but nixpkgs wraps it — no python on PATH.
               socat        # ssh-over-CONNECT ProxyCommand + tcp relays for restricted projects
               rsync
               jq
@@ -359,21 +374,29 @@ chmod 700 "$HOME_DIR/.ssh" 2>/dev/null || true
 # https://*.<proxy domain> is TRUSTED inside the container — curl, PHP, Node,
 # Python, git all read one of the vars exported below. Falls back to the store
 # bundle untouched when no proxy CA is mounted.
+# /etc/nixenv-capture-ca.crt is mitmproxy's CA, mounted only while 'nixenv
+# capture' is on for this project: it is what lets the egress container read
+# this project's HTTPS. Capture off + restart = no longer trusted.
 _NIXENV_CA_BUNDLE="$PROFILE/etc/ssl/certs/ca-bundle.crt"
 _NIXENV_NODE_CA=""
-if [ -f /etc/nixenv-proxy-ca.crt ]; then
-  if cat "$PROFILE/etc/ssl/certs/ca-bundle.crt" /etc/nixenv-proxy-ca.crt \
-       > "$HOME_DIR/.nixenv-ca-bundle.crt" 2>/dev/null; then
+_extra_cas=""
+for _ca in /etc/nixenv-proxy-ca.crt /etc/nixenv-capture-ca.crt; do
+  [ -f "$_ca" ] && _extra_cas="$_extra_cas $_ca"
+done
+if [ -n "$_extra_cas" ]; then
+  # shellcheck disable=SC2086
+  if cat "$PROFILE/etc/ssl/certs/ca-bundle.crt" $_extra_cas > "$HOME_DIR/.nixenv-ca-bundle.crt" 2>/dev/null \
+     && cat $_extra_cas > "$HOME_DIR/.nixenv-extra-ca.crt" 2>/dev/null; then
     _NIXENV_CA_BUNDLE="$HOME_DIR/.nixenv-ca-bundle.crt"
-    # Node ignores SSL_CERT_FILE; it needs NODE_EXTRA_CA_CERTS (the extra cert
-    # only, not the bundle).
-    _NIXENV_NODE_CA='export NODE_EXTRA_CA_CERTS="/etc/nixenv-proxy-ca.crt"'
+    # Node ignores SSL_CERT_FILE; it needs NODE_EXTRA_CA_CERTS (the extra certs
+    # only, not the bundle) — ONE file, hence the second concatenation.
+    _NIXENV_NODE_CA="export NODE_EXTRA_CA_CERTS=\"$HOME_DIR/.nixenv-extra-ca.crt\""
   fi
 fi
 export SSL_CERT_FILE="$_NIXENV_CA_BUNDLE" NIX_SSL_CERT_FILE="$_NIXENV_CA_BUNDLE"
 export CURL_CA_BUNDLE="$_NIXENV_CA_BUNDLE" REQUESTS_CA_BUNDLE="$_NIXENV_CA_BUNDLE"
 export GIT_SSL_CAINFO="$_NIXENV_CA_BUNDLE"
-[ -n "$_NIXENV_NODE_CA" ] && export NODE_EXTRA_CA_CERTS=/etc/nixenv-proxy-ca.crt
+[ -n "$_NIXENV_NODE_CA" ] && export NODE_EXTRA_CA_CERTS="$HOME_DIR/.nixenv-extra-ca.crt"
 
 # --- Shared profile + shell config available to every zsh --------------------
 # .zshenv is sourced for login and non-login shells alike. $PROFILE etc. are
@@ -427,7 +450,9 @@ if [ -n "${NIXENV_EGRESS_PROXY:-}" ]; then
     done < "$_hf"
   done
   # The project's own container name/hostname.
-  [ -n "${NIXENV_PROJECT:-}" ] && _noproxy="$_noproxy,$NIXENV_PROJECT,nixenv-$NIXENV_PROJECT"
+  # (container names are <prefix>-<name>; the prefix is passed in by 'run')
+  _cpfx="${NIXENV_CONTAINER_PREFIX:-nixenv}"
+  [ -n "${NIXENV_PROJECT:-}" ] && _noproxy="$_noproxy,$NIXENV_PROJECT,$_cpfx-$NIXENV_PROJECT"
 
   # Export in THIS process too, so runit project services (php-fpm, workers, …)
   # inherit the proxy env — they never source .zshenv.
@@ -444,6 +469,27 @@ export no_proxy="$_noproxy"
 EOF
   _ep="${NIXENV_EGRESS_PROXY#http://}"; _ep="${_ep%/}"
   _ephost="${_ep%%:*}"; _epport="${_ep##*:}"
+  # The blocks below are written ONCE (marker-guarded) into the home volume, so
+  # they keep the egress address they were written with. When it changes
+  # (squid moved from <prefix>-proxy to <prefix>-egress), rewrite the old
+  # address in place — otherwise yarn/npm/ssh would keep using a proxy that no
+  # longer exists. The previous address: our record, else the old .npmrc block.
+  _prev="$(cat "$HOME_DIR/.nixenv-egress-proxy" 2>/dev/null || true)"
+  [ -n "$_prev" ] || _prev="$(sed -n '/^# nixenv-egress/,/^noproxy=/s/^https-proxy=//p' "$HOME_DIR/.npmrc" 2>/dev/null | head -n 1)"
+  if [ -n "$_prev" ] && [ "$_prev" != "$NIXENV_EGRESS_PROXY" ]; then
+    _pp="${_prev#http://}"; _pp="${_pp%/}"; _phost="${_pp%%:*}"; _pport="${_pp##*:}"
+    for _f in "$HOME_DIR/.npmrc" "$HOME_DIR/.yarnrc" "$HOME_DIR/.ssh/config"; do
+      [ -f "$_f" ] || continue
+      # cat > (not mv): keep the file's inode, mode and owner.
+      sed -e "s#$_prev#$NIXENV_EGRESS_PROXY#g" \
+          -e "s#PROXY:$_phost:%h:%p,proxyport=$_pport#PROXY:$_ephost:%h:%p,proxyport=$_epport#" \
+          -e "/^Host \\* /s# !$_phost # !$_ephost #" \
+          "$_f" > "$_f.nixenv-tmp" && cat "$_f.nixenv-tmp" > "$_f"
+      rm -f "$_f.nixenv-tmp"
+    done
+    echo "nixenv: egress proxy moved: $_prev → $NIXENV_EGRESS_PROXY (updated .npmrc/.yarnrc/.ssh/config)"
+  fi
+  printf '%s\n' "$NIXENV_EGRESS_PROXY" > "$HOME_DIR/.nixenv-egress-proxy"
   mkdir -p "$HOME_DIR/.ssh"; touch "$HOME_DIR/.ssh/config"
   if ! grep -q '^# nixenv-egress' "$HOME_DIR/.ssh/config" 2>/dev/null; then
     cat >> "$HOME_DIR/.ssh/config" <<EOF
@@ -451,7 +497,7 @@ EOF
 # nixenv-egress (auto-added on restricted projects; delete this block to opt out)
 # Internal names (sibling containers, *.local/*.internal) connect DIRECTLY;
 # everything else tunnels out through the egress proxy's CONNECT.
-Host * !localhost !127.0.0.1 !$_ephost !*.local !*.internal !*.localhost !nixenv-*
+Host * !localhost !127.0.0.1 !$_ephost !*.local !*.internal !*.localhost !$_cpfx-*
     ProxyCommand $PROFILE/bin/socat - PROXY:$_ephost:%h:%p,proxyport=$_epport
 EOF
     chmod 600 "$HOME_DIR/.ssh/config" 2>/dev/null || true
@@ -1068,6 +1114,129 @@ ensure_proxy_net() {
     warn "could not create network '$PROXY_NET' (proxy routing may not work)"
 }
 
+# The egress container's own network: its route out. Only it and the Caddy
+# proxy join it — the link ingress capture runs over — and no project does, so
+# nothing else can reach squid or mitmproxy through it.
+ensure_egress_net() {
+  "$ENGINE" network inspect "$EGRESS_NET" >/dev/null 2>&1 || \
+    "$ENGINE" network create "$EGRESS_NET" >/dev/null 2>&1 || \
+    warn "could not create network '$EGRESS_NET' (egress will not work)"
+}
+
+# Join the egress container to every restricted project's internal net: the
+# project reaches squid there — its ONLY way out.
+egress_connect_nets() {
+  local rp
+  for rp in $EGRESS_PROJECTS; do
+    "$ENGINE" network connect "$(internal_net "$rp")" "$EGRESS_NAME" >/dev/null 2>&1 || true
+  done
+}
+
+# Restart mitmproxy in place (egress.sh's loop starts it again, re-reading
+# capture.conf). Also drops the UI's in-memory flows; the files stay.
+capture_restart() {
+  "$ENGINE" exec "$EGRESS_NAME" sh -c \
+    'p="$(cat /data/run/mitm.pid 2>/dev/null)"; [ -z "$p" ] || kill "$p"' >/dev/null 2>&1 || true
+}
+
+# Apply regenerated configs to the RUNNING egress container: squid reloads its
+# ACLs (no restart, so open tunnels survive) and mitmproxy restarts only if its
+# listeners changed. Run write_egress_configs first.
+egress_reload() {
+  "$ENGINE" exec "$EGRESS_NAME" "$PROFILE/bin/squid" -f /etc/egress/squid.conf -k reconfigure >/dev/null 2>&1 \
+    || { warn "squid did not reload in '$EGRESS_NAME'"; return 1; }
+  [ "${CAPTURE_CHANGED:-0}" = 1 ] && capture_restart
+  return 0
+}
+
+# Start or refresh the egress container (squid, + mitmproxy while a project is
+# captured), separate from the Caddy proxy so recreating Caddy — every restricted
+# 'run' does, for its relays — no longer cuts every project off the network.
+# Run write_egress_configs first. A running container is only reloaded; it is
+# recreated only when missing, or to add/remove the published UI port.
+egress_up() {
+  if [ -z "${EGRESS_PROJECTS:-}" ]; then
+    if container_exists "$EGRESS_NAME"; then
+      "$ENGINE" rm -f "$EGRESS_NAME" >/dev/null 2>&1 || true
+      log "no restricted project — removed the egress proxy '$EGRESS_NAME'"
+    fi
+    return 0
+  fi
+  ensure_egress_net
+  local want_ui=0 has_ui=0
+  [ -n "${CAPTURE_PROJECTS:-}" ] && want_ui=1
+  if container_running "$EGRESS_NAME"; then
+    "$ENGINE" port "$EGRESS_NAME" 2>/dev/null | grep -q . && has_ui=1
+    if [ "$want_ui" = "$has_ui" ]; then
+      egress_connect_nets
+      egress_reload && return 0
+      warn "recreating '$EGRESS_NAME'"
+    fi
+  fi
+  "$ENGINE" rm -f "$EGRESS_NAME" >/dev/null 2>&1 || true
+  mkdir -p "$EGRESS_DATA_DIR"
+  # The mitmweb UI is published on loopback only while something is captured.
+  local ui; ui=()
+  [ "$want_ui" = 1 ] && ui=(-p "127.0.0.1:$CAPTURE_WEB_PORT:$CAPTURE_WEB_IN_PORT")
+  log "Starting egress proxy '$EGRESS_NAME' (squid${CAPTURE_PROJECTS:+ + mitmproxy capturing:$CAPTURE_PROJECTS})"
+  if ! egress_run ${ui[@]+"${ui[@]}"}; then
+    [ "$want_ui" = 1 ] || die "failed to start the egress proxy '$EGRESS_NAME'"
+    # Never let the UI cost a project its network: retry without it.
+    warn "could not publish the capture UI on 127.0.0.1:$CAPTURE_WEB_PORT (in use? set CAPTURE_WEB_PORT) — starting without it"
+    egress_run || die "failed to start the egress proxy '$EGRESS_NAME'"
+  fi
+  egress_connect_nets
+}
+egress_run() {
+  "$ENGINE" rm -f "$EGRESS_NAME" >/dev/null 2>&1 || true
+  "$ENGINE" run -d \
+    --name "$EGRESS_NAME" \
+    --network "$EGRESS_NET" \
+    --network-alias "$EGRESS_LINK" \
+    --user "$(id -u):$(id -g)" \
+    $(engine_userns) \
+    $(container_hardening_args) \
+    "$@" \
+    -v "$NIX_VOLUME":/nix:ro \
+    -v "$PROXY_DIR/egress":/etc/egress:ro \
+    -v "$EGRESS_DATA_DIR":/data \
+    -e HOME=/data -e PYTHONUNBUFFERED=1 \
+    -w /data \
+    "$(img "$RUNTIME_IMAGE")" \
+    sh /etc/egress/egress.sh >/dev/null
+}
+
+# mitmproxy writes its CA on first start. Wait for it (≤20s) so a container
+# created right after 'capture on' can mount it. Returns 1 if it never appears.
+capture_wait_ca() {
+  local f="$EGRESS_DATA_DIR/mitmproxy/mitmproxy-ca-cert.pem" i=0
+  while [ ! -s "$f" ]; do
+    i=$((i + 1)); [ "$i" -gt 20 ] && return 1
+    sleep 1
+  done
+}
+
+# Settings fixed when a project container is CREATED, which a running one may
+# predate. Warns (returns 1) when '<project>' needs 'stop && run'; $2=1 for a
+# restricted project.
+container_needs_recreate() {
+  local name="$1" restricted="$2" cname env mounts stale=""
+  cname="$(container_name "$name")"
+  env="$("$ENGINE" inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$cname" 2>/dev/null || true)"
+  mounts="$("$ENGINE" inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$cname" 2>/dev/null || true)"
+  if [ "$restricted" = 1 ] && ! printf '%s\n' "$env" | grep -qx "NIXENV_EGRESS_PROXY=http://$EGRESS_NAME:$EGRESS_PORT"; then
+    warn "'$name' still points at the OLD egress proxy (squid now runs in '$EGRESS_NAME') — it has no network"
+    stale=1
+  fi
+  if [ "$restricted" = 1 ] && project_captures "$name" egress && ! printf '%s' "$mounts" | grep -q '/etc/nixenv-capture-ca.crt'; then
+    warn "'$name' does not trust the capture CA yet — its HTTPS requests fail while capture is on"
+    stale=1
+  fi
+  [ -n "$stale" ] || return 0
+  echo "    apply it with: $0 stop $name && $0 run $name"
+  return 1
+}
+
 # Start the shared proxy the first time a project runs (unless PROXY_AUTOSTART=0).
 # No-op when it's already running; non-fatal so a proxy failure never breaks 'run'
 # (the subshell contains any die from cmd_proxy).
@@ -1309,10 +1478,11 @@ store_is_populated() {
 # ── Project helpers ──────────────────────────────────────────────────────────
 # Validate a project name once, at creation: it becomes a container name, volume
 # names, a hostname, and a proxy subdomain, so keep it to a safe charset. Also
-# reserve 'proxy' (its container name would collide with the shared proxy).
+# reserve 'proxy' and 'egress' (their container names are the shared ones).
 valid_project_name() {
   case "$1" in
     proxy) warn "'proxy' is reserved (container name '$PROXY_NAME' is the shared proxy)"; return 1;;
+    egress) warn "'egress' is reserved (container name '$EGRESS_NAME' is the shared egress proxy)"; return 1;;
     ""|*[!a-zA-Z0-9_-]*) warn "project names may only contain letters, digits, '-' and '_'"; return 1;;
     -*) warn "project names may not start with '-'"; return 1;;
   esac
@@ -2308,6 +2478,9 @@ cmd_run() {
   appmnt="$(project_app_mount "$name")"
   [ -f "$ENTRYPOINT_FILE" ] || die "missing entrypoint at $ENTRYPOINT_FILE"
   [ "$#" -eq 0 ] || die "run takes no command — use '$0 shell $name' or '$0 ssh $name'"
+  # 'egress' became reserved when squid moved to <prefix>-egress; an older
+  # project of that name would now collide with the shared container.
+  [ "$cname" != "$EGRESS_NAME" ] || die "a project named 'egress' collides with the egress proxy container '$EGRESS_NAME' — rename it (export + import under a new name)"
   # Defence in depth: these files shape the container's creation, and a
   # symlink among them could make the engine bind-mount (or read) a host file
   # outside the project dir — e.g. hosts.extra -> ~/.ssh/id_ed25519.
@@ -2340,18 +2513,20 @@ cmd_run() {
   # Egress restriction: a restricted project runs on its own --internal network
   # (kernel-enforced: no route out). Ports published on an internal network don't
   # work, so its ssh/extra ports are published by the PROXY container and relayed
-  # (write_egress_configs); its only way out is squid in the proxy container.
+  # (write_egress_configs); its only way out is squid in the egress container.
   local restricted=0 netarg="$PROXY_NET" egress_env; egress_env=()
   if is_restricted "$name"; then
     restricted=1
     ensure_internal_net "$name"
     netarg="$(internal_net "$name")"
-    egress_env=(-e NIXENV_EGRESS_PROXY="http://$PROXY_NAME:$EGRESS_PORT")
-    # The proxy must be up BEFORE the container starts: on an internal network
-    # it is the only way out, and the container's FIRST-RUN hook (template setup:
-    # composer/npm/wp-cli) needs egress immediately. Starting it afterwards left
-    # the hook unable to even resolve the proxy's name.
-    if ! container_running "$PROXY_NAME"; then
+    egress_env=(-e NIXENV_EGRESS_PROXY="http://$EGRESS_NAME:$EGRESS_PORT")
+    # The egress proxy must be up BEFORE the container starts: on an internal
+    # network it is the only way out, and the container's FIRST-RUN hook
+    # (template setup: composer/npm/wp-cli) needs egress immediately. Starting
+    # it afterwards left the hook unable to even resolve the proxy's name.
+    # A capture CA that doesn't exist yet also needs mitmproxy started first.
+    if ! container_running "$EGRESS_NAME" || ! container_running "$PROXY_NAME" || \
+       { project_captures "$name" egress && [ ! -s "$EGRESS_DATA_DIR/mitmproxy/mitmproxy-ca-cert.pem" ]; }; then
       log "Starting the egress proxy first (restricted project needs it to reach the network)"
       ( PROXY_MKCERT_INSTALL="${PROXY_MKCERT_INSTALL:-0}"; cmd_proxy up ) \
         || warn "proxy failed to start — '$name' will have no network access"
@@ -2392,6 +2567,13 @@ cmd_run() {
   # The proxy's root CA (mkcert's or Caddy's internal), so the container can
   # trust https://*.$PROXY_DOMAIN. The entrypoint merges it into a CA bundle.
   [ -f "$PROXY_DIR/certs/rootCA.pem" ] && hostsmount+=(-v "$PROXY_DIR/certs/rootCA.pem:/etc/nixenv-proxy-ca.crt:ro")
+  # 'capture' on: trust mitmproxy's CA, or every HTTPS request fails its check.
+  # ONLY then — trusting it is what lets the egress container read the traffic.
+  local capca="$EGRESS_DATA_DIR/mitmproxy/mitmproxy-ca-cert.pem"
+  if [ "$restricted" = 1 ] && project_captures "$name" egress; then
+    capture_wait_ca || warn "capture CA not ready yet — HTTPS from '$name' will fail until '$0 stop $name && $0 run $name'"
+    [ -f "$capca" ] && hostsmount+=(-v "$capca:/etc/nixenv-capture-ca.crt:ro")
+  fi
 
   if container_running "$cname"; then
     ok "Project '$name' already running as '$cname'"
@@ -2407,6 +2589,7 @@ cmd_run() {
       warn "'$name' was started before host-key pinning — 'ssh $name' will report a changed host key"
       echo "    apply it with: $0 stop $name && $0 run $name"
     fi
+    container_needs_recreate "$name" "$restricted" || true
   else
     container_exists "$cname" && "$ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
     log "Starting service '$cname' ($RUNTIME_IMAGE) as uid $(id -u) — sshd on 127.0.0.1:$port, volumes $appv → $appmnt, $homev → /home/$APP_USER"
@@ -2457,6 +2640,7 @@ cmd_run() {
       -e NIXENV_APP_MOUNT="$appmnt" \
       -e CLAUDE_CODE_PROJECT_DIR_NAME="nixenv-$name" \
       -e NIXENV_PROXY_NAME="$PROXY_NAME" \
+      -e NIXENV_CONTAINER_PREFIX="$CONTAINER_PREFIX" \
       -e NIXENV_PROXY_DOMAIN="$PROXY_DOMAIN" \
       -e NIXENV_EXTRA_PROFILE="$(project_profile "$name")" \
       "$(img "$RUNTIME_IMAGE")" \
@@ -2477,6 +2661,9 @@ cmd_run() {
   if [ "$restricted" = 1 ]; then
     echo "   egress: RESTRICTED — allowed: $(tr '\n' ' ' < "$pdir/allowed_hosts" 2>/dev/null || echo '(none)')"
     echo "           add hosts: $0 allow $name <domain>…   watch: $0 egress $name"
+  fi
+  if [ "$restricted" = 1 ] && [ -f "$pdir/capture" ]; then
+    echo "   capture: ON ($(capture_directions "$name")) — $0 capture $name web | log -f | tui"
   fi
   if [ "$PROXY_AUTOSTART" = 1 ] && container_running "$PROXY_NAME"; then
     echo "   proxy:  https://$name-<port>.$PROXY_DOMAIN/   (via '$PROXY_NAME')"
@@ -2639,13 +2826,13 @@ cmd_allow() {
     log "saved — note '$name' is NOT restricted (it opted out; enable: $0 restrict $name on)"
     return 0
   fi
-  # HOT-reload squid's ACLs — no proxy recreate, so relayed ssh/zmx sessions and
-  # ingress stay up. (write_egress_configs overwrites the bind-mounted config in
+  # HOT-reload squid's ACLs — no egress/proxy recreate, so relayed ssh/zmx
+  # sessions, open tunnels and ingress stay up. (write_egress_configs overwrites the bind-mounted config in
   # place; 'squid -k reconfigure' re-reads it.) Falls back to a full 'proxy up'
   # if squid isn't running in the proxy yet (e.g. proxy predates restriction).
-  if resolve_engine 2>/dev/null && container_running "$PROXY_NAME"; then
+  if resolve_engine 2>/dev/null && container_running "$EGRESS_NAME"; then
     write_egress_configs
-    if "$ENGINE" exec "$PROXY_NAME" "$PROFILE/bin/squid" -f /etc/egress/squid.conf -k reconfigure >/dev/null 2>&1; then
+    if "$ENGINE" exec "$EGRESS_NAME" "$PROFILE/bin/squid" -f /etc/egress/squid.conf -k reconfigure >/dev/null 2>&1; then
       ok "allowlist reloaded (hot — no proxy restart)"
     else
       warn "hot reload failed — recreating the proxy"
@@ -2698,7 +2885,9 @@ cmd_egress() {
   local name="${1:-}" follow="${2:-}"
   [ -n "$name" ] || die "usage: $0 egress <project> [-f]"
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
-  local logf="$PROXY_DIR/data/egress.log"
+  # squid moved to its own container; an older proxy logged into the proxy dir.
+  local logf="$EGRESS_DATA_DIR/egress.log"
+  [ -f "$logf" ] || [ ! -f "$PROXY_DIR/data/egress.log" ] || logf="$PROXY_DIR/data/egress.log"
   [ -f "$logf" ] || die "no egress log at $logf — is the proxy running with a restricted project?"
 
   # Squid access log: time elapsed client action/status bytes method host:port …
@@ -2730,6 +2919,135 @@ cmd_egress() {
   printf '%s\n' "$lines" | awk '$4 ~ /DENIED/ {print $7}' | sed "$_dom" | sort | uniq -c | sort -rn | head -20
   echo "── last 10 raw entries ─────────────────────────────"
   printf '%s\n' "$lines" | tail -10
+}
+
+# =============================================================================
+# capture — record a restricted project's HTTP(S) traffic with mitmproxy.
+#   usage: capture <project> [on [egress|ingress]|off|status|web|log [-f]|tui|har <file>|clear]
+# =============================================================================
+# mitmproxy runs in the egress container BEHIND squid: squid still decides what
+# a project may reach (and refuses the rest without resolving it); only allowed
+# requests reach the project's own mitmproxy listener. 'egress' = the project's
+# outbound requests (HTTPS is decrypted: the container trusts mitmproxy's CA
+# while capture is on); 'ingress' = requests to its public URLs, routed by Caddy
+# through mitmproxy on the way in. Files: $EGRESS_DATA_DIR/captures/<p>.{flows,log}.
+cmd_capture() {
+  local name="${1:-}" sub="${2:-status}"
+  [ -n "$name" ] || die "usage: $0 capture <project> [on [egress|ingress]|off|status|web|log [-f]|tui|har <file>|clear]"
+  case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  local pdir; pdir="$(project_dir "$name")"
+  [ -d "$pdir" ] || die "unknown project '$name' — run '$0 init $name' first"
+  local cdir="$EGRESS_DATA_DIR/captures"
+  local flows="$cdir/$name.flows" logf="$cdir/$name.log"
+
+  case "$sub" in
+    on)
+      # Only a restricted project has squid (and so mitmproxy) in its path; an
+      # unrestricted one talks to the internet directly.
+      is_restricted "$name" || die "'$name' is unrestricted — its traffic does not go through the egress proxy. Enable with: $0 restrict $name on"
+      local dirs="${3:-}"
+      case "$dirs" in
+        ""|both) dirs="egress
+ingress";;
+        egress|ingress) ;;
+        *) die "usage: $0 capture $name on [egress|ingress]   (default: both)";;
+      esac
+      require_engine
+      volume_exists && "$ENGINE" run --rm -v "$NIX_VOLUME":/nix:ro "$(img "$RUNTIME_IMAGE")" \
+          test -x "$PROFILE/bin/mitmweb" >/dev/null 2>&1 \
+        || die "mitmproxy is not in the shared store yet — run '$0 build' (or '$0 update') first"
+      printf '%s\n' "$dirs" > "$pdir/capture"
+      warn "Captures record EVERYTHING that crosses the wire — tokens, cookies, git"
+      warn "credentials included. They stay on this machine (owner-only): $cdir"
+      capture_apply "$name"
+      ok "capture ON for '$name' ($(capture_directions "$name"))"
+      if project_captures "$name" egress && container_running "$(container_name "$name")" \
+         && ! container_needs_recreate "$name" 1 >/dev/null 2>&1; then
+        warn "'$name' must restart to trust the capture CA — until then its HTTPS requests FAIL"
+        if confirm_tty "Restart '$name' now?"; then
+          cmd_stop "$name" && cmd_run "$name"
+        else
+          echo "    apply it with: $0 stop $name && $0 run $name"
+        fi
+      fi
+      echo "   UI:   $0 capture $name web      live log: $0 capture $name log -f"
+      ;;
+    off)
+      [ -f "$pdir/capture" ] || { log "capture is already off for '$name'"; return 0; }
+      rm -f "$pdir/capture"
+      capture_apply "$name"
+      ok "capture OFF for '$name' (recorded files kept — '$0 capture $name clear' deletes them)"
+      if container_running "$(container_name "$name")" 2>/dev/null; then
+        log "'$name' still trusts the capture CA until it restarts ($0 stop $name && $0 run $name)"
+      fi
+      ;;
+    status)
+      if [ -f "$pdir/capture" ]; then ok "capture ON for '$name' ($(capture_directions "$name"))"
+      else log "capture OFF for '$name'"; fi
+      [ -f "$flows" ] && echo "   flows: $flows ($(wc -c < "$flows" | tr -d ' ') bytes)"
+      [ -f "$logf" ]  && echo "   log:   $logf ($(wc -l < "$logf" | tr -d ' ') requests)"
+      return 0
+      ;;
+    web)
+      local tok; tok="$(cat "$EGRESS_DATA_DIR/mitmweb.token" 2>/dev/null || true)"
+      [ -n "$tok" ] || die "no capture UI yet — turn it on first: $0 capture $name on"
+      require_engine
+      container_running "$EGRESS_NAME" || warn "the egress proxy is not running — '$0 proxy up'"
+      log "mitmweb UI (all captured projects; this one: filter '~comment $name'):"
+      echo "    http://127.0.0.1:$CAPTURE_WEB_PORT/?token=$tok"
+      echo "    (loopback only; the token is the UI password — treat the URL as a secret)"
+      ;;
+    log)
+      [ -f "$logf" ] || die "nothing captured for '$name' yet ($logf)"
+      if [ "${3:-}" = "-f" ]; then exec tail -f "$logf"; fi
+      tail -n 50 "$logf"
+      ;;
+    tui)
+      [ -f "$flows" ] || die "nothing captured for '$name' yet ($flows)"
+      require_engine
+      container_running "$EGRESS_NAME" || die "the egress proxy is not running — '$0 proxy up'"
+      # Read-only: -n (no proxy listener) over the recorded file.
+      exec "$ENGINE" exec -it -e TERM="${TERM:-xterm-256color}" -e HOME=/data "$EGRESS_NAME" \
+        "$PROFILE/bin/mitmproxy" -n -r "/data/captures/$name.flows" --set confdir=/data/mitmproxy
+      ;;
+    har)
+      local out="${3:-}"
+      [ -n "$out" ] || die "usage: $0 capture $name har <file.har>"
+      [ -f "$flows" ] || die "nothing captured for '$name' yet ($flows)"
+      require_engine
+      container_running "$EGRESS_NAME" || die "the egress proxy is not running — '$0 proxy up'"
+      "$ENGINE" exec -e HOME=/data "$EGRESS_NAME" "$PROFILE/bin/mitmdump" -q -n \
+          -r "/data/captures/$name.flows" --set confdir=/data/mitmproxy \
+          --set hardump="/data/captures/$name.har" \
+        || die "mitmdump could not export $flows"
+      ( umask 077; cat "$cdir/$name.har" > "$out" ) && rm -f "$cdir/$name.har"
+      ok "wrote $out (contains whatever was captured — treat it as a secret)"
+      ;;
+    clear)
+      rm -f "$flows" "$logf"
+      # mitmproxy holds the files open — and every project's flows in the UI.
+      if resolve_engine 2>/dev/null && container_running "$EGRESS_NAME"; then capture_restart; fi
+      ok "deleted the captures of '$name' (the UI restarted: its view of every project is cleared)"
+      ;;
+    *) die "usage: $0 capture <project> [on [egress|ingress]|off|status|web|log [-f]|tui|har <file>|clear]";;
+  esac
+}
+
+# Regenerate squid/mitmproxy/Caddy config after <project>/capture changed and
+# apply it live: squid reloads, mitmproxy restarts with the new listeners, and
+# Caddy reloads its ingress routes. Nothing is recreated unless the capture UI
+# port must appear or disappear. Without a running proxy it applies at next run.
+capture_apply() {
+  resolve_engine 2>/dev/null || { log "applies at the next '$0 run $1'"; return 0; }
+  if ! container_running "$PROXY_NAME"; then
+    log "applies when the proxy starts ('$0 proxy up' or next '$0 run $1')"
+    return 0
+  fi
+  ( PROXY_MKCERT_INSTALL="${PROXY_MKCERT_INSTALL:-0}"; cmd_proxy reload ) \
+    || warn "proxy reload failed — '$0 proxy up' applies it"
+  if project_captures "$1" egress; then
+    capture_wait_ca || warn "mitmproxy has not written its CA yet — see '$0 proxy logs egress'"
+  fi
 }
 
 # =============================================================================
@@ -2802,12 +3120,19 @@ export_caddy_ca() {
   fi
 }
 
-# Generate $PROXY_DIR/egress/: squid.conf (per-project domain ACLs keyed by the
-# project's internal-net subnet, default-deny), and start.sh (squid + socat ssh
-# relays + caddy). Also fills EGRESS_PUB (extra -p args for the proxy container:
-# restricted projects' ssh/extra ports are published HERE and relayed over the
-# internal net, because ports published on an --internal network don't work).
-# Sets EGRESS_PROJECTS to the restricted project names.
+# Generate $PROXY_DIR/egress/:
+#   squid.conf          per-project domain ACLs keyed by the project's internal-net
+#                       subnet, default-deny; captured projects go via mitmproxy
+#   capture.conf        mitmproxy listeners (see write_capture_files)
+#   nixenv_capture.py   the mitmproxy addon
+#   egress.sh           the EGRESS container's command (squid + mitmproxy)
+#   start.sh            the PROXY container's command (socat relays + caddy)
+# Also fills EGRESS_PUB (extra -p args for the proxy container: restricted
+# projects' ssh/extra ports are published HERE and relayed over the internal
+# net, because ports published on an --internal network don't work), sets
+# EGRESS_PROJECTS to the restricted project names, CAPTURE_PROJECTS to those
+# with capture on, CAPTURE_INGRESS to "name port" lines (write_caddyfile), and
+# CAPTURE_CHANGED=1 when the mitmproxy listeners changed (it must restart).
 write_egress_configs() {
   local edir="$PROXY_DIR/egress"
   # NOTE: never rm -rf this dir — it's bind-mounted into a possibly-running
@@ -2816,7 +3141,9 @@ write_egress_configs() {
   # Overwriting files in place keeps the mount coherent.
   mkdir -p "$edir"
   EGRESS_PUB=(); EGRESS_PROJECTS=""; EGRESS_SUBNETS=""
+  CAPTURE_PROJECTS=""; CAPTURE_INGRESS=""; CAPTURE_CHANGED=0
   local relays="" acls="" gates="" sshgates="" allows="" all_srcs="" sshdoms d pdir name subnet aclname doms ips sshport _line _spec hp cp
+  local peers="" capconf="" capn=0
 
   for pdir in "$PROJECTS_DIR"/*/; do
     [ -d "$pdir" ] || continue
@@ -2896,6 +3223,33 @@ http_access deny p_$aclname CONNECT ssh_port"
       fi
     fi
 
+    # Capture: this project's traffic goes through ITS OWN mitmproxy listener
+    # (the port tells the addon which project a flow belongs to), AFTER squid
+    # has applied every rule above. Ports 22/9418 (ssh, git://) are not HTTP —
+    # they stay direct. never_direct makes it fail CLOSED: if mitmproxy is down
+    # the request fails instead of silently going out unrecorded.
+    if [ -f "$pdir/capture" ] && [ "$capn" -lt 99 ]; then
+      capn=$((capn + 1))
+      CAPTURE_PROJECTS="$CAPTURE_PROJECTS $name"
+      if project_captures "$name" egress; then
+        peers="$peers
+cache_peer 127.0.0.1 parent $((CAPTURE_EGRESS_BASE + capn)) 0 no-query no-digest no-netdb-exchange name=cap_$aclname
+cache_peer_access cap_$aclname allow p_$aclname !nocapture_ports
+cache_peer_access cap_$aclname deny all
+never_direct allow p_$aclname !nocapture_ports"
+        capconf="${capconf}egress $name $((CAPTURE_EGRESS_BASE + capn))
+"
+      fi
+      if project_captures "$name" ingress; then
+        capconf="${capconf}ingress $name $((CAPTURE_INGRESS_BASE + capn)) $(container_name "$name")
+"
+        CAPTURE_INGRESS="$CAPTURE_INGRESS$name $((CAPTURE_INGRESS_BASE + capn))
+"
+      fi
+    elif [ -f "$pdir/capture" ]; then
+      warn "capture: more than 99 projects — '$name' is not captured"
+    fi
+
     # Relays require the ports to be free on the host. If the project container
     # is RUNNING and still publishes its own ports (started before it became
     # restricted), publishing them here would collide and kill the proxy —
@@ -2948,6 +3302,7 @@ forwarded_for delete
 # Only tunnel to sane ports (https, ssh, http, git).
 acl Connect_ports port 443 22 80 9418
 acl ssh_port port 22
+acl nocapture_ports port 22 9418
 acl CONNECT method CONNECT
 
 # Loopback, private/container networks and link-local (169.254.169.254 is the
@@ -2955,6 +3310,10 @@ acl CONNECT method CONNECT
 acl to_localnets dst 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fc00::/7 fe80::/10 ::1/128
 $acls
 acl nixenv_projects src$all_srcs
+
+# Captured projects ('nixenv capture'): forwarded to their mitmproxy listener
+# on loopback instead of going direct. Routing only — http_access below still
+# decides what is allowed at all, before anything is forwarded.$peers
 
 # ORDER MATTERS. squid evaluates http_access top-down and stops at the
 # first match, so every rule ABOVE the first 'dst' ACL decides without DNS.
@@ -2977,29 +3336,315 @@ EOF
     rm -f "$edir/squid.conf"   # no restricted projects → start.sh skips squid
   fi
 
-  # start.sh: squid (egress) + socat relays + caddy (ingress) — caddy is PID 1.
+  write_capture_files "$capconf"
+
+  # start.sh: socat relays + caddy (ingress) — caddy is PID 1. Squid is NOT
+  # here any more: it runs in its own container (egress.sh), so restarting the
+  # ingress proxy no longer cuts every restricted project off the network.
+  local proxy_subnet; proxy_subnet="$(net_subnet "$PROXY_NET" 2>/dev/null || true)"
   cat > "$edir/start.sh" <<EOF
 #!/bin/sh
-# Generated by nixenv — proxy container startup (egress + relays + ingress).
+# Generated by nixenv — proxy container startup (relays + ingress).
 PROFILE="$PROFILE"
-mkdir -p /data/run
-if [ -f /etc/egress/squid.conf ]; then
-  # /data persists across proxy recreations: a stale pid file makes squid FATAL
-  # with "already running" (the old PID exists in the NEW container's namespace).
-  # This container is freshly created, so no squid can be running — clear it.
-  rm -f /data/run/squid.pid
-  # stdout/err to a host-visible file so startup FATALs are diagnosable
-  "\$PROFILE/bin/squid" -f /etc/egress/squid.conf -N >>/data/squid-out.log 2>&1 &
-fi
-# The relays listen ONLY on the primary ($PROXY_NET, eth0) address —
-# the one the host's published ports arrive on. Restricted projects reach this
-# container through their --internal nets (eth1+), which have no route to that
-# address, so they can't use another project's relay to hit its services.
-# Empty (address undetectable) falls back to listening everywhere.
-RELAY_BIND="\$(hostname -I 2>/dev/null | awk '{print \$1}')"
+$(pick_addr_fn)
+# The relays listen ONLY on the $PROXY_NET address — the one the host's
+# published ports arrive on. Restricted projects reach this container through
+# their --internal nets, which have no route to that address, so they can't use
+# another project's relay to hit its services. Chosen by SUBNET, not position:
+# after a restart 'hostname -I' may list an internal net first.
+# Empty (address undetectable) falls back to the first address, then to all.
+RELAY_BIND="\$(pick_addr "$proxy_subnet")"
+[ -n "\$RELAY_BIND" ] || RELAY_BIND="\$(hostname -I 2>/dev/null | awk '{print \$1}')"
 [ -n "\$RELAY_BIND" ] || echo "nixenv: could not detect the proxy address — relays listen on all interfaces" >&2$relays
 exec "\$PROFILE/bin/caddy" run --config /etc/caddy/Caddyfile --adapter caddyfile
 EOF
+}
+
+# Shell function (as text, for the generated scripts): print this container's
+# address inside CIDR $1. Interface ORDER is not stable across restarts, so a
+# container on several networks must pick its address by subnet.
+pick_addr_fn() {
+  cat <<'NIXENV_PICK_ADDR'
+pick_addr() {
+  [ -n "$1" ] || return 0
+  hostname -I 2>/dev/null | tr ' ' '\n' | awk -v cidr="$1" '
+    function n(s,  a) { split(s, a, "."); return ((a[1]*256 + a[2])*256 + a[3])*256 + a[4] }
+    BEGIN { split(cidr, c, "/"); size = 2 ^ (32 - c[2]); net = int(n(c[1]) / size) }
+    /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { if (int(n($0) / size) == net) { print; exit } }'
+}
+NIXENV_PICK_ADDR
+}
+
+# Is <project> capturing <egress|ingress>? <project>/capture lists the
+# directions ('egress', 'ingress'); an empty file means both.
+project_captures() {
+  local f; f="$(project_dir "$1")/capture"
+  [ -f "$f" ] || return 1
+  grep -q '[a-z]' "$f" || return 0
+  grep -qw -- "$2" "$f"
+}
+
+# The directions <project> captures, as words ("egress ingress").
+capture_directions() {
+  local d out=""
+  for d in egress ingress; do project_captures "$1" "$d" && out="$out $d"; done
+  printf '%s' "${out# }"
+}
+
+# The egress container's files: capture.conf (mitmproxy listeners, from $1),
+# the mitmproxy addon, the UI token and egress.sh. capture.conf is rewritten
+# only when it changes, and CAPTURE_CHANGED=1 tells the caller to restart
+# mitmproxy (its listeners are fixed at start).
+write_capture_files() {
+  local edir="$PROXY_DIR/egress" lsub="" conf
+  # The link subnet: EGRESS_NET, shared ONLY by this container and Caddy. The
+  # ingress listeners and the UI bind there, and the addon accepts ingress
+  # connections from nowhere else.
+  [ -n "$1" ] && lsub="$(net_subnet "$EGRESS_NET" 2>/dev/null || true)"
+  conf="# Generated by nixenv — mitmproxy listeners for 'nixenv capture'. Do not edit.
+$1"
+  [ -n "$lsub" ] && conf="${conf}link $lsub
+"
+  if ! printf '%s' "$conf" | cmp -s - "$edir/capture.conf" 2>/dev/null; then
+    printf '%s' "$conf" > "$edir/capture.conf"
+    CAPTURE_CHANGED=1
+  fi
+
+  # Captures hold whatever crossed the wire — tokens, cookies, credentials:
+  # owner-only. The UI password is generated once; the URL 'capture web' prints
+  # carries it.
+  mkdir -p "$EGRESS_DATA_DIR"
+  chmod 700 "$EGRESS_DATA_DIR" 2>/dev/null || true
+  if [ -n "$1" ] && [ ! -s "$EGRESS_DATA_DIR/mitmweb.token" ]; then
+    ( umask 077; od -An -N16 -tx1 /dev/urandom | tr -d ' \n' > "$EGRESS_DATA_DIR/mitmweb.token" )
+  fi
+
+  {
+    printf '#!/bin/sh\n# Generated by nixenv — egress container startup (squid + mitmproxy).\n'
+    printf 'PROFILE="%s"\nLINK_SUBNET="%s"\nWEB_PORT=%s\n' "$PROFILE" "$lsub" "$CAPTURE_WEB_IN_PORT"
+    pick_addr_fn
+    cat <<'NIXENV_EGRESS_SH'
+mkdir -p /data/run /data/captures
+chmod 700 /data/captures 2>/dev/null || true
+# /data persists across recreations: a stale pid file makes squid FATAL with
+# "already running" (the old PID exists in the NEW container's namespace).
+# This container is freshly created, so nothing can be running — clear them.
+rm -f /data/run/squid.pid /data/run/mitm.pid
+
+# mitmproxy, supervised by this loop. It runs only while capture.conf lists
+# listeners and re-reads it on every start: 'nixenv capture' changes listeners
+# by killing it (pid in /data/run/mitm.pid), never by recreating the container.
+capture_loop() {
+  _warned=0
+  while :; do
+    if grep -qE '^(egress|ingress) ' /etc/egress/capture.conf 2>/dev/null; then
+      if [ ! -x "$PROFILE/bin/mitmweb" ]; then
+        [ "$_warned" = 1 ] || echo "nixenv: capture is on but mitmproxy is not in the store — run 'nixenv build'" >&2
+        _warned=1; sleep 10; continue
+      fi
+      _bind="$(pick_addr "$LINK_SUBNET")"
+      set --
+      while read -r _kind _name _port _rest; do
+        case "$_kind" in
+          # Loopback only: squid is the only client. Bound anywhere else, a
+          # project could use it as a proxy and skip squid's rules entirely.
+          egress)  set -- "$@" --mode "regular@127.0.0.1:$_port" ;;
+          ingress) [ -n "$_bind" ] && set -- "$@" --mode "regular@$_bind:$_port" ;;
+        esac
+      done < /etc/egress/capture.conf
+      # No listener at all would make mitmproxy fall back to 0.0.0.0:8080.
+      if [ "$#" -gt 0 ]; then
+        "$PROFILE/bin/mitmweb" "$@" \
+          --set confdir=/data/mitmproxy \
+          --set web_open_browser=false \
+          --set web_host="${_bind:-127.0.0.1}" --set web_port="$WEB_PORT" \
+          --set web_password="$(cat /data/mitmweb.token 2>/dev/null)" \
+          --set stream_large_bodies=1m \
+          -s /etc/egress/nixenv_capture.py &
+        echo "$!" > /data/run/mitm.pid
+        wait "$!"
+        rm -f /data/run/mitm.pid
+      fi
+    fi
+    sleep 2
+  done
+}
+capture_loop &
+
+exec "$PROFILE/bin/squid" -f /etc/egress/squid.conf -N
+NIXENV_EGRESS_SH
+  } > "$edir/egress.sh"
+
+  cat > "$edir/nixenv_capture.py" <<'NIXENV_CAPTURE_ADDON'
+# Generated by nixenv — mitmproxy addon for 'nixenv capture'. Do not edit.
+#
+# Runs in the egress container, BEHIND squid: squid has already decided which
+# NAMES a project may reach (and refused the rest without resolving them), and
+# only then hands the request to this project's loopback listener. This addon:
+#   * tags every flow with its project (listener port → project, from
+#     capture.conf) and appends it to /data/captures/<project>.flows + .log;
+#   * re-checks the ADDRESS: mitmproxy resolves the name again, and a second
+#     answer could point somewhere private (DNS rebinding). Non-public answers
+#     are refused and the connection is pinned to the address that was checked;
+#   * ingress listeners (Caddy → project) only accept the ingress proxy, and
+#     only connect to their own project's container.
+import asyncio
+import ipaddress
+import logging
+import os
+import socket
+import time
+
+from mitmproxy import http, io
+
+os.umask(0o077)   # captures hold tokens/cookies: owner-only
+CONF = os.environ.get("NIXENV_CAPTURE_CONF", "/etc/egress/capture.conf")
+OUT = os.environ.get("NIXENV_CAPTURE_DIR", "/data/captures")
+UPSTREAM_HEADER = "X-Nixenv-Upstream"
+
+
+def load_conf(path):
+    """capture.conf lines: 'egress <project> <port>',
+    'ingress <project> <port> <container>', 'link <subnet>'."""
+    listeners, links = {}, []
+    with open(path) as f:
+        for line in f:
+            p = line.split()
+            if not p or p[0].startswith("#"):
+                continue
+            if p[0] == "egress" and len(p) == 3:
+                listeners[int(p[2])] = ("egress", p[1], None)
+            elif p[0] == "ingress" and len(p) == 4:
+                listeners[int(p[2])] = ("ingress", p[1], p[3])
+            elif p[0] == "link" and len(p) == 2:
+                links.append(ipaddress.ip_network(p[1], strict=False))
+    return listeners, links
+
+
+def public(ip):
+    a = ipaddress.ip_address(ip)
+    if a.version == 6 and a.ipv4_mapped:
+        a = a.ipv4_mapped
+    return a.is_global
+
+
+class Capture:
+    def __init__(self):
+        self.listeners, self.links = load_conf(CONF)
+        self.files = {}
+
+    def who(self, conn):
+        try:
+            return self.listeners.get(conn.sockname[1])
+        except (AttributeError, IndexError, TypeError):
+            return None
+
+    def client_connected(self, client):
+        w = self.who(client)
+        if w is None:
+            client.error = "nixenv: unknown capture listener"
+        elif w[0] == "ingress":
+            peer = ipaddress.ip_address(client.peername[0])
+            if not any(peer in n for n in self.links):
+                client.error = "nixenv: ingress capture only accepts the ingress proxy"
+
+    async def server_connect(self, data):
+        w = self.who(data.client)
+        if w is None:
+            data.server.error = "nixenv: unknown capture listener"
+            return
+        kind, project, target = w
+        host, port = data.server.address
+        if kind == "ingress":
+            if host != target:
+                data.server.error = f"nixenv: ingress capture for {project} only reaches {target}"
+            return
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(
+                host, port, type=socket.SOCK_STREAM)
+        except OSError as e:
+            data.server.error = f"nixenv: cannot resolve {host}: {e}"
+            return
+        ips = sorted({i[4][0] for i in infos}, key=lambda ip: ":" in ip)  # IPv4 first
+        if not ips or not all(public(ip) for ip in ips):
+            data.server.error = f"nixenv: {host} resolves to a non-public address — refused"
+            return
+        data.server.address = (ips[0], port)
+
+    def requestheaders(self, flow):
+        w = self.who(flow.client_conn)
+        if not w:
+            return
+        flow.comment = f"{w[1]} {w[0]}"   # mitmweb filter: ~comment <project>
+        if w[0] == "ingress":
+            # Caddy names the upstream it chose in this header (it sends the
+            # PUBLIC host as the proxy target). Only this project's container.
+            up = flow.request.headers.pop(UPSTREAM_HEADER, "")
+            host, _, port = up.rpartition(":")
+            if host != w[2] or not port.isdigit():
+                flow.response = http.Response.make(
+                    502, f"nixenv: bad ingress upstream {up!r}\n".encode())
+                return
+            public_host = flow.request.headers.get("host")
+            flow.request.host, flow.request.port = host, int(port)
+            if public_host is not None:   # .host= rewrote it; the app wants the public one
+                flow.request.headers["host"] = public_host
+
+    def responseheaders(self, flow):
+        # Never buffer an event stream: the client would wait forever.
+        if flow.response.headers.get("content-type", "").startswith("text/event-stream"):
+            flow.response.stream = True
+
+    def response(self, flow):
+        self.save(flow)
+
+    def error(self, flow):
+        self.save(flow)
+
+    def tls_failed_client(self, data):
+        w = self.who(data.context.client)
+        if w:
+            msg = (f"{w[1]}: client refused the capture certificate for "
+                   f"{data.context.client.sni or '?'} (certificate pinning, or the "
+                   f"container predates 'capture on' — restart it)")
+            logging.warning("nixenv: %s", msg)
+            self.line(w[1], f"{self.now()} {w[0]:7} TLS-REFUSED {data.context.client.sni or '?'}")
+
+    @staticmethod
+    def now():
+        return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    def handles(self, project):
+        h = self.files.get(project)
+        if h is None:
+            os.makedirs(OUT, exist_ok=True)
+            fh = open(os.path.join(OUT, project + ".flows"), "ab")
+            lg = open(os.path.join(OUT, project + ".log"), "a", buffering=1)
+            h = self.files[project] = (fh, io.FlowWriter(fh), lg)
+        return h
+
+    def line(self, project, text):
+        self.handles(project)[2].write(text + "\n")
+
+    def save(self, flow):
+        w = self.who(flow.client_conn)
+        if not w:
+            return
+        fh, writer, _ = self.handles(w[1])
+        writer.add(flow)
+        fh.flush()
+        r = flow.request
+        if flow.response:
+            status = str(flow.response.status_code)
+            size = len(flow.response.raw_content or b"")
+        else:
+            status = "ERR(" + (flow.error.msg if flow.error else "?") + ")"
+            size = 0
+        self.line(w[1], f"{self.now()} {w[0]:7} {r.method} {r.pretty_url} {status} {size}")
+
+
+addons = [Capture()]
+NIXENV_CAPTURE_ADDON
 }
 
 # Opt-in: <target>/accept-from lists the projects allowed to reach the
@@ -3055,10 +3700,44 @@ EOF
   printf '%s\n--\n%s\n' "$matchers" "$denies"
 }
 
+# Caddy matchers + routes for ingress capture, from CAPTURE_INGRESS ("name port"
+# lines, set by write_egress_configs). Same two-section output as above. Such a
+# project's requests go to its upstream THROUGH its mitmproxy ingress listener;
+# Caddy sends the PUBLIC host as the proxy target, so the upstream it chose
+# travels in X-Nixenv-Upstream (set here, overwriting anything a client sent;
+# the addon accepts only this project's container and strips it).
+caddy_capture_routes() {
+  local dom_re="$1" name port id matchers="" routes=""
+  while read -r name port; do
+    [ -n "$name" ] && [ -n "$port" ] || continue
+    case "$name" in -*|*[!a-zA-Z0-9_-]*) continue;; esac
+    case "$port" in *[!0-9]*) continue;; esac
+    id="$(printf '%s' "$name" | tr -c 'a-zA-Z0-9' '_')"
+    matchers="$matchers
+	@cap_$id header_regexp cap_$id Host ^$name-([0-9]+)\\.$dom_re(:[0-9]+)?\$"
+    routes="$routes
+		# 'nixenv capture $name': recorded by mitmproxy on the way in.
+		reverse_proxy @cap_$id $CONTAINER_PREFIX-$name:{re.cap_$id.1} {
+			transport http {
+				forward_proxy_url http://$EGRESS_LINK:$port
+			}
+			header_up X-Nixenv-Upstream $CONTAINER_PREFIX-$name:{re.cap_$id.1}
+			header_up X-Forwarded-Proto https
+			header_up X-Forwarded-Port 443
+			header_up X-Real-IP {http.request.remote.host}
+			flush_interval -1
+		}"
+  done <<EOF
+${CAPTURE_INGRESS:-}
+EOF
+  printf '%s\n--\n%s\n' "$matchers" "$routes"
+}
+
 # Write $PROXY_DIR/Caddyfile. $1=1 → use the mkcert wildcard cert, else internal.
-# Call write_egress_configs FIRST: the cross-project guard needs EGRESS_SUBNETS.
+# Call write_egress_configs FIRST: the cross-project guard needs EGRESS_SUBNETS,
+# and ingress capture needs CAPTURE_INGRESS.
 write_caddyfile() {
-  local tls_line dom_re rules guards denies
+  local tls_line dom_re rules guards denies caps capmatch caproutes
   mkdir -p "$PROXY_DIR"
   dom_re="$(printf '%s' "$PROXY_DOMAIN" | sed 's/\./\\./g')"
   if [ "${1:-0}" = 1 ]; then
@@ -3069,6 +3748,9 @@ write_caddyfile() {
   rules="$(caddy_isolation_rules "$dom_re")"
   guards="$(printf '%s\n' "$rules" | sed '/^--$/,$d')"
   denies="$(printf '%s\n' "$rules" | sed '1,/^--$/d')"
+  caps="$(caddy_capture_routes "$dom_re")"
+  capmatch="$(printf '%s\n' "$caps" | sed '/^--$/,$d')"
+  caproutes="$(printf '%s\n' "$caps" | sed '1,/^--$/d')"
   # Unquoted heredoc: $vars expand; Caddy's {re.route.N}/{host} have no $ so stay
   # literal; \. and \$ are preserved/reduced to regex-correct forms.
   cat > "$PROXY_DIR/Caddyfile" <<CADDY
@@ -3085,14 +3767,14 @@ write_caddyfile() {
 	$tls_line
 	# Project names are [a-zA-Z0-9_-] (valid_project_name) — nothing looser.
 	@route header_regexp route Host ^([a-zA-Z0-9_-]+)-([0-9]+)\.$dom_re(:[0-9]+)?\$
-$guards
+$guards$capmatch
 	# 'route' keeps this order literally (Caddy would otherwise sort directives).
 	route {
 		# A restricted project may only reach ITSELF through the proxy,
 		# unless the target lists it in <target>/accept-from. Identified by the
 		# source subnet of its --internal network. Host requests and unrestricted
 		# projects (flat $PROXY_NET, reachable directly anyway) are not guarded.
-$denies
+$denies$caproutes
 		reverse_proxy @route $CONTAINER_PREFIX-{re.route.1}:{re.route.2} {
 			# Caddy already adds X-Forwarded-For/Proto/Host; make the TLS-terminated
 			# scheme explicit (443 is mapped to caddy's 8443) and add a couple more
@@ -3117,10 +3799,14 @@ cmd_proxy() {
     up|start|restart)
       volume_exists && store_is_populated || die "shared store not built — run '$0 build' first (caddy comes from it)"
       ensure_proxy_net
+      ensure_egress_net
       mkdir -p "$PROXY_DIR/data"
       local cert=0; proxy_make_cert && cert=1 || cert=0
       write_egress_configs   # squid ACLs + relays + start.sh (fills EGRESS_PUB/PROJECTS/SUBNETS)
       write_caddyfile "$cert"   # after: its cross-project guard needs EGRESS_SUBNETS
+      # Egress FIRST: restricted projects have no other way out, and it is left
+      # running (reloaded, not recreated) while Caddy is recreated below.
+      egress_up
       local certmount; certmount=()
       [ "$cert" = 1 ] && certmount=(-v "$PROXY_DIR/certs:/certs:ro")
       "$ENGINE" rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
@@ -3145,11 +3831,19 @@ cmd_proxy() {
         "$(img "$RUNTIME_IMAGE")" \
         sh /etc/egress/start.sh >/dev/null \
         || die "failed to start proxy container"
-      # Join every restricted project's internal net so (a) caddy can ingress-route
-      # to it and (b) the project can reach squid — its ONLY path out.
+      # Join every restricted project's internal net so caddy can ingress-route
+      # to it, and the egress net — the link ingress capture goes over.
       local rp
       for rp in $EGRESS_PROJECTS; do
         "$ENGINE" network connect "$(internal_net "$rp")" "$PROXY_NAME" >/dev/null 2>&1 || true
+      done
+      "$ENGINE" network connect "$EGRESS_NET" "$PROXY_NAME" >/dev/null 2>&1 || true
+      # Name every running restricted project still wired the old way (e.g.
+      # created when squid ran in this container): it has no network now.
+      for rp in $EGRESS_PROJECTS; do
+        if container_running "$(container_name "$rp")"; then
+          container_needs_recreate "$rp" 1 || true
+        fi
       done
       # Caddy writes its internal CA on first start; give it a moment, then
       # publish it so containers can trust the certs it serves.
@@ -3159,7 +3853,8 @@ cmd_proxy() {
       if [ "$cert" = 1 ]; then echo "   tls:    trusted wildcard cert via mkcert"
       else echo "   tls:    Caddy internal CA (browser warning until you install/trust mkcert)"; fi
       echo "   net:    $PROXY_NET  (projects auto-join on '$0 run')"
-      [ -n "$EGRESS_PROJECTS" ] && echo "   egress: squid allowlist on :$EGRESS_PORT for:$EGRESS_PROJECTS  (log: $0 egress <project>)"
+      [ -n "$EGRESS_PROJECTS" ] && echo "   egress: squid allowlist in '$EGRESS_NAME' :$EGRESS_PORT for:$EGRESS_PROJECTS  (log: $0 egress <project>)"
+      [ -n "$CAPTURE_PROJECTS" ] && echo "   capture:$CAPTURE_PROJECTS  (UI: $0 capture <project> web)"
       echo "   note:   *.localhost auto-resolves to 127.0.0.1 in Chrome/Firefox (Safari needs an /etc/hosts line)"
       ;;
     reload)
@@ -3176,21 +3871,34 @@ cmd_proxy() {
       for rp in $EGRESS_PROJECTS; do
         "$ENGINE" network connect "$(internal_net "$rp")" "$PROXY_NAME" >/dev/null 2>&1 || true
       done
-      "$ENGINE" exec "$PROXY_NAME" "$PROFILE/bin/caddy" reload \
-          --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null \
-        || die "caddy rejected the new config (the old one stays active) — see '$0 proxy logs'"
-      if [ -f "$PROXY_DIR/egress/squid.conf" ]; then
-        "$ENGINE" exec "$PROXY_NAME" "$PROFILE/bin/squid" -f /etc/egress/squid.conf -k reconfigure >/dev/null 2>&1 \
-          || warn "squid did not reload (not running in this proxy?) — use '$0 proxy up'"
-      fi
+      # Egress: reloaded in place; created/recreated only when it is missing or
+      # the capture UI port has to appear/disappear.
+      egress_up
+      "$ENGINE" network connect "$EGRESS_NET" "$PROXY_NAME" >/dev/null 2>&1 || true
+      # caddy logs JSON to stderr even on success: show it only on failure.
+      local rout
+      rout="$("$ENGINE" exec "$PROXY_NAME" "$PROFILE/bin/caddy" reload \
+          --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1)" \
+        || { printf '%s\n' "$rout" >&2; die "caddy rejected the new config (the old one stays active) — see '$0 proxy logs'"; }
       ok "proxy config reloaded (no restart)"
       ;;
     stop|down)
       "$ENGINE" rm -f "$PROXY_NAME" >/dev/null 2>&1 && ok "proxy stopped" || log "proxy not running"
+      if container_exists "$EGRESS_NAME"; then
+        "$ENGINE" rm -f "$EGRESS_NAME" >/dev/null 2>&1 || true
+        ok "egress proxy stopped (restricted projects have no network until '$0 proxy up')"
+      fi
       ;;
     status)
       if container_running "$PROXY_NAME"; then ok "proxy running as '$PROXY_NAME'"
       else warn "proxy not running — start with '$0 proxy up'"; fi
+      if container_running "$EGRESS_NAME"; then ok "egress proxy running as '$EGRESS_NAME' (squid :$EGRESS_PORT)"
+      else log "egress proxy not running (only needed by restricted projects)"; fi
+      local cp_list="" rp
+      for rp in "$PROJECTS_DIR"/*/; do
+        [ -f "${rp}capture" ] && cp_list="$cp_list $(basename "$rp")"
+      done
+      [ -n "$cp_list" ] && echo "   capture:$cp_list  (UI: $0 capture <project> web)"
       echo "   domain: *.$PROXY_DOMAIN → nixenv-<project>:<port>"
       echo "   net:    $PROXY_NET"
       if [ -f "$PROXY_DIR/certs/wildcard.pem" ]; then
@@ -3219,9 +3927,13 @@ cmd_proxy() {
       fi
       ;;
     logs)
-      exec "$ENGINE" logs -f "$PROXY_NAME"
+      case "${2:-}" in
+        egress) exec "$ENGINE" logs -f "$EGRESS_NAME";;
+        "")     exec "$ENGINE" logs -f "$PROXY_NAME";;
+        *)      die "usage: $0 proxy logs [egress]";;
+      esac
       ;;
-    *) die "usage: $0 proxy [up|reload|stop|status|logs|renew|remove-cert]";;
+    *) die "usage: $0 proxy [up|reload|stop|status|logs [egress]|renew|remove-cert]";;
   esac
 }
 
@@ -3394,6 +4106,7 @@ cmd_delete() {
     warn "no container engine detected — its container/volumes won't be removed"
   fi
   echo "    rm -rf $pdir   (home seed, SSH keys, stored git credentials, port)"
+  echo "    rm -f $EGRESS_DATA_DIR/captures/$name.*   (recorded traffic, if any)"
   echo "    rm -rf $(claude_profile_dir "$name")   (its Claude settings; transcripts are kept)"
   warn "This cannot be undone (including all code in the app volume)."
 
@@ -3407,8 +4120,9 @@ cmd_delete() {
   if [ -n "$ENGINE" ]; then
     "$ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
     [ -n "$vols" ] && "$ENGINE" volume rm $vols >/dev/null 2>&1 || true
-    # Egress internal network (restricted projects): detach the proxy, then remove.
+    # Egress internal network (restricted projects): detach both proxies, then remove.
     "$ENGINE" network disconnect "$(internal_net "$name")" "$PROXY_NAME" >/dev/null 2>&1 || true
+    "$ENGINE" network disconnect "$(internal_net "$name")" "$EGRESS_NAME" >/dev/null 2>&1 || true
     "$ENGINE" network rm "$(internal_net "$name")" >/dev/null 2>&1 || true
     volume_exists && "$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" \
       sh -c "rm -f '$prof' '$prof'-*-link" >/dev/null 2>&1 || true
@@ -3416,6 +4130,8 @@ cmd_delete() {
   rm -rf "$pdir"
   # A re-created project of the same name must not inherit these.
   rm -rf "$(claude_profile_dir "$name")"
+  # Recorded traffic ('capture') can hold its tokens and cookies.
+  rm -f "$EGRESS_DATA_DIR/captures/$name.flows" "$EGRESS_DATA_DIR/captures/$name.log"
   ok "Deleted project '$name'"
 }
 
@@ -4272,8 +4988,9 @@ Commands:
                             <project>/hosts.extra; the entrypoint merges that file
                             into /etc/hosts at start. Edit the file by hand too.
                             Restarts a running project to apply
-  proxy [up|reload|stop|status|logs|renew|remove-cert]
-                            Shared Caddy reverse proxy. 'up' starts it and routes
+  proxy [up|reload|stop|status|logs [egress]|renew|remove-cert]
+                            Shared Caddy reverse proxy (plus, for restricted
+                            projects, the '$EGRESS_NAME' container running squid). 'up' starts it and routes
                             https://<project>-<port>.$PROXY_DOMAIN → nixenv-<project>:<port>
                             over network '$PROXY_NET' (projects auto-join on 'run').
                             Auto-starts on the first 'run' (PROXY_AUTOSTART=0 to skip).
@@ -4291,12 +5008,24 @@ Commands:
                             it runs on its own INTERNAL network (no route out) and
                             can only reach hosts in <project>/allowed_hosts (the
                             forge domain is seeded automatically), via squid in
-                            the proxy container (default-deny). ssh/ports keep
+                            the '$EGRESS_NAME' container (default-deny). ssh/ports keep
                             working (relayed through the proxy). 'off' opts out
   allow <project> <host>…   Add validated egress host(s) (domain or IP) to
                             <project>/allowed_hosts and reload the proxy
   egress <project> [-f]     Show the project's egress log: allowed vs DENIED
                             domains (candidates to validate); -f follows live
+  capture <project> [on [egress|ingress]|off|status|web|log [-f]|tui|har <file>|clear]
+                            Record a RESTRICTED project's HTTP(S) traffic with
+                            mitmproxy, behind squid (its rules still apply).
+                            'egress' = its outbound requests (HTTPS decrypted: the
+                            container trusts mitmproxy's CA while capture is on,
+                            restart it after 'on'); 'ingress' = requests to its
+                            public URLs (via Caddy). Default: both.
+                            'web' prints the mitmweb UI URL (127.0.0.1:$CAPTURE_WEB_PORT),
+                            'log -f' follows a one-line-per-request log, 'tui'
+                            opens the recorded flows in mitmproxy's console UI,
+                            'har' exports them. Captures hold tokens and cookies:
+                            they stay owner-only in $EGRESS_DATA_DIR/captures
   ssh-config [--install]    Print (or install) the ~/.ssh/config Include so
                             'ssh <project>' works via each <project>/ssh/config
   up <project>              build if needed, then start the service
@@ -4353,6 +5082,7 @@ Per-project (runtime runs as non-root user '$APP_USER'):
                           project ('restrict <p> off'; absent = restricted)
   <project>/allowed_hosts → validated egress hosts, one per line (via 'allow';
                           init seeds the forge domain from the clone URL)
+  <project>/capture     → 'capture' on: the directions recorded (egress/ingress)
 
 SSH: each project gets a random host port (stored once in <project>/port). The
 container runs an unprivileged sshd (port 2222) via runit as '$APP_USER', key-only:
@@ -4376,6 +5106,7 @@ Environment overrides:
   PROXY_NET=$PROXY_NET                  (shared user network)
   PROXY_HTTP_PORT=$PROXY_HTTP_PORT / PROXY_HTTPS_PORT=$PROXY_HTTPS_PORT   (host ports; use 8080/8443 for podman rootless)
   PROXY_AUTOSTART=$PROXY_AUTOSTART                     (auto-start the proxy on 'run'; 0 to disable)
+  CAPTURE_WEB_PORT=$CAPTURE_WEB_PORT                  (host port of the 'capture' web UI, on 127.0.0.1)
   PROXY_MKCERT_INSTALL                        (1=run 'mkcert -install' on explicit 'proxy up';
                                                0=never trust — HTTPS works with a warning.
                                                Auto-start on 'run' defaults to 0)
@@ -4430,6 +5161,7 @@ main() {
     restrict) cmd_restrict "$@";;
     allow)    cmd_allow "$@";;
     egress)   cmd_egress "$@";;
+    capture)  cmd_capture "$@";;
     stop)     cmd_stop "$@";;
     logs)     cmd_logs "$@";;
     delete|rm) cmd_delete "$@";;

@@ -113,3 +113,22 @@ out="$(PATH="$T2/bin:$PATH" bash "$T2/engines.sh" --help 2>&1)" && fail "an outd
 assert_contains "$out" "upgrade nixenv" "says how to fix an outdated nixenv"
 rm -rf "$T2"
 true
+
+# --- Nested nixenv never shares names with the hosted one ---------------------
+# The dev wrappers default the prefix to nixdev (an explicit one still wins),
+# and every engine-side name follows the prefix — the store volume included.
+dflake="$(code_only < "$REPO_DIR/dev/flake.nix")"
+assert_contains "$dflake" "export CONTAINER_PREFIX=\"''\${CONTAINER_PREFIX:-nixdev}\"" "dev wrappers default to nixdev"
+[ "$(printf '%s\n' "$dflake" | grep -c '{devPrefix}')" -eq 2 ] || fail "both wrappers (nixenv, nixenv-<engine>) use the dev prefix"
+names() {
+  env -u NIX_VOLUME -u PROXY_NET -u EGRESS_NET CONTAINER_PREFIX="$1" bash -c \
+    'source "$1"; echo "$NIX_VOLUME $PROXY_NET $EGRESS_NET $PROXY_NAME $EGRESS_NAME"' _ "$NIXENV_SH"
+}
+assert_eq "$(names nixdev)" "nixdev__nixos_store nixdev_net nixdev_net-egress nixdev-proxy nixdev-egress" "nixdev names"
+assert_eq "$(names nixenv)" "nixenv__nixos_store nixenv_net nixenv_net-egress nixenv-proxy nixenv-egress" "default names unchanged"
+# Inside the container, sibling names use the prefix too (NO_PROXY, ssh bypass).
+ep="$(cat "$CONTEXT_DIR/entrypoint.sh" 2>/dev/null || { materialize_context; cat "$CONTEXT_DIR/entrypoint.sh"; })"
+assert_contains "$ep" '!$_cpfx-*' "ssh: siblings bypass the egress proxy whatever the prefix"
+assert_not_contains "$(printf '%s' "$ep" | code_only)" 'nixenv-$NIXENV_PROJECT' "no hardcoded nixenv- container name"
+assert_contains "$(sed -n '/^cmd_run()/,/^}/p' "$NIXENV_SH")" 'NIXENV_CONTAINER_PREFIX="$CONTAINER_PREFIX"' "run passes the prefix"
+true

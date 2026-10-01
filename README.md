@@ -183,8 +183,12 @@ interactive `zsh` via `docker exec` (no SSH key needed).
 - `restrict <project> [on|off]` / `allow <project> <host>…` /
   `egress <project> [-f]` — egress restriction to validated hosts only, ON by
   default (see [Egress restriction](#egress-restriction-default-validated-hosts-only)).
-- `proxy [up|stop|status|logs|renew|remove-cert]` — shared HTTPS reverse proxy
-  for all projects (see [Reverse proxy](#reverse-proxy-httpsproject-portnixenvlocalhost)).
+- `capture <project> [on|off|web|log -f|tui|har <file>|clear]` — record a
+  restricted project's HTTP(S) traffic with mitmproxy, with a web UI and CLI
+  views (see [Capturing traffic](#capturing-traffic-capture)).
+- `proxy [up|reload|stop|status|logs [egress]|renew|remove-cert]` — shared HTTPS
+  reverse proxy for all projects, plus the egress container restricted projects
+  go out through (see [Reverse proxy](#reverse-proxy-httpsproject-portnixenvlocalhost)).
 - `up <project>` — build if needed, then start the service.
 - `stop [<project>]` — stop and remove the project's service container; with no
   project, stops **every** nixenv container including the shared proxy (volumes
@@ -352,8 +356,12 @@ flowchart LR
 
     subgraph PROXYC["📦 nixenv-proxy"]
         CADDY["Caddy :80/:443<br/><i>ingress — routes on Host</i>"]
-        SQUID["squid :3128<br/><i>egress allowlist</i>"]
         RELAYS["socat relays<br/><i>ssh + declared ports</i>"]
+    end
+
+    subgraph EGRESSC["📦 nixenv-egress"]
+        SQUID["squid :3128<br/><i>egress allowlist</i>"]
+        MITM["mitmproxy<br/><i>only with 'capture'</i>"]
     end
 
     subgraph PROJ["📦 nixenv-myapp &nbsp;(internal network)"]
@@ -370,6 +378,8 @@ flowchart LR
     LOOP -- "raw TCP, TLS stays end-to-end" --> CADDY
     APP -- "③ HTTPS_PROXY env → CONNECT" --> SQUID
     SQUID -- "allowed_hosts only<br/>else 403" --> NET
+    SQUID -. "captured projects" .-> MITM
+    MITM -.-> NET
     CLIENT -- "④ 127.0.0.1:port" --> RELAYS
     RELAYS --> SSHD
 
@@ -380,7 +390,7 @@ flowchart LR
 | --- | --- | --- |
 | ① | **Ingress** — browser → app, HTTPS, no setup | automatic; `proxy up\|status`, `PROXY_DOMAIN`, `PROXY_HTTP_PORT`/`PROXY_HTTPS_PORT`, mkcert for trusted certs |
 | ② | **Public URL from inside** the container | automatic (loopback relay + CA injection); glibc clients need `nixenv host <p> <name>:127.0.0.1` |
-| ③ | **Egress** to the internet — default-deny | `restrict <p> on\|off`, `allow <p> <host>`, `egress <p>` to see allowed vs denied |
+| ③ | **Egress** to the internet — default-deny | `restrict <p> on\|off`, `allow <p> <host>`, `egress <p>` to see allowed vs denied, `capture <p> on` to record it |
 | ④ | **Raw TCP** from your Mac (databases, ssh) | `expose <p> <port>`; ssh port is automatic |
 
 Two paths need no proxy at all: **service-to-service** calls between projects
@@ -548,9 +558,13 @@ nixenv init open-project --unrestricted   # opt out at creation
 
 How it works: the restricted project runs on its own **internal** network — the
 kernel gives it *no route to the internet at all* — and its only way out is a
-**squid** allowlist proxy (default-deny) running inside the shared proxy
+**squid** allowlist proxy (default-deny) running in the shared `nixenv-egress`
 container. Enforcement is the missing route; squid is just policy, so nothing
-in the container can bypass the list. `HTTP(S)_PROXY` is exported automatically
+in the container can bypass the list. (squid used to run inside `nixenv-proxy`
+next to Caddy; it has its own container now, so restarting the reverse proxy
+no longer cuts every project off the network. A project container created
+before that still points at the old address — `run` tells you, and
+`nixenv stop <p> && nixenv run <p>` fixes it.) `HTTP(S)_PROXY` is exported automatically
 (npm, pip, composer, cargo, curl, git-https, the Claude CLI all honour it), and
 ssh is routed through the proxy's CONNECT tunnel via a `ProxyCommand` added to
 the container's `~/.ssh/config` — so `git@…` remotes to **validated** forges
@@ -626,6 +640,48 @@ that asks for `<secret>.attacker.example` delivers the secret to whoever runs
 that domain's nameserver, even though the request is then refused. So the proxy
 decides on the *name* first, and only resolves names that are already allowed —
 it still does that, to refuse an allowed name that points at a private address.
+
+## Capturing traffic (`capture`)
+
+See exactly what a project sends and receives — every HTTP(S) request, headers
+and bodies — with [mitmproxy](https://mitmproxy.org), in a web UI or from the
+terminal:
+
+```sh
+nixenv capture myapp on            # egress + ingress (or: on egress | on ingress)
+nixenv capture myapp web           # prints the UI URL: http://127.0.0.1:8081/?token=…
+nixenv capture myapp log -f        # one line per request, live
+nixenv capture myapp tui           # the recorded flows in mitmproxy's console UI
+nixenv capture myapp har out.har   # export for browser devtools & co
+nixenv capture myapp off           # stop recording (files kept)
+nixenv capture myapp clear         # delete the recordings
+```
+
+- **Egress** — the project's outbound requests. mitmproxy sits *behind* squid,
+  so the allowlist still decides first: a refused host gets its 403 and never
+  reaches mitmproxy (or its DNS). HTTPS is decrypted, which only works because
+  the container trusts mitmproxy's CA while capture is on — after `capture on`
+  the project must restart once (`capture on` offers to do it). Apps that pin
+  certificates will refuse the connection; that shows as `TLS-REFUSED` in the
+  log. ssh and `git://` are never captured.
+- **Ingress** — requests to the project's public URLs
+  (`https://<project>-<port>.nixenv.localhost/`), routed by Caddy through
+  mitmproxy on the way in. The app still sees the public `Host`.
+
+Only **restricted** projects (the default) can be captured: an unrestricted
+one talks to the internet directly, with no proxy in the path.
+
+**Captures are secrets.** They hold whatever crossed the wire: tokens,
+cookies, the `Authorization` header of an HTTPS `git fetch`. They are stored
+owner-only in `~/.nixenv/proxy/egress-data/captures/<project>.{flows,log}`,
+`delete` removes them, and the UI is published on `127.0.0.1` only, behind a
+password (the `token` in the URL — don't paste it around). No project can
+reach mitmproxy directly: its listeners are bound to the egress container's
+loopback (only squid uses them) or to the network it shares with Caddy alone.
+Capture fails closed: if mitmproxy is down, the captured project's requests
+fail rather than go out unrecorded (`nixenv proxy logs egress` shows why).
+mitmproxy keeps flows in memory for the UI; `capture <p> clear` (or `off`)
+restarts it. Set `CAPTURE_WEB_PORT` if 8081 is taken.
 
 ### Allowlist cheatsheet (tools in the base toolchain + VS Code)
 
@@ -930,7 +986,10 @@ Override via environment variables:
 
 - `CONTAINER_ENGINE` (`docker` or `podman`; auto-detects, asks if both present)
 - `CONTEXT_DIR` (default `~/.nixenv/context`)
-- `NIX_VOLUME` (default `nixenv__nixos_store`)
+- `CONTAINER_PREFIX` (default `nixenv`) — every engine-side name: containers
+  `<prefix>-<project>`, volumes `<prefix>_<project>_*`, and the defaults of
+  `NIX_VOLUME` and `PROXY_NET` below. Two prefixes on one engine share nothing.
+- `NIX_VOLUME` (default `<prefix>__nixos_store`, i.e. `nixenv__nixos_store`)
 - `BUILDER_IMAGE` (default `nixos/nix:2.32.8`)
 - `RUNTIME_IMAGE` (default `debian:stable-slim`)
 - `APP_USER` (default `app`)
@@ -942,11 +1001,13 @@ Override via environment variables:
 - `APP_MOUNT` — default code-volume mount path for `init` (same as
   `--app-path`).
 - `PROXY_DOMAIN` (default `nixenv.localhost`), `PROXY_NET` (default
-  `nixenv_net`), `PROXY_HTTP_PORT` / `PROXY_HTTPS_PORT` (default 80/443; use
+  `<prefix>_net`, i.e. `nixenv_net`), `PROXY_HTTP_PORT` / `PROXY_HTTPS_PORT` (default 80/443; use
   8080/8443 for rootless Podman), `PROXY_AUTOSTART` (default 1; 0 = don't start
   the proxy on `run`), `PROXY_MKCERT_INSTALL` (0 = never run `mkcert -install`).
-- `EGRESS_PORT` (default 3128) — squid's port inside the proxy container (not
-  published; used by restricted projects).
+- `EGRESS_PORT` (default 3128) — squid's port inside the `nixenv-egress`
+  container (not published; used by restricted projects).
+- `CAPTURE_WEB_PORT` (default 8081) — host port (on `127.0.0.1`) of the
+  `capture` web UI.
 
 Projects always live in `~/.nixenv/projects` (not configurable).
 

@@ -97,11 +97,41 @@ Boot a nested project — the hello example:
 nixenv build                                                  # nested store (slow the first time; kept in the sidecar)
 nixenv init hello --template=examples/hello/flake.nix --yes
 nixenv run hello
-docker exec nixenv-hello /nix/var/nix/profiles/shared/bin/curl -s localhost:8080 | grep nixenv-hello-ok
+docker exec nixdev-hello /nix/var/nix/profiles/shared/bin/curl -s localhost:8080 | grep nixenv-hello-ok
 ```
 
 Nested ports and the nested proxy live in the sidecar's network: reach them with
-`docker exec`, not from your browser. The first nested `build` may ask for a
+`docker exec`, not from your browser.
+
+**Nested names are `nixdev-*`, never `nixenv-*`.** The dev wrappers (`nixenv`,
+`nixenv-docker`, `nixenv-podman`) default `CONTAINER_PREFIX=nixdev`, and every
+engine-side name follows the prefix: containers `nixdev-<p>`, `nixdev-proxy`,
+`nixdev-egress`, volumes `nixdev_<p>_*`, networks `nixdev_net*` and the store
+volume `nixdev__nixos_store`. So even on an engine shared with your hosted
+nixenv, a nested `stop`, `delete` or `build` can only touch nested things. An
+explicit `CONTAINER_PREFIX=…` still wins.
+
+Nested projects made before this used the `nixenv` prefix and are not picked up
+by the new names. Either keep driving them with `CONTAINER_PREFIX=nixenv
+nixenv-docker …`, or move them once:
+
+```sh
+CONTAINER_PREFIX=nixenv nixenv-docker stop          # the old nested containers
+for p in $(ls ~/.nixenv-dev/docker/.nixenv/projects); do
+  for k in app home databases; do
+    docker volume create "nixdev_${p}_$k" >/dev/null
+    docker run --rm -v "nixenv_${p}_$k":/from:ro -v "nixdev_${p}_$k":/to \
+      debian:stable-slim cp -a /from/. /to/
+  done
+done
+nixenv-docker build                                 # builds nixdev__nixos_store
+nixenv-docker build <p>                             # each project flake, then run
+```
+
+(`NIX_VOLUME=nixenv__nixos_store` reuses the old nested store instead of
+building a new one — fine inside the sidecar, but on a SHARED engine that is
+the hosted store, and a nested `build` would rewrite it.) Remove the old
+`nixenv_*` volumes once the moved projects work. The first nested `build` may ask for a
 GitHub token — see "GitHub token" in the README.
 
 ### One project on Docker, one on Podman
@@ -116,12 +146,12 @@ share config files.
 nixenv-docker build                   # one nested store per engine (slow once each)
 nixenv-docker init hello-docker --template=examples/hello/flake.nix --yes
 nixenv-docker run hello-docker
-docker exec nixenv-hello-docker /nix/var/nix/profiles/shared/bin/curl -s localhost:8080 | grep nixenv-hello-ok
+docker exec nixdev-hello-docker /nix/var/nix/profiles/shared/bin/curl -s localhost:8080 | grep nixenv-hello-ok
 
 nixenv-podman build
 nixenv-podman init hello-podman --template=examples/hello/flake.nix --yes
 nixenv-podman run hello-podman
-podman exec nixenv-hello-podman /nix/var/nix/profiles/shared/bin/curl -s localhost:8080 | grep nixenv-hello-ok
+podman exec nixdev-hello-podman /nix/var/nix/profiles/shared/bin/curl -s localhost:8080 | grep nixenv-hello-ok
 
 nixenv-docker projects                # lists only the Docker ones
 ```
@@ -165,6 +195,16 @@ The same commands work in both setups (inside the dev project, from `/app`).
 Integration tests clean up after themselves by prefix, but they do use your
 engine — prefer `run-in-docker.sh`, or the dev project, if you have projects you
 care about.
+
+Inside the dev project, two things differ. Point `NIXTEST_HOME` under
+`/home/app` (e.g. `NIXTEST_HOME=/home/app/.cache/nxt-tests`): the sidecar
+daemon resolves bind-mount paths on its own filesystem, which shares only the
+home and app volumes, so the default `/tmp/nixenv-tests` fails with "not a
+directory". And ports published on `127.0.0.1` land on the SIDECAR's
+loopback, not the project's, so checks that `wait_tcp`/`curl` a host port
+(06, the ssh relay in 07, 16) can't pass there; the rest of those tests can.
+`integration/19-capture.sh` takes `NIXENV_TEST_PROFILE=<profile path>` to run
+against a profile with mitmproxy without rebuilding the shared one.
 
 Every change to `nixenv.sh` needs the unit suite green. New logic gets a unit
 test (`tests/unit/NN-name.sh`); anything that touches containers also gets an
