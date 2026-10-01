@@ -787,8 +787,10 @@ Host-side, `~/.nixenv/projects/<name>/` keeps only small state: `home/` (the
 **seed** the home volume is populated from on first run — skeleton + git config),
 the generated `passwd`/`group`/`shadow` (the container's user db), `port`,
 `ports`, `app_mount` (custom code-volume path, if set), `hosts.extra`
-(local `/etc/hosts` entries, if any), `extra-parameters` (see below), and
-`ssh/config`. Because the code and home are in volumes, they're not directly
+(local `/etc/hosts` entries, if any), `extra-parameters` (see below),
+`capture` (present while [`capture`](#capturing-traffic-capture) is on), and
+`ssh/config`. Recorded traffic lives outside it, in
+`~/.nixenv/proxy/egress-data/captures/<name>.{flows,log}`. Because the code and home are in volumes, they're not directly
 editable from the host — you work through the container (`nixenv ssh` /
 Remote-SSH / VS Code). Populate the code volume by passing a git URL to `init`,
 or by cloning/working inside the container at the app mount (`/app` by default,
@@ -1127,10 +1129,11 @@ NIXTEST_HEAVY=1 ./tests/run.sh integration   # include the slow flake-build test
 ```
 
 Unit tests source `nixenv.sh` (functions only, nothing executes) and verify all
-pure logic: URL/name/ACL parsing, Caddyfile/squid/start.sh generation, the
-entrypoint's feature hooks, allowlist semantics. Integration tests exercise the
-real flows — init/volumes/run/ssh/app-path/hosts/proxy routing/egress
-deny+allow/sync-home/expose/delete — using an isolated prefix (`nxt-*`
+pure logic: URL/name/ACL parsing, Caddyfile/squid/start.sh/egress.sh
+generation, the entrypoint's feature hooks, allowlist semantics, and the
+capture addon (against a stub mitmproxy, so no install is needed). Integration
+tests exercise the real flows — init/volumes/run/ssh/app-path/hosts/proxy
+routing/egress deny+allow/capture/sync-home/expose/delete — using an isolated prefix (`nxt-*`
 containers, volumes, networks) and isolated state dirs; they sweep everything
 prefixed before and after each test, and reuse the shared nix store volume
 (test `00` builds it if missing). `run-in-docker.sh` wraps all of that in a

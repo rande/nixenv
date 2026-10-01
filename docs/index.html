@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>nixenv — one Nix store, a room for every project</title>
-<meta name="description" content="nixenv spins up disposable, per-project dev containers that all share one pinned Nix toolchain. Docker or Podman, non-root, egress-restricted by default.">
+<meta name="description" content="nixenv spins up disposable, per-project dev containers that all share one pinned Nix toolchain. Docker or Podman, non-root, egress-restricted by default, with ready-made stacks and built-in traffic capture.">
 <meta property="og:title" content="nixenv — one Nix store, a room for every project">
 <meta property="og:description" content="Disposable per-project dev containers sharing one pinned Nix store. Single bash script, Docker or Podman.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='3' width='26' height='26' fill='none' stroke='%231d4ed8' stroke-width='3'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%231d4ed8'/%3E%3C/svg%3E">
@@ -248,6 +248,42 @@ h2 { font: 400 clamp(30px, 4vw, 42px)/1.1 var(--serif); margin: 0 0 10px; letter
 }
 .honest b { color: var(--accent); font-family: var(--mono); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; margin-right: 8px; }
 
+/* Templates — a drawing set, one sheet per stack */
+.dwg-set { display: grid; grid-template-columns: repeat(5, 1fr); border: 1.5px solid var(--ink); background: var(--paper); }
+@media (max-width: 1000px) { .dwg-set { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 680px) { .dwg-set { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 440px) { .dwg-set { grid-template-columns: 1fr; } }
+.dwg {
+  font: inherit; color: inherit; text-align: left; cursor: pointer; background: var(--paper);
+  border: 0; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft);
+  padding: 18px 18px 20px; display: flex; flex-direction: column; gap: 6px; position: relative;
+}
+.dwg:hover { background: var(--line-soft); }
+.dwg[aria-pressed="true"] { background: var(--line-soft); box-shadow: inset 0 3px 0 var(--accent); }
+.dwg:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.dwg .no { font: 11px var(--mono); letter-spacing: .1em; color: var(--accent); }
+.dwg h3 { margin: 0; font: 600 15px var(--mono); }
+.dwg p { margin: 0; font-size: 14px; color: var(--ink-soft); flex: 1; }
+.dwg .spec { font: 11px var(--mono); color: var(--ink-soft); letter-spacing: .04em; border-top: 1px dashed var(--line-soft); padding-top: 8px; }
+.tpl-detail { display: grid; grid-template-columns: 1.3fr 1fr; gap: 36px; align-items: start; margin-top: 28px; }
+@media (max-width: 900px) { .tpl-detail { grid-template-columns: 1fr; } }
+.first { margin: 0 0 14px; padding: 4px 0 4px 12px; border-left: 3px solid var(--accent); font-size: 15px; color: var(--ink-soft); min-height: 4.8em; }
+.first b { color: var(--ink); }
+
+/* Capture — the recorder in the egress path */
+.cap-grid { display: grid; grid-template-columns: 1.15fr 1fr; gap: 36px; align-items: start; }
+@media (max-width: 900px) { .cap-grid { grid-template-columns: 1fr; } }
+.cap-fig { margin: 0 0 22px; }
+.cap-fig svg { width: 100%; height: auto; display: block; }
+.cap-fig figcaption {
+  font: 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-soft);
+  border-top: 1px solid var(--ink); padding-top: 8px; margin-top: 6px;
+}
+.term pre.static { min-height: 0; }
+/* Grid columns otherwise refuse to shrink below their widest code line,
+   pushing the page sideways on a phone. */
+.tpl-detail > *, .cap-grid > *, .install-grid > *, .term-wrap > * { min-width: 0; }
+
 /* Install */
 .tabs { display: flex; gap: 0; border: 1.5px solid var(--ink); border-bottom: 0; width: fit-content; }
 .tabs button {
@@ -266,6 +302,7 @@ h2 { font: 400 clamp(30px, 4vw, 42px)/1.1 var(--serif); margin: 0 0 10px; letter
   border: 1px solid #3b4f78; padding: 4px 9px; border-radius: 4px; cursor: pointer;
 }
 .copy:hover { background: #3b4f78; }
+@media (max-width: 600px) { .codeblock pre { padding-top: 46px; } }   /* clear of the copy button */
 .install-grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 36px; align-items: start; }
 @media (max-width: 900px) { .install-grid { grid-template-columns: 1fr; } }
 .req { list-style: none; margin: 0; padding: 0; }
@@ -287,11 +324,13 @@ footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: spac
 <header class="frame">
   <div class="sheet">
     <div class="cell brand"><span>project</span><b>nixenv</b></div>
-    <div class="cell"><span>rev</span><b id="rev">0.1.0</b></div>
+    <div class="cell"><span>rev</span><b id="rev">0.2.0</b></div>
     <div class="cell"><span>licence</span><b>GPL-3.0+</b></div>
     <nav>
       <a href="#how" class="hide-sm">How</a>
       <a href="#try" class="hide-sm">Try</a>
+      <a href="#templates" class="hide-sm">Templates</a>
+      <a href="#capture" class="hide-sm">Capture</a>
       <a href="#security" class="hide-sm">Security</a>
       <a href="#install">Install</a>
       <a href="https://github.com/rande/nixenv">GitHub ↗</a>
@@ -324,7 +363,7 @@ footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: spac
 
     <figure class="plan" style="margin:0">
       <svg viewBox="0 0 560 500" role="img" aria-labelledby="planTitle">
-        <title id="planTitle">Plan: three example projects, each in its own container. A projects gateway brings HTTPS in to every project, an exit proxy is every project's only way out to the internet, and all projects mount one shared Nix store read-only.</title>
+        <title id="planTitle">Plan: three example projects, each in its own container. A projects gateway brings HTTPS in to every project, an exit proxy is every project's only way out to the internet, an optional recorder (mitmproxy) next to it captures the traffic of projects you choose, and all projects mount one shared Nix store read-only.</title>
         <defs>
           <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0,0 L10,5 L0,10 z" class="f-line"/>
@@ -352,12 +391,14 @@ footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: spac
           <text x="40" y="54" class="t" style="fill:var(--line)">your browser</text>
         </g>
         <path d="M140,60 V76" fill="none" class="s-line flow" stroke-width="1.5" marker-end="url(#arr)"/>
-        <text x="330" y="54" class="t" style="fill:var(--ok)">internet</text>
-        <path d="M420,78 V60" fill="none" class="s-ok flow" stroke-width="1.5" marker-end="url(#arrO)"/>
-        <text x="428" y="68" class="t-sm">allowed hosts</text>
+        <text x="345" y="40" class="t" style="fill:var(--ok)">internet</text>
+        <path d="M369,78 V50" fill="none" class="s-ok flow" stroke-width="1.5" marker-end="url(#arrO)"/>
+        <text x="377" y="66" class="t-sm">allowed hosts</text>
+        <!-- captured projects: allowed traffic leaves through the recorder -->
+        <path d="M488,78 V36 H410" fill="none" class="s-ok" stroke-width="1.5" stroke-dasharray="2 3" marker-end="url(#arrO)"/>
         <g class="blocked">
-          <path d="M510,78 V62" class="s-acc" stroke-width="1.5"/>
-          <path d="M503,48 L517,62 M517,48 L503,62" class="s-acc" stroke-width="2"/>
+          <path d="M330,78 V64" class="s-acc" stroke-width="1.5"/>
+          <path d="M323,50 L337,64 M337,50 L323,64" class="s-acc" stroke-width="2"/>
         </g>
 
         <!-- projects gateway -->
@@ -368,10 +409,18 @@ footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: spac
         </g>
 
         <!-- exit proxy -->
-        <g class="room" data-note="<b>Exit proxy</b> — the way OUT. Projects have <b>no direct route</b> to the internet: every outbound request goes through here, and only the hosts on that project's allowlist get through. A refused name is never even looked up.">
-          <rect class="body f-paper s-ink" x="310" y="78" width="220" height="58" stroke-width="1.5"/>
+        <g class="room" data-note="<b>Exit proxy</b> — the way OUT. Projects have <b>no direct route</b> to the internet: every outbound request goes through here, and only the hosts on that project's allowlist get through. A refused name is never even looked up — and never reaches the recorder next to it.">
+          <rect class="body f-paper s-ink" x="310" y="78" width="118" height="58" stroke-width="1.5"/>
           <text x="324" y="100" class="t" style="font-weight:600">Exit proxy</text>
-          <text x="324" y="120" class="t-sm">per-project allowlist · deny rest</text>
+          <text x="324" y="120" class="t-sm">allowlist first</text>
+        </g>
+
+        <!-- recorder (mitmproxy), only for projects with capture on -->
+        <path d="M428,107 H444" fill="none" class="s-ok" stroke-width="1.5" stroke-dasharray="2 3" marker-end="url(#arrO)"/>
+        <g class="room" data-note="<b>Recorder</b> (mitmproxy) — off until you run <code>nixenv capture myapp on</code>. That project's traffic then passes through it <b>after</b> the allowlist, and on the way in from the gateway, so every request and response is recorded — browse them in a web UI on <code>127.0.0.1</code> or from your terminal. No project can reach it directly.">
+          <rect class="body f-paper s-line" x="446" y="78" width="84" height="58" stroke-width="1.5" stroke-dasharray="4 3"/>
+          <text x="456" y="100" class="t" style="font-weight:600">Recorder</text>
+          <text x="456" y="120" class="t-sm">mitmproxy</text>
         </g>
 
         <!-- inbound: gateway → every project -->
@@ -383,7 +432,7 @@ footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: spac
         <!-- outbound: every project → exit proxy (bridges over the inbound bus) -->
         <path d="M150,192 V150 M320,192 V150 M490,192 V150" fill="none" class="f-paper" style="stroke:var(--paper)" stroke-width="6"/>
         <path d="M150,192 V150 M320,192 V150 M490,192 V150 M150,150 H490" fill="none" class="s-ok flow" stroke-width="1.5"/>
-        <path d="M420,150 V138" fill="none" class="s-ok" stroke-width="1.5" marker-end="url(#arrO)"/>
+        <path d="M369,150 V138" fill="none" class="s-ok" stroke-width="1.5" marker-end="url(#arrO)"/>
 
         <!-- the projects -->
         <rect x="24" y="178" width="512" height="124" fill="none" class="s-ink" stroke-width="1" stroke-dasharray="2 4"/>
@@ -444,6 +493,7 @@ footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: spac
         <g transform="translate(400,462)">
           <line x1="0" y1="0" x2="18" y2="0" class="s-line" stroke-width="2"/><text x="24" y="3" class="t-sm">in (https)</text>
           <line x1="0" y1="14" x2="18" y2="14" class="s-ok" stroke-width="2"/><text x="24" y="17" class="t-sm">out (allowlisted)</text>
+          <line x1="0" y1="-14" x2="18" y2="-14" class="s-ok" stroke-width="2" stroke-dasharray="2 3"/><text x="24" y="-11" class="t-sm">recorded (capture)</text>
         </g>
       </svg>
       <figcaption class="caption"><span>Fig. 1 — three example projects on one machine</span><span>hover any part</span></figcaption>
@@ -515,15 +565,159 @@ footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: spac
         <tr><td>R-07</td><td>Services under runit</td><td>Declare <code>sv/&lt;name&gt;/run</code> in the repo or flake; databases and workers start with the container and restart if they die.</td></tr>
         <tr><td>R-08</td><td>Export / import</td><td>Move a project between machines as one archive. Secrets stay out unless you ask, and imported settings are checked, not trusted.</td></tr>
         <tr><td>R-09</td><td>Claude CLI built in</td><td>One login for all projects; settings, hooks and MCP servers stay per project.</td></tr>
-        <tr><td>R-10</td><td>A single file</td><td>The whole tool is one bash script (Bash 3.2 compatible), with its flake, entrypoint and dotfiles embedded.</td></tr>
+        <tr><td>R-10</td><td>Ready-made stacks</td><td><code>init --template=wordpress</code> — or cloudflare, symfony, directus-astro, windmill. One file becomes the project's flake; the app installs itself on first start.</td></tr>
+        <tr><td>R-11</td><td>Traffic capture</td><td><code>nixenv capture</code> records a project's HTTP(S), in and out, with mitmproxy — in a web UI or the terminal — without loosening the allowlist.</td></tr>
+        <tr><td>R-12</td><td>A single file</td><td>The whole tool is one bash script (Bash 3.2 compatible), with its flake, entrypoint and dotfiles embedded.</td></tr>
       </tbody>
     </table>
+  </section>
+
+  <!-- ═══ Templates ══════════════════════════════════════════════════════ -->
+  <section id="templates">
+    <div class="sec-head">
+      <div class="sec-no">§ 04</div>
+      <div>
+        <h2>A running stack in one command</h2>
+        <p>A template is <b>one file</b> that becomes the project's <code>flake.nix</code>: the toolchain, the services, and a startup hook that installs the app on first start. What you get is an ordinary project — real files in your app volume, yours to edit and commit. Pick a sheet.</p>
+      </div>
+    </div>
+    <div class="dwg-set" role="group" aria-label="Shipped templates">
+      <button class="dwg" aria-pressed="true" data-tpl="wordpress" data-project="myblog" data-port="8080"
+        data-first="<b>On first start</b> wp-cli downloads WordPress core, creates the MariaDB database, installs the site and its plugins. nginx and php-fpm run as services; outbound requests go through the exit proxy, which the template has already allowed WordPress's hosts on.">
+        <span class="no">T-01</span><h3>wordpress</h3>
+        <p>WordPress, PHP 8.3, nginx and MariaDB, with wp-cli.</p>
+        <span class="spec">:8080 · php · mariadb</span>
+      </button>
+      <button class="dwg" aria-pressed="false" data-tpl="cloudflare" data-project="myworker" data-port="8787"
+        data-first="<b>On first start</b> it scaffolds a minimal Worker — skipped when the repo already has one — installs its packages and runs <code>wrangler dev</code> in local mode, bound so the gateway can reach it.">
+        <span class="no">T-02</span><h3>cloudflare</h3>
+        <p>Cloudflare Workers with wrangler and Node 22, local mode.</p>
+        <span class="spec">:8787 · node · wrangler</span>
+      </button>
+      <button class="dwg" aria-pressed="false" data-tpl="symfony" data-project="myapp" data-port="8000"
+        data-first="<b>On first start</b> <code>composer create-project</code> builds a Symfony skeleton into the app volume and PostgreSQL gets its database; nginx, php-fpm and postgres start as services. symfony-cli is on the path.">
+        <span class="no">T-03</span><h3>symfony</h3>
+        <p>Symfony 7, PHP 8.3, nginx and PostgreSQL, with composer.</p>
+        <span class="spec">:8000 · php · postgres</span>
+      </button>
+      <button class="dwg" aria-pressed="false" data-tpl="headlesscms-directus-astro" data-project="mysite" data-port="4321"
+        data-first="<b>On first start</b> it installs Directus — API and admin on <code>:8055</code>, backed by PostgreSQL — and an Astro frontend on <code>:4321</code> that reads its content from it. Both get their own HTTPS address.">
+        <span class="no">T-04</span><h3>directus-astro</h3>
+        <p>A headless CMS: Directus for content, Astro for the site.</p>
+        <span class="spec">:4321 · :8055 · node · postgres</span>
+      </button>
+      <button class="dwg" aria-pressed="false" data-tpl="windmill" data-project="flows" data-port="8000"
+        data-first="<b>On first start</b> it brings up PostgreSQL, the Windmill server and two worker groups as services — no docker-compose. Scripts and flows live in the database; <code>wmill sync pull</code> writes them into the repo when you decide to.">
+        <span class="no">T-05</span><h3>windmill</h3>
+        <p>Self-hosted Windmill: server, workers and PostgreSQL.</p>
+        <span class="spec">:8000 · postgres · workers</span>
+      </button>
+    </div>
+    <div class="tpl-detail">
+      <div>
+        <p class="first" id="tplFirst" aria-live="polite"><b>On first start</b> wp-cli downloads WordPress core, creates the MariaDB database, installs the site and its plugins. nginx and php-fpm run as services; outbound requests go through the exit proxy, which the template has already allowed WordPress's hosts on.</p>
+        <div class="codeblock"><button class="copy" data-copy="c-tpl">copy</button><pre id="c-tpl">nixenv init myblog --template=wordpress   <span class="c"># asks before building</span>
+nixenv run myblog                         <span class="c"># → https://myblog-8080.nixenv.localhost/</span></pre></div>
+      </div>
+      <ul class="req">
+        <li><span><b>Allowlist included.</b> A template declares the hosts its setup needs, so a restricted project can install itself on day one.</span></li>
+        <li><span><b>Pinned to your version.</b> Short names resolve to the templates that shipped with your nixenv, never a moving branch.</span></li>
+        <li><span><b>Bring your own.</b> <code>--template=./mystack.nix</code> or an https URL — copy a shipped one and edit it.</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ═══ Capture ════════════════════════════════════════════════════════ -->
+  <section id="capture">
+    <div class="sec-head">
+      <div class="sec-no">§ 05</div>
+      <div>
+        <h2>See every request</h2>
+        <p>What is that dependency calling home to? Why does the webhook fail? <code>nixenv capture</code> records a project's HTTP and HTTPS traffic — headers and bodies, both directions — with mitmproxy, and shows it in a web UI or your terminal.</p>
+      </div>
+    </div>
+    <div class="cap-grid">
+      <div>
+        <figure class="cap-fig">
+          <svg viewBox="0 0 460 180" role="img" aria-labelledby="capTitle">
+            <title id="capTitle">Outbound: the project's request passes the exit proxy's allowlist first, then the recorder, then reaches the internet; a refused request gets a 403 and is never recorded. Inbound: the gateway sends a request through the recorder before it reaches the project.</title>
+            <text x="4" y="12" class="t-sm">OUT</text>
+            <rect x="4" y="22" width="84" height="40" class="f-paper s-ink" stroke-width="1.5"/>
+            <text x="16" y="47" class="t">project</text>
+            <path d="M88,42 H124" class="s-ok" stroke-width="1.5" marker-end="url(#capO)"/>
+            <rect x="126" y="22" width="112" height="40" class="f-paper s-ink" stroke-width="1.5"/>
+            <text x="138" y="40" class="t">exit proxy</text>
+            <text x="138" y="55" class="t-sm">allowlist first</text>
+            <path d="M238,42 H272" class="s-ok" stroke-width="1.5" marker-end="url(#capO)"/>
+            <rect x="274" y="22" width="100" height="40" class="f-soft s-line" stroke-width="1.5"/>
+            <text x="286" y="40" class="t">recorder</text>
+            <text x="286" y="55" class="t-sm">mitmproxy</text>
+            <path d="M374,42 H404" class="s-ok" stroke-width="1.5" marker-end="url(#capO)"/>
+            <text x="408" y="46" class="t" style="fill:var(--ok)">web</text>
+            <path d="M182,62 V84" class="s-acc" stroke-width="1.5" stroke-dasharray="3 4"/>
+            <path d="M176,80 L188,92 M188,80 L176,92" class="s-acc" stroke-width="2"/>
+            <text x="196" y="90" class="t-sm" style="fill:var(--accent)">refused → 403 · never recorded</text>
+
+            <text x="4" y="118" class="t-sm">IN</text>
+            <text x="4" y="152" class="t" style="fill:var(--line)">browser</text>
+            <path d="M64,148 H86" class="s-line" stroke-width="1.5" marker-end="url(#capL)"/>
+            <rect x="88" y="128" width="96" height="40" class="f-paper s-ink" stroke-width="1.5"/>
+            <text x="100" y="152" class="t">gateway</text>
+            <path d="M184,148 H220" class="s-line" stroke-width="1.5" marker-end="url(#capL)"/>
+            <rect x="222" y="128" width="100" height="40" class="f-soft s-line" stroke-width="1.5"/>
+            <text x="234" y="146" class="t">recorder</text>
+            <text x="234" y="161" class="t-sm">same one</text>
+            <path d="M322,148 H356" class="s-line" stroke-width="1.5" marker-end="url(#capL)"/>
+            <rect x="358" y="128" width="84" height="40" class="f-paper s-ink" stroke-width="1.5"/>
+            <text x="370" y="152" class="t">project</text>
+            <defs>
+              <marker id="capO" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="f-ok"/></marker>
+              <marker id="capL" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="f-line"/></marker>
+            </defs>
+          </svg>
+          <figcaption>Fig. 2 — where the recorder sits</figcaption>
+        </figure>
+        <div class="term" aria-label="Example capture session">
+          <div class="bar"><i></i><i></i><i></i><span>~/work — zsh</span></div>
+<pre class="static"><span class="p">❯</span> nixenv capture myapp on
+<span class="y">! Captures record EVERYTHING that crosses the wire — tokens, cookies, git</span>
+<span class="y">! credentials included. They stay on this machine (owner-only)</span>
+<span class="g">✓ capture ON for 'myapp' (egress ingress)</span>
+Restart 'myapp' now? [y/N] y
+
+<span class="p">❯</span> nixenv capture myapp log -f
+<span class="c">09:14:02</span> egress  GET  https://registry.npmjs.org/vite <span class="g">200</span>
+<span class="c">09:14:03</span> egress  POST https://api.stripe.com/v1/payment_intents <span class="g">200</span>
+<span class="c">09:14:05</span> ingress GET  http://myapp-3000.nixenv.localhost/ <span class="g">200</span>
+<span class="c">09:14:09</span> egress  <span class="y">TLS-REFUSED</span> telemetry.example-sdk.io
+
+<span class="p">❯</span> nixenv capture myapp web
+<span class="c">==&gt; mitmweb UI (all captured projects; this one: filter '~comment myapp'):</span>
+    http://127.0.0.1:8081/?token=3f9c…</pre>
+        </div>
+      </div>
+      <div>
+        <ul class="req">
+          <li><span><b>Behind the allowlist, never instead of it.</b> The recorder only sees what the exit proxy already let through. A refused host still gets its 403, and is still never looked up.</span></li>
+          <li><span><b>Both directions.</b> <em>Egress</em>: everything the project sends out. <em>Ingress</em>: requests to its <code>https://&lt;project&gt;-&lt;port&gt;</code> addresses, on their way in — the app still sees its public host name.</span></li>
+          <li><span><b>HTTPS in the clear.</b> While capture is on, the container trusts the recorder's certificate — one restart, which <code>capture on</code> offers. An app that pins its certificates shows up as <code>TLS-REFUSED</code>.</span></li>
+          <li><span><b>Out of the projects' reach.</b> No project can talk to the recorder directly. The web UI listens on <code>127.0.0.1</code> only, behind a password.</span></li>
+          <li><span><b>Treated as secrets.</b> Recordings hold tokens and cookies, so they're owner-only on your machine and <code>delete</code> removes them.</span></li>
+        </ul>
+        <div class="codeblock" style="margin-top:22px"><button class="copy" data-copy="c-cap">copy</button><pre id="c-cap">nixenv capture myapp on          <span class="c"># both ways</span>
+nixenv capture myapp web         <span class="c"># web UI address</span>
+nixenv capture myapp log -f      <span class="c"># one line per request</span>
+nixenv capture myapp tui         <span class="c"># console UI</span>
+nixenv capture myapp har out.har <span class="c"># for browser devtools</span>
+nixenv capture myapp off</pre></div>
+      </div>
+    </div>
   </section>
 
   <!-- ═══ Security ═══════════════════════════════════════════════════════ -->
   <section id="security">
     <div class="sec-head">
-      <div class="sec-no">§ 04</div>
+      <div class="sec-no">§ 06</div>
       <div>
         <h2>Built for code you only half trust</h2>
         <p>A project container runs cloned repos, their dependencies and their setup scripts. So each one is treated as a sandbox: it shouldn't reach your machine, another project, or the internet beyond what you allowed.</p>
@@ -535,15 +729,17 @@ footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: spac
       <div class="pin" data-tag="ssh"><h3>Key-only SSH, pinned host keys</h3><p>Each project has its own key, generated on your machine and mounted read-only. The container's host key is pinned, so a squatter on the port is refused.</p></div>
       <div class="pin" data-tag="runtime"><h3>Hardened containers</h3><p>Non-root, all capabilities dropped, no privilege gain through setuid binaries, and a process limit so one runaway project can't take the rest down.</p></div>
       <div class="pin" data-tag="supply chain"><h3>Pinned downloads</h3><p>The base build is pure: every fetch is hash-pinned. A swapped upstream file fails the build instead of reaching your containers.</p></div>
+      <div class="pin" data-tag="templates"><h3>Templates are pinned</h3><p>A template is code, so short names resolve to the ones that shipped with your version, plain-http templates are refused, fetched ones are hashed, and <code>init</code> asks before building one.</p></div>
+      <div class="pin" data-tag="capture"><h3>Recording stays behind the allowlist</h3><p>The recorder only sees traffic the allowlist already let through, listens where no project can reach it, and re-checks every address so a name can't be re-pointed at your network.</p></div>
       <div class="pin" data-tag="import"><h3>Imports are checked</h3><p>An archive from someone else can't turn on privileged flags, publish ports to your LAN, lift the egress restriction or smuggle symlinks — those need your say-so.</p></div>
     </div>
-    <p class="honest"><b>Stated limits</b>Building a project's flake runs its code with write access to the shared store, every project can read the shared Claude login, and an allowlist can't police the hosts you allowed. These are documented in the README rather than glossed over.</p>
+    <p class="honest"><b>Stated limits</b>Building a project's flake runs its code with write access to the shared store, every project can read the shared Claude login, an allowlist can't police the hosts you allowed, and a capture holds whatever crossed the wire — tokens included. These are documented in the README rather than glossed over.</p>
   </section>
 
   <!-- ═══ Install ════════════════════════════════════════════════════════ -->
   <section id="install">
     <div class="sec-head">
-      <div class="sec-no">§ 05</div>
+      <div class="sec-no">§ 07</div>
       <div>
         <h2>Install</h2>
         <p>Three ways, one script. Pick whichever suits the machine.</p>
@@ -699,6 +895,25 @@ nixenv build</pre></div></div>
     }, { threshold: .35 }).observe(screen);
   } else { play(0); }
   render();
+
+  /* ── Template sheets ───────────────────────────────────────────────── */
+  var tplCode = document.getElementById("c-tpl");
+  var tplFirst = document.getElementById("tplFirst");
+  var sheets = document.querySelectorAll(".dwg");
+  function pad(str, n) { while (str.length < n) str += " "; return str; }
+  sheets.forEach(function (card) {
+    card.addEventListener("click", function () {
+      sheets.forEach(function (c) { c.setAttribute("aria-pressed", c === card ? "true" : "false"); });
+      var p = card.getAttribute("data-project");
+      var init = "nixenv init " + p + " --template=" + card.getAttribute("data-tpl");
+      var run = "nixenv run " + p;
+      var w = Math.max(init.length, run.length) + 3;
+      tplCode.innerHTML =
+        esc(pad(init, w)) + '<span class="c"># asks before building</span>\n' +
+        esc(pad(run, w)) + '<span class="c"># → https://' + esc(p) + "-" + card.getAttribute("data-port") + '.nixenv.localhost/</span>';
+      tplFirst.innerHTML = card.getAttribute("data-first");
+    });
+  });
 
   /* ── Install tabs ──────────────────────────────────────────────────── */
   document.querySelectorAll(".tabs button").forEach(function (b) {
