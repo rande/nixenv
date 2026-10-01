@@ -15,7 +15,8 @@ git commit -am "release 0.2.0" && git push
 
 `release.sh` checks you're on `main`, clean and pushed, that the version matches
 and the unit tests pass; asks once; pushes the tag; follows the **release**
-workflow with `gh` (printing the failing log if it breaks); then publishes the
+workflow through GitHub's REST API (naming the failed step and linking the run
+if it breaks); then publishes the
 formula — to this repo and to the tap, which it clones into `./homebrew-nixenv/`
 (git-ignored). If the workflow's own formula job already did that (`TAP_TOKEN`
 set), those steps are no-ops.
@@ -23,8 +24,13 @@ set), those steps are no-ops.
 It's safe to re-run: it resumes where it stopped, and does nothing once the
 release is complete. If a release failed and you've pushed a fix, move the tag
 with `./release.sh --retag` (it also deletes the failed GitHub release, after
-confirming). `--yes` skips the prompt. It needs `git` and `curl`; `gh` (logged
-in) lets it follow the workflow instead of just waiting for the release page.
+confirming). `--yes` skips the prompt. It needs only `git` and `curl` — no
+GitHub CLI. Reads are anonymous (60 API requests/hour per IP, enough for a
+release); a token in `$GITHUB_TOKEN` or `~/.nixenv/github_token` lifts that
+limit, and `--retag` needs one (Contents: write) to delete a failed GitHub
+release — without it, delete the release on its page and re-run. The tag push
+shows git's own output: if it seems to stop there, git is waiting for
+credentials or a signing passphrase.
 
 Doing it by hand instead:
 

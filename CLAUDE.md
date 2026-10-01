@@ -721,8 +721,13 @@ read directly (no curl: paths with spaces), `http://` is refused unless
 `NIXENV_ALLOW_INSECURE_TEMPLATES=1`, and a fetched template's sha256 is logged.
 
 `release.sh` (repo root) is the local driver: preflight (default branch, clean,
-HEAD == origin, version == `NIXENV_VERSION`, unit suite) → annotated tag → `gh
-run watch` on `release.yml` (prints `--log-failed` on failure) → pull →
+HEAD == origin, version == `NIXENV_VERSION`, unit suite) → annotated tag
+(pushed WITHOUT `--quiet`: a hidden credential prompt looked like a hang) →
+polls `release.yml`'s run through the GitHub REST API with `curl` — NO `gh`
+dependency; anonymous reads, optional token from `$GITHUB_TOKEN` or
+`~/.nixenv/github_token` passed via `curl --config -` (never argv), required
+only for `--retag`'s release DELETE; on failure it names the failed step and
+links the run (logs need auth, so they aren't fetched) → pull →
 `update-formula.sh` (the ONE sha256 implementation — `34-release-script.sh`
 rejects `shasum`/`sha256sum` in release.sh) → commit/push the formula here and to
 the tap clone in `./homebrew-nixenv/` (git-ignored; the check uses a trailing
@@ -730,8 +735,9 @@ slash because a dir-only ignore pattern doesn't match a not-yet-existing path).
 Idempotent: a tag counts as THIS release when it's HEAD or an ancestor that
 differs only by the formula file (the post-release formula commit moves main
 past the tag); anything else needs `--retag`. The test runs the whole flow
-offline — bare repos for origin and tap, fake `gh`/`curl` on PATH, the fake curl
-serving `git archive` of the tag to the real update-formula.sh.
+offline — bare repos for origin and tap, a fake `curl` on PATH serving canned
+API JSON and `git archive` of the tag to the real update-formula.sh; it also
+rejects any `gh` call in release.sh.
 
 CI/release live in `.github/workflows/` and are covered by `22-workflows.sh`
 (trigger shape, job dependency chain, and that the guards exist). That test must

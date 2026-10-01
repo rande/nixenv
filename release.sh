@@ -13,15 +13,17 @@
 #                   NIXENV_VERSION matches, syntax + unit tests pass
 #   2. tag        — annotated vX.Y.Z tag on HEAD, pushed
 #   3. wait       — follows the `release` workflow (verify → release → formula)
-#                   and prints the failing log if it breaks
+#                   through GitHub's REST API and names the failing step
 #   4. formula    — pulls what the workflow committed, clones/updates the tap in
 #                   ./homebrew-nixenv (git-ignored), runs update-formula.sh and
 #                   pushes the formula to BOTH repos if they're not already on it
 #
 # Release order is fixed by the sha256: the Homebrew formula hashes the tarball
 # GitHub generates for the tag, which doesn't exist until the tag is pushed.
-# Needs: git, curl. `gh` (logged in) is strongly recommended — without it the
-# script can only poll for the release page, not see why a workflow failed.
+# Needs: git, curl. No GitHub CLI: the workflow is followed through the public
+# REST API. A token is optional ($GITHUB_TOKEN, else ~/.nixenv/github_token):
+# it lifts the 60 requests/hour anonymous limit, and --retag needs one to delete
+# a failed GitHub release.
 # =============================================================================
 set -euo pipefail
 
@@ -32,6 +34,8 @@ REPO="${NIXENV_REPO:-rande/nixenv}"
 TAP_DIR="${TAP_DIR:-$ROOT/homebrew-nixenv}"
 FORMULA="packaging/homebrew/Formula/nixenv.rb"
 WORKFLOW="release.yml"
+API="${GITHUB_API:-https://api.github.com}"
+POLL="${RELEASE_POLL_INTERVAL:-15}"     # seconds between workflow polls
 
 c_red=$'\033[1;31m'; c_grn=$'\033[1;32m'; c_yel=$'\033[1;33m'; c_blu=$'\033[1;34m'; c_off=$'\033[0m'
 if [ ! -t 1 ]; then c_red=""; c_grn=""; c_yel=""; c_blu=""; c_off=""; fi
@@ -151,17 +155,40 @@ if [ "$tag_state" != "here" ]; then
   ok "unit tests pass"
 fi
 
-have gh || warn "gh (GitHub CLI) not found — the workflow can't be followed, only waited for"
+# --- GitHub REST API (curl only) ------------------------------------------------------
+# The repo is public, so reads work anonymously (60 requests/hour per IP). A
+# token raises that and allows deleting a release; it goes to curl on stdin
+# (--config -), never on the command line where `ps` would show it.
+api_token="${GITHUB_TOKEN:-}"
+[ -n "$api_token" ] || api_token="$(cat "${GITHUB_TOKEN_FILE:-$HOME/.nixenv/github_token}" 2>/dev/null || true)"
+case "$api_token" in *[!A-Za-z0-9_]*) api_token="";; esac   # one line, token charset only
+api() {   # api [METHOD] <path under /repos/$REPO/>  → body on stdout, non-zero on HTTP error
+  local method=GET
+  [ "$#" -gt 1 ] && { method="$1"; shift; }
+  { if [ -n "$api_token" ]; then printf 'header = "Authorization: Bearer %s"\n' "$api_token"; fi; } \
+    | curl -fsS --max-time 20 --config - -X "$method" \
+        -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+        "$API/repos/$REPO/$1"
+}
+# First value of a top-level-ish "key": in a JSON body (compact or pretty). Good
+# enough for the fields used here, which GitHub lists before any nested object.
+json_first() {
+  tr -s ' \t\r\n' ' ' | sed 's/": /":/g' | grep -oE "\"$1\":(\"[^\"]*\"|[0-9a-z]+)" \
+    | head -1 | sed -E "s/^\"$1\"://; s/^\"//; s/\"$//"
+}
 
 # --- 2. tag ---------------------------------------------------------------------
 if [ "$tag_state" = "elsewhere" ]; then
   warn "--retag: $tag will be deleted on origin and re-created on HEAD"
-  if have gh && gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
-    warn "a GitHub release for $tag exists and will be deleted too"
+  release_id="$(api "releases/tags/$tag" 2>/dev/null | json_first id || true)"
+  if [ -n "$release_id" ]; then
+    [ -n "$api_token" ] || die "a GitHub release for $tag exists, and deleting it needs a token.
+    Delete it at https://github.com/$REPO/releases/tag/$tag (or set GITHUB_TOKEN), then re-run --retag"
+    warn "the GitHub release for $tag will be deleted too"
   fi
   confirm "Move $tag to $(git rev-parse --short HEAD)?"
-  if have gh && gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
-    gh release delete "$tag" --repo "$REPO" --yes
+  if [ -n "$release_id" ]; then
+    api DELETE "releases/$release_id" >/dev/null || die "could not delete the GitHub release for $tag (token lacks Contents: write?)"
   fi
   git push --quiet origin ":refs/tags/$tag"
   git tag -d "$tag" >/dev/null 2>&1 || true
@@ -172,38 +199,54 @@ fi
 if [ "$tag_state" = "none" ]; then
   confirm "Tag $(git rev-parse --short HEAD) as $tag and publish nixenv $version?"
   git tag -d "$tag" >/dev/null 2>&1 || true      # a stale local-only tag
+  log "creating $tag (if tag signing is on, gpg may ask for its passphrase)"
   git tag -a "$tag" -m "nixenv $version"
-  git push --quiet origin "$tag"
+  # Not --quiet: a push waiting for credentials (keychain dialog, browser login,
+  # ssh passphrase) looks exactly like a hang when its output is hidden.
+  log "pushing $tag to origin (git may ask for credentials)"
+  git push origin "refs/tags/$tag"
   ok "pushed $tag"
 fi
 
 # --- 3. wait for the release workflow --------------------------------------------
-if have gh; then
-  log "waiting for the '$WORKFLOW' run for $tag to appear"
-  run_id="" i=0
-  while [ -z "$run_id" ] && [ "$i" -lt 30 ]; do
-    run_id="$(gh run list --repo "$REPO" --workflow "$WORKFLOW" --branch "$tag" --limit 1 \
-                --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null || true)"
-    [ -n "$run_id" ] || { sleep 4; i=$((i + 1)); }
-  done
-  [ -n "$run_id" ] || die "no '$WORKFLOW' run showed up for $tag after 2 minutes — check the Actions tab"
-  log "following run $run_id (https://github.com/$REPO/actions/runs/$run_id)"
-  if ! gh run watch "$run_id" --repo "$REPO" --exit-status --interval 10; then
-    echo >&2
-    gh run view "$run_id" --repo "$REPO" --log-failed 2>/dev/null | tail -40 >&2 || true
-    die "the release workflow failed (log above). Fix it, commit, push, then: ./release.sh --retag"
+tag_sha="$(git rev-parse "$tag^{commit}")"
+log "waiting for the '$WORKFLOW' run for $tag to appear"
+run_id="" i=0
+while [ -z "$run_id" ]; do
+  # head_sha too: after --retag, an older run for the same tag name may exist.
+  run_id="$(api "actions/workflows/$WORKFLOW/runs?event=push&branch=$tag&head_sha=$tag_sha&per_page=1" 2>/dev/null \
+              | json_first id || true)"
+  [ -n "$run_id" ] && break
+  i=$((i + 1)); [ "$i" -lt 30 ] || die "no '$WORKFLOW' run showed up for $tag — check https://github.com/$REPO/actions"
+  sleep 4
+done
+run_url="https://github.com/$REPO/actions/runs/$run_id"
+log "following run $run_id ($run_url)"
+status="" conclusion="" errs=0 last=""
+while :; do
+  if body="$(api "actions/runs/$run_id" 2>/dev/null)"; then
+    errs=0
+    status="$(printf '%s' "$body" | json_first status)"
+    conclusion="$(printf '%s' "$body" | json_first conclusion)"
+    [ "$status" = "$last" ] || { log "  $status"; last="$status"; }
+    [ "$status" = completed ] && break
+  else
+    errs=$((errs + 1))
+    [ "$errs" -lt 5 ] || die "GitHub API keeps failing (rate limit? set GITHUB_TOKEN) — follow it at $run_url, then re-run ./release.sh"
   fi
-  ok "workflow succeeded"
-else
-  log "waiting for https://github.com/$REPO/releases/tag/$tag (up to 15 min)"
-  i=0
-  until curl -fsI --max-time 10 "https://github.com/$REPO/releases/tag/$tag" >/dev/null 2>&1; do
-    i=$((i + 1)); [ "$i" -lt 90 ] || die "no release page after 15 minutes — check the Actions tab"
-    sleep 10
-  done
-  ok "release page is up"
-  sleep 20   # let the (optional) formula job finish before we look at the tap
+  sleep "$POLL"
+done
+if [ "$conclusion" != success ]; then
+  # Steps are listed as {"name","status","conclusion"}: name the failed ones.
+  failed="$(api "actions/runs/$run_id/jobs" 2>/dev/null | tr -s ' \t\r\n' ' ' | sed 's/": /":/g; s/, /,/g' \
+             | grep -oE '"name":"[^"]*","status":"[^"]*","conclusion":"failure"' \
+             | sed -E 's/^"name":"([^"]*)".*/\1/' || true)"
+  echo >&2
+  [ -z "$failed" ] || printf '%s\n' "$failed" | sed 's/^/   failed step: /' >&2
+  die "the release workflow ended '$conclusion' — logs: $run_url
+    Fix it, commit, push, then: ./release.sh --retag"
 fi
+ok "workflow succeeded"
 
 # --- 4. formula: this repo + the tap -------------------------------------------------
 # The workflow's formula job may already have done this (when TAP_TOKEN is set).
