@@ -28,7 +28,7 @@
 set -euo pipefail
 
 # Bump on release; the Homebrew formula's `test` asserts this matches its tag.
-NIXENV_VERSION="0.3.0"
+NIXENV_VERSION="0.3.1"
 
 # ── Configuration (override via env) ─────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
