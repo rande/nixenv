@@ -34,3 +34,6 @@ assert_contains "$body" '.env.local'              "uses .env.local (never commit
 # packagist egress is required for composer
 allow="$(template_meta "$f" allow)"
 assert_contains "$allow" "repo.packagist.org"     "packagist allowed"
+
+# nginx opens its compiled-in /var/log/nginx/error.log before reading the config
+assert_contains "$body" 'nginx -e /dev/stderr' "nginx never opens /var/log/nginx"

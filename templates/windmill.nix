@@ -63,7 +63,7 @@
 #   does NOT help here: unstable carries the same 1.601.1.
 #
 # HEADS UP — this is a BIG closure. The wrapper pulls in deno, bun, go,
-#   python312, php, powershell, dotnet-sdk and nsjail, so expect several GB on
+#   python, php, powershell, dotnet-sdk and nsjail, so expect several GB on
 #   the first `./nixenv.sh build <project>`. It downloads from cache.nixos.org
 #   rather than compiling, and the builder is not egress-restricted, but it is
 #   not a quick first run. The shared store means a SECOND windmill project
@@ -143,7 +143,7 @@
             '';
             postFixup = ''
               wrapProgram "$out/bin/windmill" \
-                --set PYTHON_PATH ${pkgs.python312}/bin/python3 \
+                --set PYTHON_PATH ${jobPython}/bin/python3 \
                 --set UV_PATH     ${pkgs.uv}/bin/uv \
                 --set DENO_PATH   ${pkgs.deno}/bin/deno \
                 --set BUN_PATH    ${pkgs.bun}/bin/bun \
@@ -151,13 +151,38 @@
                 --set PHP_PATH    ${pkgs.php}/bin/php \
                 --set FLOCK_PATH  ${pkgs.flock}/bin/flock \
                 --set BASH_PATH   ${pkgs.bash}/bin/bash \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.python312 pkgs.procps pkgs.coreutils ]}
+                --prefix PATH : ${pkgs.lib.makeBinPath [ jobPython pkgs.procps pkgs.coreutils ]}
             '';
             meta.mainProgram = "windmill";
           };
 
+          # --- Python for jobs ----------------------------------------------------
+          # MUST be the version Windmill treats as its built-in default (3.11 as
+          # of 1.601). Every worker preinstalls that default at start, and when
+          # PYTHON_PATH is a fixed python of another version (nix-managed, so uv
+          # may not fetch one) it logs "Cannot preinstall or find default 311
+          # version" as an ERROR on EVERY start — neither the instance setting
+          # nor INSTANCE_PYTHON_VERSION changes that step (it only covers the
+          # instance version, the second preinstall — set in commonEnv). nixpkgs wraps 3.12,
+          # so the nixpkgs build gets its wrapper rewritten below. 3.11 is also
+          # what upstream's own image uses.
+          jobPython = pkgs.python311;
+
+          # The nixpkgs wrapper hard-sets PYTHON_PATH (and puts that python on
+          # PATH), so the environment can't override it: copy the wrapper with
+          # the python swapped. It still execs the same prebuilt binary — no
+          # rebuild. Fails the build if nixpkgs ever changes the wrapper's shape.
+          windmillNixpkgs = pkgs.runCommand "windmill-${pkgs.windmill.version}-py${jobPython.pythonVersion}" { } ''
+            mkdir -p $out/bin
+            w=${pkgs.windmill}/bin/windmill
+            old=$(sed -n "s|^export PYTHON_PATH='\(.*\)/bin/python3'\$|\1|p" "$w")
+            [ -n "$old" ] || { echo "windmill template: no PYTHON_PATH line in $w (nixpkgs changed its wrapper)" >&2; exit 1; }
+            sed "s|$old|${jobPython}|g" "$w" > $out/bin/windmill
+            chmod +x $out/bin/windmill
+          '';
+
           windmillPkg =
-            if !useUpstreamBinary then pkgs.windmill
+            if !useUpstreamBinary then windmillNixpkgs
             else if system != "x86_64-linux" then
               throw ("windmill template: useUpstreamBinary is x86_64-linux only "
                      + "(upstream ships no arm64 asset) — set it back to false for ${system}")
@@ -171,6 +196,27 @@
             export DENO_DIR="''${DENO_DIR:-$HOME/.cache/deno}"
             mkdir -p "$DENO_DIR"
             exec ${pkgs.deno}/bin/deno run -A --unstable-worker-options ${wmillSpec} "$@"
+          '';
+
+          # Exported by the server AND both workers. (Note the -d on every
+          # pg_isready below: without it the probe opens a database named after
+          # the login user, logging 'FATAL: database "app" does not exist'.)
+          commonEnv = ''
+            export DATABASE_URL="${dbUrl}"
+            export RUST_LOG=${logLevel}
+            export WM_BASE_URL="${baseUrl}"
+            # The other half of the jobPython story: workers ALSO preinstall the
+            # instance version, which is unset on a new instance and then means
+            # another version. Pin it to the same python.
+            export INSTANCE_PYTHON_VERSION=${jobPython.pythonVersion}
+          '';
+
+          # Workers start only once the server answers: it runs the migrations,
+          # and a worker racing it queries tables that don't exist yet (postgres
+          # logs 'relation "global_settings" does not exist' on first boot).
+          waitForServer = ''
+            curl -sf -o /dev/null http://127.0.0.1:${httpPort}/api/version \
+              || { echo "worker: waiting for windmill-server"; sleep 5; exit 0; }
           '';
 
           # --- Services ---------------------------------------------------------
@@ -190,13 +236,16 @@
           svServer = pkgs.writeTextDir "sv/windmill-server/run" ''
             #!/bin/sh
             exec 2>&1
-            pg_isready -h 127.0.0.1 -p 5432 -q || { echo "windmill-server: waiting for postgres"; sleep 5; exit 0; }
+            pg_isready -h 127.0.0.1 -p 5432 -d ${dbName} -q || { echo "windmill-server: waiting for postgres"; sleep 5; exit 0; }
             mkdir -p "$HOME/.nixenv-run/windmill"
-            export DATABASE_URL="${dbUrl}"
+            ${commonEnv}
             export MODE=server
             export PORT=${httpPort}
-            export WM_BASE_URL="${baseUrl}"
-            export RUST_LOG=${logLevel}
+            # Hub script search embeddings: the server downloads a model from
+            # huggingface.co, which egress refuses (an ERROR at every start).
+            # To use them: remove this line, then
+            #   nixenv allow <project> huggingface.co .huggingface.co .hf.co
+            export DISABLE_EMBEDDING=true
             exec windmill
           '';
 
@@ -208,15 +257,14 @@
           svWorker = pkgs.writeTextDir "sv/windmill-worker/run" ''
             #!/bin/sh
             exec 2>&1
-            pg_isready -h 127.0.0.1 -p 5432 -q || { echo "windmill-worker: waiting for postgres"; sleep 5; exit 0; }
+            pg_isready -h 127.0.0.1 -p 5432 -d ${dbName} -q || { echo "windmill-worker: waiting for postgres"; sleep 5; exit 0; }
+            ${waitForServer}
             mkdir -p "$HOME/.nixenv-run/windmill"
-            export DATABASE_URL="${dbUrl}"
+            ${commonEnv}
             export MODE=worker
             export WORKER_GROUP=default
             export KEEP_JOB_DIR=false
             export DISABLE_NSJAIL=true
-            export RUST_LOG=${logLevel}
-            export WM_BASE_URL="${baseUrl}"
             exec windmill
           '';
 
@@ -224,16 +272,15 @@
           svWorkerNative = pkgs.writeTextDir "sv/windmill-worker-native/run" ''
             #!/bin/sh
             exec 2>&1
-            pg_isready -h 127.0.0.1 -p 5432 -q || { echo "windmill-worker-native: waiting for postgres"; sleep 5; exit 0; }
+            pg_isready -h 127.0.0.1 -p 5432 -d ${dbName} -q || { echo "windmill-worker-native: waiting for postgres"; sleep 5; exit 0; }
+            ${waitForServer}
             mkdir -p "$HOME/.nixenv-run/windmill"
-            export DATABASE_URL="${dbUrl}"
+            ${commonEnv}
             export MODE=worker
             export WORKER_GROUP=native
             export NATIVE_MODE=true
             export SLEEP_QUEUE=200
             export DISABLE_NSJAIL=true
-            export RUST_LOG=${logLevel}
-            export WM_BASE_URL="${baseUrl}"
             exec windmill
           '';
 
@@ -258,7 +305,7 @@
               echo "nixenv/windmill: first-run setup…"
               # A previous failed setup can leave a stale pid file behind; no
               # server can be running yet (services start after this hook).
-              [ -f "$PGDATA/postmaster.pid" ] && pg_isready -h 127.0.0.1 -p 5432 -q \
+              [ -f "$PGDATA/postmaster.pid" ] && pg_isready -h 127.0.0.1 -p 5432 -d ${dbName} -q \
                 || rm -f "$PGDATA/postmaster.pid"
               pg_ctl -D "$PGDATA" -o "-k $RUN -h 127.0.0.1 -p 5432" -l /tmp/pg-setup.log -w start || {
                 echo "nixenv/windmill: postgres failed to start; see /tmp/pg-setup.log"; return 1; }
@@ -337,6 +384,29 @@
                   "before 'pull', and review the diff before 'push'." \
                   > "$APP/README.windmill.md"
               fi
+
+              # ---- schema migrations, against this setup-only postgres -----
+              # On an EMPTY database the server queries global_settings and
+              # _sqlx_migrations before creating them, and postgres logs every
+              # such probe as an ERROR. Migrating here sends that one-time noise
+              # to /tmp/pg-setup.log instead of the container log. Best effort:
+              # if it times out, windmill-server simply migrates on first start.
+              echo "nixenv/windmill: applying database migrations…"
+              env DATABASE_URL="${dbUrl}" MODE=server PORT=${httpPort} \
+                  DISABLE_EMBEDDING=true RUST_LOG=warn \
+                  windmill >/tmp/windmill-migrate.log 2>&1 &
+              _wm=$!
+              _i=0
+              while ! curl -sf -o /dev/null http://127.0.0.1:${httpPort}/api/version; do
+                _i=$((_i+1))
+                if [ $_i -ge 120 ] || ! kill -0 $_wm 2>/dev/null; then
+                  echo "nixenv/windmill: WARNING migrations not confirmed (see /tmp/windmill-migrate.log)"
+                  break
+                fi
+                sleep 1
+              done
+              kill $_wm 2>/dev/null
+              _i=0; while kill -0 $_wm 2>/dev/null && [ $_i -lt 30 ]; do sleep 1; _i=$((_i+1)); done
 
               pg_ctl -D "$PGDATA" -w stop >/dev/null 2>&1 || true
               touch "$MARK"

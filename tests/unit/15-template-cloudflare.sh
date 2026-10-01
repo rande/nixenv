@@ -34,3 +34,8 @@ assert_contains "$body" 'src/index.ts'    "writes a worker entrypoint"
 allow="$(template_meta "$f" allow)"
 assert_contains "$allow" "registry.npmjs.org" "npm registry allowed"
 assert_contains "$allow" "cloudflare.com"     "cloudflare hosts allowed"
+
+# tsconfig.json names these types; a fresh scaffold must typecheck
+assert_contains "$body" '@cloudflare/workers-types' "tsconfig types"
+assert_contains "$body" 'npm install --save-dev --no-audit --no-fund @cloudflare/workers-types' \
+  "scaffold installs the types it references"

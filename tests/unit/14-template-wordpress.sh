@@ -37,3 +37,16 @@ assert_contains "$body" 'listen ${httpPort}'      "nginx listens on that port"
 allow="$(template_meta "$f" allow)"
 assert_contains "$allow" "downloads.wordpress.org" "core download host allowed"
 assert_contains "$allow" "api.wordpress.org"       "plugin API host allowed"
+
+# Found by running it (2026-10):
+# wp-cli ships etc/php.ini too — without hiPrio the buildEnv fails to build
+assert_contains "$body" '(pkgs.lib.hiPrio php)'   "php wins the etc/php.ini collision"
+# WordPress ignores HTTP(S)_PROXY and its "safe" downloads resolve the host in
+# the container, which a restricted project can't — plugin installs failed with
+# "A valid URL was not provided"
+assert_contains "$body" 'WP_PROXY_HOST'           "wp-config routes WP through the egress proxy"
+assert_contains "$body" 'WP_PROXY_BYPASS_HOSTS'   "...but not the site's own public URL"
+assert_contains "$body" "reject_unsafe_urls'] = false" "mu-plugin skips the in-container DNS pre-check"
+assert_contains "$body" 'mu-plugins/nixenv-egress.php' "hook installs the mu-plugin"
+assert_contains "$body" 'curl zlib'               "php has the curl + zlib extensions"
+assert_contains "$body" 'nginx -e /dev/stderr'    "nginx never opens /var/log/nginx"

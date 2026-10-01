@@ -29,9 +29,13 @@ assert_contains "$body" 'WORKER_GROUP=default' "default worker group"
 assert_contains "$body" 'WORKER_GROUP=native'  "native worker group"
 assert_contains "$body" 'NATIVE_MODE=true'     "native worker is in native mode"
 
-# every windmill process must wait for the database rather than crash-loop
-n="$(printf '%s' "$body" | grep -c 'pg_isready -h 127.0.0.1 -p 5432 -q')"
-[ "$n" -ge 3 ] || fail "each windmill service must gate on pg_isready (found $n)"
+# every windmill process must wait for the database rather than crash-loop —
+# with -d: a bare probe opens a database named after the login user and postgres
+# logs 'FATAL: database "app" does not exist' on every attempt
+n="$(printf '%s' "$body" | grep -c 'pg_isready -h 127.0.0.1 -p 5432 -d ${dbName} -q')"
+[ "$n" -ge 3 ] || fail "each windmill service must gate on pg_isready -d (found $n)"
+printf '%s' "$body" | sed 's/[[:space:]]*#.*//' | grep 'pg_isready' | grep -qv -- ' -d ' \
+  && fail "every pg_isready needs -d \${dbName}"
 
 # the server must be reachable from the proxy container on the declared port
 port="$(template_meta "$f" port)"
@@ -81,3 +85,20 @@ allow="$(template_meta "$f" allow)"
 for h in pypi.org .npmjs.org .windmill.dev jsr.io deno.land; do
   assert_contains "$allow" "$h" "egress allows $h"
 done
+
+# Found by running it (2026-10): each of these logged an ERROR on every start.
+# Job python must be Windmill's built-in default (3.11): workers preinstall it
+# unconditionally and nixpkgs wraps 3.12 — so the wrapper is rewritten, and
+# the instance version (the second preinstall) is pinned to the same python.
+assert_contains "$body" 'jobPython = pkgs.python311'  "job python = Windmill's default"
+assert_contains "$body" 'windmillNixpkgs'             "nixpkgs wrapper is re-pointed"
+assert_contains "$body" 'INSTANCE_PYTHON_VERSION=${jobPython.pythonVersion}' \
+  "instance python pinned to the same version"
+assert_contains "$body" '--set PYTHON_PATH ${jobPython}/bin/python3' \
+  "upstream binary uses the same job python"
+# embeddings fetch a model from huggingface.co, which egress refuses
+assert_contains "$body" 'DISABLE_EMBEDDING=true'      "embeddings off (no huggingface egress)"
+# workers wait for the server, which owns the migrations; the hook migrates once
+n="$(printf '%s' "$body" | grep -c '${waitForServer}')"
+[ "$n" -eq 2 ] || fail "both workers must wait for windmill-server (found $n)"
+assert_contains "$body" 'applying database migrations' "first-run hook applies migrations"

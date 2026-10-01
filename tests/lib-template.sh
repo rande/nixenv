@@ -91,6 +91,15 @@ assert_template() {
           | grep -n "^[[:space:]][[:space:]]*#.*''" || true)"
   [ -z "$badq" ] || fail "$t: comment inside an indented string contains a bare '' → $badq"
 
+  # --- a JS/TS template literal inside a Nix indented string ----------------
+  # `${x}` there is NIX interpolation, not JavaScript: the build dies with
+  # "undefined variable" (headlesscms-directus-astro shipped exactly that).
+  # Escape it as `''${x}`. Only the backtick-adjacent form is checked — a
+  # mid-literal ${…} may be a deliberate Nix value (cloudflare's ${devPort}).
+  local jsq
+  jsq="$(printf '%s' "$body" | grep -n '`\${' || true)"
+  [ -z "$jsq" ] || fail "$t: unescaped \`\${ in a JS template literal (Nix interpolates it) → $jsq"
+
   # --- cheap Nix sanity: balanced brackets outside comments -----------------
   python3 - "$f" <<'PY' || fail "$t: unbalanced brackets"
 import sys, re
@@ -108,7 +117,7 @@ PY
   # --- any service that serves the declared port must be reachable ----------
   # (binding localhost would be invisible to the reverse proxy container)
   if printf '%s' "$body" | grep -qE 'astro dev|wrangler dev|--host|--ip'; then
-    printf '%s' "$body" | grep -qE '\-\-host 0\.0\.0\.0|\-\-ip 0\.0\.0\.0|HOST="0\.0\.0\.0"' \
+    printf '%s' "$body" | grep -qE -e '--host 0\.0\.0\.0|--ip 0\.0\.0\.0|HOST="0\.0\.0\.0"' \
       || fail "$t: dev server must bind 0.0.0.0 to be proxy-reachable"
   fi
 }

@@ -43,3 +43,11 @@ assert_contains "$body" 'PUBLIC_DIRECTUS_URL' "browser-side gets the public URL"
 # npm egress is required
 allow="$(template_meta "$f" allow)"
 assert_contains "$allow" "registry.npmjs.org" "npm registry allowed"
+
+# Found by running it (2026-10):
+# pg_isready without -U probes as the login user: 'FATAL: role "app" does not exist'
+assert_contains "$body" 'pg_isready -h 127.0.0.1 -p 5432 -U ${dbUser}' "pg_isready as the db user"
+assert_contains "$body" 'mkdir -p uploads extensions' "directus dirs exist (uploads would fail)"
+# /server/health needs an admin token on current Directus — the page showed "error 403"
+assert_contains "$body" '/server/ping' "frontend probes the public ping endpoint"
+assert_not_contains "$body" '/server/health' "no admin-only health probe"

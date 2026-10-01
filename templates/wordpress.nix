@@ -52,7 +52,7 @@
           pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
           php  = pkgs.php83.buildEnv {
             extensions = { enabled, all }: enabled ++ (with all; [
-              mysqli pdo_mysql gd intl zip mbstring exif opcache
+              mysqli pdo_mysql gd intl zip mbstring exif opcache curl zlib
             ]);
             extraConfig = ''
               memory_limit = 512M
@@ -116,6 +116,26 @@
             clear_env = no
           '';
 
+          # Must-use plugin, copied into wp-content/mu-plugins by the hook.
+          # WordPress's "safe" downloads (plugins, themes, core updates) resolve
+          # the host IN the container before connecting and refuse it when that
+          # fails, and a restricted project deliberately has no outside DNS. The
+          # egress proxy resolves the name itself and already refuses private
+          # ranges, so the pre-check is skipped only when a proxy is configured.
+          wpEgressPlugin = pkgs.writeTextDir "share/nixenv-wordpress/nixenv-egress.php" ''
+            <?php
+            /**
+             * Plugin Name: nixenv egress
+             * Description: Lets downloads work through nixenv's egress proxy.
+             */
+            if ( defined( 'WP_PROXY_HOST' ) ) {
+                add_filter( 'http_request_args', function ( $args ) {
+                    $args['reject_unsafe_urls'] = false;
+                    return $args;
+                } );
+            }
+          '';
+
           # ---------------------------------------------------------------
           # Startup hook — the ONLY place that can write to the app volume.
           # Runs as the app user before services start, with this profile on
@@ -129,7 +149,9 @@
           # shell heredocs inside a Nix string.)
           svMariadb = pkgs.writeTextDir "sv/mariadb/run" ''
             #!/bin/sh
-            exec mariadbd --datadir=/databases/mysql \
+            # native AIO (io_uring/libaio) is refused in this unprivileged
+            # container; mariadb falls back anyway, this just skips two warnings.
+            exec mariadbd --datadir=/databases/mysql --innodb-use-native-aio=0 \
                  --socket="$HOME/.nixenv-run/mysql.sock" \
                  --bind-address=127.0.0.1 --port=3306
           '';
@@ -144,7 +166,9 @@
             # wait for php-fpm's socket so nginx doesn't spin on a missing upstream
             i=0; while [ ! -S "$HOME/.nixenv-run/php-fpm.sock" ] && [ $i -lt 30 ]; do
               i=$((i+1)); sleep 1; done
-            exec nginx -g 'daemon off;' -c "$NIXENV_EXTRA_PROFILE/etc/nginx.conf" -p "$HOME/.nixenv-run"
+            # -e: nginx opens its compiled-in error log (/var/log/nginx/error.log,
+            # absent here) BEFORE reading the config's error_log line.
+            exec nginx -e /dev/stderr -g 'daemon off;' -c "$NIXENV_EXTRA_PROFILE/etc/nginx.conf" -p "$HOME/.nixenv-run"
           '';
 
           startupHook = pkgs.writeTextDir "etc/nixenv-hooks.sh" ''
@@ -163,9 +187,9 @@
               # ---- database ------------------------------------------------
               if [ ! -d "$DATA/mysql" ]; then
                 mkdir -p "$DATA"
-                mariadb-install-db --datadir="$DATA" --auth-root-authentication-method=normal >/dev/null
+                mariadb-install-db --datadir="$DATA" --auth-root-authentication-method=normal --innodb-use-native-aio=0 >/dev/null
               fi
-              mariadbd --datadir="$DATA" --socket="$SOCK" --skip-networking >/tmp/mariadb-setup.log 2>&1 &
+              mariadbd --datadir="$DATA" --innodb-use-native-aio=0 --socket="$SOCK" --skip-networking >/tmp/mariadb-setup.log 2>&1 &
               _pid=$!
               _i=0; while [ ! -S "$SOCK" ] && [ $_i -lt 30 ]; do sleep 1; _i=$((_i+1)); done
               if [ ! -S "$SOCK" ]; then
@@ -175,7 +199,11 @@
                 "CREATE DATABASE IF NOT EXISTS ${dbName} CHARACTER SET utf8mb4;" || true
 
               # ---- WordPress (wp-cli, one time) ----------------------------
-              WP="wp --path=$APP --allow-root"
+              # wp-cli's phar on the SITE's php (the `wp` wrapper brings its own,
+              # newer one). 24575 = E_ALL & ~E_DEPRECATED, written as a number so
+              # the unquoted $WP doesn't split it: the phar's bundled Symfony
+              # Finder floods plugin installs with PHP 8.1+ return-type notices.
+              WP="php -d memory_limit=-1 -d error_reporting=24575 ${pkgs.wp-cli}/share/wp-cli/wp-cli.phar --path=$APP"
               if [ ! -f "$APP/wp-load.php" ]; then
                 $WP core download --version=${wpVersion} || {
                   echo "nixenv/wordpress: download failed — is downloads.wordpress.org allowed? (nixenv allow $NIXENV_PROJECT downloads.wordpress.org)"
@@ -191,6 +219,17 @@
             define( 'WP_DEBUG_DISPLAY', false );
             define( 'SCRIPT_DEBUG', true );
             define( 'DISALLOW_FILE_EDIT', false );
+            // Egress-restricted project: the egress proxy is the only way out, and
+            // WordPress ignores HTTP(S)_PROXY — it reads these constants instead.
+            // The site's own public URL is reached through the in-container
+            // loopback relay, so it must NOT go to the proxy (cron, site health).
+            $nixenv_proxy = getenv( 'NIXENV_EGRESS_PROXY' );
+            if ( $nixenv_proxy && ! defined( 'WP_PROXY_HOST' ) ) {
+                $nixenv_p = parse_url( $nixenv_proxy );
+                define( 'WP_PROXY_HOST', $nixenv_p['host'] );
+                define( 'WP_PROXY_PORT', isset( $nixenv_p['port'] ) ? $nixenv_p['port'] : 3128 );
+                define( 'WP_PROXY_BYPASS_HOSTS', 'localhost, 127.0.0.1, *.@@DOMAIN@@' );
+            }
             // Behind nixenv's reverse proxy: trust the forwarded scheme.
             if ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' ) {
                 $_SERVER['HTTPS'] = 'on';
@@ -202,6 +241,13 @@
                 $WP core install --url="$SITE" --title="@@PROJECT@@" \
                     --admin_user=admin --admin_password=admin \
                     --admin_email=admin@example.com --skip-email
+
+              # Before any plugin install: without it every download below fails
+              # with "A valid URL was not provided" in a restricted project.
+              mkdir -p "$APP/wp-content/mu-plugins"
+              [ -f "$APP/wp-content/mu-plugins/nixenv-egress.php" ] || \
+                install -m 644 "$NIXENV_EXTRA_PROFILE/share/nixenv-wordpress/nixenv-egress.php" \
+                  "$APP/wp-content/mu-plugins/nixenv-egress.php"
 
               for _p in ${builtins.concatStringsSep " " wpPlugins}; do
                 $WP plugin is-installed "$_p" 2>/dev/null || $WP plugin install "$_p" --activate || \
@@ -220,13 +266,18 @@
             name = "wordpress-project";
             extraOutputsToInstall = [ "man" ];
             paths = [
-              php
+              # wp-cli runs on its OWN php (a wrapper with -c pointing at its
+              # store path) but still ships etc/php.ini, which collides with
+              # php's in buildEnv — hiPrio picks ours. Nothing reads the
+              # profile's copy; this only settles the collision.
+              (pkgs.lib.hiPrio php)
               pkgs.nginx
               pkgs.mariadb
               pkgs.wp-cli
               nginxConf
               phpFpmConf
               svMariadb svPhpFpm svNginx    # → ~/.nixenv-sv/<name>, run by runit
+              wpEgressPlugin
               startupHook
             ];
           };

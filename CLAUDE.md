@@ -476,7 +476,17 @@ README back to `./nixenv.sh`.
   `workspaces/`. It also carries
   an opt-in `useUpstreamBinary` (fetchurl + `autoPatchelfHook` on the release
   asset, x86_64 only) because nixpkgs lags upstream by ~200 releases — the same
-  prebuilt-binary escape hatch the base flake uses for zmx.
+  prebuilt-binary escape hatch the base flake uses for zmx. **Job python is
+  `jobPython = python311`, on purpose**: every worker preinstalls Windmill's
+  built-in default (3.11) at start, and with a nix-fixed `PYTHON_PATH` of any
+  other version that's an ERROR on every start; nixpkgs wraps 3.12 and hard-sets
+  it, so `windmillNixpkgs` copies the wrapper with the python swapped (no
+  rebuild; the build fails if the wrapper's shape changes) and
+  `INSTANCE_PYTHON_VERSION` pins the second preinstall to the same version.
+  Also: `DISABLE_EMBEDDING=true` (the model comes from huggingface.co), workers
+  wait for the server's `/api/version` (it owns migrations), and the first-run
+  hook migrates once against its setup-only postgres so the empty-database
+  probe errors land in `/tmp/pg-setup.log`, not the container log.
 
 `build [project]`, `init <project> [git-url] [--build]`, `run <project>`,
 `ssh <project>`, `ssh-config [--install]`, `shell <project>`,
@@ -717,7 +727,10 @@ of them. Add a `tests/unit/1N-template-<name>.sh` for every new template.
   containing a bare `''` (top-level comments, at column 0, are fine).
 - **In Nix `''` strings, escape shell `${…}` as `''${…}`** (e.g.
   `''${NIXENV_APP_MOUNT:-/app}`), otherwise Nix tries to interpolate it. A bare
-  `$VAR` is already literal.
+  `$VAR` is already literal. **JS/TS template literals too**: `` `${base}/x` ``
+  inside a scaffolded `.astro`/`.ts` file is Nix interpolation and the build
+  dies with "undefined variable" — directus-astro shipped that, unbuildable.
+  `assert_template` rejects a backtick directly followed by `${`.
 - **Dev servers must bind `0.0.0.0`** (`--host`, `--ip`, `HOST=`), never
   localhost: the reverse proxy is a different container. The declared
   `# nixenv:port` must match the port the stack actually serves.
@@ -726,17 +739,36 @@ of them. Add a `tests/unit/1N-template-<name>.sh` for every new template.
   node tools that vendor their deps are the usual culprits (`wrangler` bundles
   `typescript`; `mysql-client` overlaps `mariadb`). Fix with
   `(pkgs.lib.hiPrio pkgs.<winner>)` — the base flake uses the same trick for
-  `git`, and `templates/cloudflare.nix` for `typescript` — or drop the
-  redundant package.
+  `git`, `templates/cloudflare.nix` for `typescript`, `templates/wordpress.nix`
+  for `php` (wp-cli ships its own `etc/php.ini`) — or drop the redundant package.
 - **Services need their dependencies to exist.** Each `run` script must `exec` a
   FOREGROUND process, and should wait for what it needs (php-fpm socket, DB
   ready) with a short `sleep; exit 0` — runsv retries, so exiting is the
   throttle. First-run setup happens BEFORE services start, so if the hook needs
   a database it must start a temporary one itself and shut it down afterwards.
+  Probe postgres AS the cluster's role and database (`pg_isready -U <role>
+  -d <db>`): a bare probe uses the login user `app`, and postgres logs
+  `FATAL: role/database "app" does not exist` on every attempt. Likewise nginx
+  needs `-e /dev/stderr`, or it opens its compiled-in `/var/log/nginx/error.log`
+  before reading the config.
 - **Templates are egress-restricted by default**, so declare every host the
   setup needs in `# nixenv:allow` — the metadata is read before the build and
   seeded into `allowed_hosts`. Missing entries surface as `TCP_DENIED` in
-  `nixenv egress <project>`.
+  `nixenv egress <project>`. **A clean egress log does not prove egress works**:
+  a restricted container has no outside DNS, and an app that resolves the host
+  ITSELF before using the proxy fails without ever reaching squid. WordPress is
+  the case in point — it ignores `HTTP(S)_PROXY` (needs `WP_PROXY_*` in
+  wp-config, from `$NIXENV_EGRESS_PROXY`) and its "safe" downloads pre-resolve
+  the host ("A valid URL was not provided"), so the template ships a
+  must-use plugin that skips that pre-check when a proxy is set.
+- **Verify a template by RUNNING it, not just the unit test.** `assert_template`
+  is textual; it can't see a `buildEnv` collision, a service that logs errors,
+  or a setup step that silently fails. In the dev project: `nixenv-docker init
+  <p> --template=/app/templates/<name>.nix --yes && nixenv-docker run <p>`, then
+  `sv status ~/.nixenv-sv/*` in the container, `docker logs nixenv-<p>` for
+  ERROR/FATAL/WARN, an HTTP check on the declared port, and `nixenv-docker
+  egress <p>`. A 2026-10 pass this way found one template that didn't build,
+  one whose setup half-failed, and error lines in three others.
 - Metadata (`description`, `port`, `allow`, `app-path`) is parsed from leading
   `# nixenv:<key>` comments; the header should also show the `init` command.
   Only `@@PROJECT@@`, `@@APP_MOUNT@@`, `@@DOMAIN@@`, `@@PORT@@` are substituted.

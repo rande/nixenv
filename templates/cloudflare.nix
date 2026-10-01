@@ -171,6 +171,12 @@
             .dev.vars
             GI
 
+              # tsconfig.json names these types; without them `npm run typecheck`
+              # and the editor's TS server fail on a fresh scaffold. npm records
+              # the real version. The worker itself runs without them.
+              ( cd "$APP" && npm install --save-dev --no-audit --no-fund @cloudflare/workers-types ) || \
+                echo "nixenv/cloudflare: could not install @cloudflare/workers-types (egress? nixenv egress $NIXENV_PROJECT)"
+
               touch "$APP/.nixenv/.cloudflare-scaffolded"
               echo "nixenv/cloudflare: ready → https://@@PROJECT@@-${devPort}.@@DOMAIN@@/"
               echo "nixenv/cloudflare: 'wrangler login' is only needed to deploy."

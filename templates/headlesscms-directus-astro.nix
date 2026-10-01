@@ -68,7 +68,13 @@
             #!/bin/sh
             cd "''${NIXENV_APP_MOUNT:-/app}/cms" 2>/dev/null || { echo "directus: not installed yet"; sleep 10; exit 0; }
             [ -d node_modules ] || { echo "directus: deps missing"; sleep 10; exit 0; }
-            i=0; while ! pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1; do
+            # A bare `npm install directus` creates neither; Directus warns that
+            # they're unreadable and uploads fail. Here (not the hook) so
+            # existing installs get them too.
+            mkdir -p uploads extensions
+            # -U: without it pg_isready connects as the login user, which is not a
+            # role in this cluster — every probe logged 'FATAL: role "app" does not exist'.
+            i=0; while ! pg_isready -h 127.0.0.1 -p 5432 -U ${dbUser} >/dev/null 2>&1; do
               i=$((i+1)); [ $i -gt 30 ] && { echo "directus: no database"; sleep 5; exit 0; }; sleep 1; done
             exec npx directus start
           '';
@@ -76,6 +82,8 @@
             #!/bin/sh
             cd "''${NIXENV_APP_MOUNT:-/app}/web" 2>/dev/null || { echo "astro: not installed yet"; sleep 10; exit 0; }
             [ -d node_modules ] || { echo "astro: deps missing"; sleep 10; exit 0; }
+            # Telemetry would only be refused by the egress proxy anyway.
+            export ASTRO_TELEMETRY_DISABLED=1
             # --host is REQUIRED: the reverse proxy is another container, so
             # binding localhost would be unreachable.
             exec npx astro dev --host 0.0.0.0 --port ${webPort}
@@ -132,6 +140,7 @@
             ADMIN_PASSWORD="${adminPass}"
             CORS_ENABLED="true"
             CORS_ORIGIN="true"
+            TELEMETRY="false"
             ENVF
               fi
 
@@ -172,8 +181,9 @@
             const base = import.meta.env.DIRECTUS_URL ?? 'http://127.0.0.1:${cmsPort}';
             let status = 'unreachable';
             try {
-              const r = await fetch(`${base}/server/health`);
-              status = r.ok ? 'up' : `error ${r.status}`;
+              // ping is public; the health endpoint needs an admin token.
+              const r = await fetch(`''${base}/server/ping`);
+              status = r.ok ? 'up' : `error ''${r.status}`;
             } catch (e) { status = 'unreachable'; }
             ---
             <html lang="en">

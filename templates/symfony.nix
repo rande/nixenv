@@ -134,7 +134,9 @@
             mkdir -p "$HOME/.nixenv-run"
             i=0; while [ ! -S "$HOME/.nixenv-run/php-fpm.sock" ] && [ $i -lt 30 ]; do
               i=$((i+1)); sleep 1; done
-            exec nginx -g 'daemon off;' -c "$NIXENV_EXTRA_PROFILE/etc/nginx.conf" -p "$HOME/.nixenv-run"
+            # -e: nginx opens its compiled-in error log (/var/log/nginx/error.log,
+            # absent here) BEFORE reading the config's error_log line.
+            exec nginx -e /dev/stderr -g 'daemon off;' -c "$NIXENV_EXTRA_PROFILE/etc/nginx.conf" -p "$HOME/.nixenv-run"
           '';
 
           startupHook = pkgs.writeTextDir "etc/nixenv-hooks.sh" ''
