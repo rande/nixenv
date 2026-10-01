@@ -17,11 +17,12 @@ git clone -q "$T/tap.git" "$T/tapseed" 2>/dev/null
 ( cd "$T/tapseed" && mkdir Formula && echo old > Formula/nixenv.rb && git add . && git commit -qm init && git push -q origin HEAD:main )
 git -C "$T/tap.git" symbolic-ref HEAD refs/heads/main
 
-W="$T/work"; mkdir -p "$W/packaging/homebrew/Formula" "$W/tests"
+W="$T/work"; mkdir -p "$W/packaging/homebrew/Formula" "$W/tests" "$W/docs"
 cp "$REPO_DIR/release.sh" "$REPO_DIR/.gitignore" "$W/"
 cp "$REPO_DIR/packaging/homebrew/update-formula.sh" "$W/packaging/homebrew/"
 cp "$REPO_DIR/packaging/homebrew/Formula/nixenv.rb" "$W/packaging/homebrew/Formula/"
-printf '#!/usr/bin/env bash\nNIXENV_VERSION="9.8.7"\necho hi\n' > "$W/nixenv.sh"
+printf '#!/usr/bin/env bash\nNIXENV_VERSION="9.8.6"\necho hi\n' > "$W/nixenv.sh"
+printf '<b id="rev">9.8.6</b>\n' > "$W/docs/index.html"
 printf '#!/bin/sh\nexit 0\n' > "$W/tests/run.sh"              # stub: no recursion into this suite
 chmod +x "$W/release.sh" "$W/tests/run.sh" "$W/packaging/homebrew/update-formula.sh"
 ( cd "$W" && git init -q && git add -A && git commit -qm init \
@@ -65,22 +66,45 @@ export NIXENV_REPO="fake/nixenv" TAP_URL="$T/tap.git"
 unset GITHUB_TOKEN; export GITHUB_TOKEN_FILE="$T/no-token"   # never the real one
 rel() { ( cd "$W" && ./release.sh "$@" ) 2>&1; }
 
-# --- preflight refusals (nothing is tagged) ----------------------------------------
-out="$(rel 1.0.0 --yes)" && fail "version mismatch accepted"
-assert_contains "$out" 'declares NIXENV_VERSION="9.8.7"' "version must match nixenv.sh"
-echo dirty >> "$W/nixenv.sh"
-out="$(rel --yes)" && fail "dirty tree accepted"
-assert_contains "$out" "not clean" "refuses a dirty tree"
-( cd "$W" && git checkout -q -- nixenv.sh )
-( cd "$W" && echo x > x && git add x && git commit -qm local )
-out="$(rel --yes)" && fail "unpushed HEAD accepted"
-assert_contains "$out" "isn't pushed" "refuses an unpushed HEAD"
-( cd "$W" && git push -q origin main )
+# --- preflight refusals (nothing is bumped, committed or tagged) ---------------------
+out="$(rel --yes)" && fail "a release without a version accepted"
+assert_contains "$out" "mandatory" "the version argument is mandatory"
+out="$(rel 9.8 --yes)" && fail "a malformed version accepted"
+assert_contains "$out" "X.Y.Z" "rejects a malformed version"
+( cd "$W" && git checkout -q -b feature )
+out="$(rel 9.8.7 --yes)" && fail "a release off main accepted"
+assert_contains "$out" "from 'main' only" "refuses any branch but main"
+( cd "$W" && git checkout -q main && git branch -q -D feature )
+echo dirty >> "$W/README"; ( cd "$W" && git add README )
+out="$(rel 9.8.7 --yes)" && fail "dirty tree accepted"
+assert_contains "$out" "uncommitted changes" "refuses a dirty tree"
+( cd "$W" && git rm -q --cached README && rm README )
+( cd "$W" && git commit -q --allow-empty -m ahead && git push -q origin main && git reset -q --hard HEAD~1 )
+out="$(rel 9.8.7 --yes)" && fail "a stale main accepted"
+assert_contains "$out" "has commits you don't" "refuses when behind origin"
+( cd "$W" && git pull -q --ff-only origin main )
 [ -z "$(git -C "$T/origin.git" tag)" ] || fail "a refusal must not create a tag"
+assert_contains "$(cat "$W/nixenv.sh")" 'NIXENV_VERSION="9.8.6"' "a refusal leaves nixenv.sh alone"
 
-# --- a failing workflow stops before the formula -------------------------------------
+# --- tests failing after the bump: nothing committed, the bump is undone ---------------
+printf '#!/bin/sh\nexit 1\n' > "$W/tests/run.sh"; ( cd "$W" && git commit -qam "failing tests" && git push -q origin main )
+out="$(rel 9.8.7 --yes)" && fail "failing unit tests accepted"
+assert_contains "$out" "unit tests fail" "stops on failing tests"
+assert_eq "$(cd "$W" && git status --porcelain --untracked-files=no)" "" "the bump is reverted"
+printf '#!/bin/sh\nexit 0\n' > "$W/tests/run.sh"; ( cd "$W" && git commit -qam "passing tests" && git push -q origin main )
+
+# --- bump + commit + tag; a failing workflow stops before the formula ---------------
+echo scratch > "$W/untracked.txt"                        # must not be committed
 : > "$FAKE_FAIL"
-out="$(rel --yes)" && fail "a failed workflow must fail the release"
+out="$(rel 9.8.7 --yes)" && fail "a failed workflow must fail the release"
+assert_eq "$(git -C "$T/origin.git" log -1 --format=%s main)" "release 9.8.7" "release commit pushed to main"
+assert_eq "$(git -C "$T/origin.git" show --name-only --format= main | sort | tr '\n' ' ')" \
+  "docs/index.html nixenv.sh " "the release commit holds ONLY nixenv.sh and docs/index.html"
+assert_contains "$(git -C "$T/origin.git" show main:nixenv.sh)" 'NIXENV_VERSION="9.8.7"' "NIXENV_VERSION bumped"
+assert_contains "$(git -C "$T/origin.git" show main:docs/index.html)" '<b id="rev">9.8.7</b>' "site rev bumped"
+assert_eq "$(git -C "$T/origin.git" rev-parse 'v9.8.7^{}')" "$(git -C "$T/origin.git" rev-parse main)" \
+  "the tag is on the release commit"
+[ -f "$W/untracked.txt" ] && rm "$W/untracked.txt"
 assert_contains "$out" "failed step: Unit tests" "names the failing step"
 assert_contains "$out" "github.com/fake/nixenv/actions/runs/4242" "links the run"
 assert_contains "$out" "--retag" "says how to recover"
@@ -89,7 +113,7 @@ git -C "$T/tap.git" show main:Formula/nixenv.rb | grep -q old || fail "tap touch
 rm -f "$FAKE_FAIL"
 
 # --- the same tag on HEAD: resume, publish the formula to both repos ----------------
-out="$(rel --yes)" || fail "resume failed: $out"
+out="$(rel 9.8.7 --yes)" || fail "resume failed: $out"
 assert_contains "$out" "resuming" "an existing tag for this code is resumed, not re-created"
 assert_contains "$out" "nixenv 9.8.7 is released" "finishes"
 tapf="$(git -C "$T/tap.git" show main:Formula/nixenv.rb)"
@@ -101,21 +125,21 @@ assert_eq "$(cd "$W" && git status --porcelain)" "" "the tap clone is git-ignore
 
 # --- running again is a no-op ---------------------------------------------------------
 n_before="$(git -C "$T/tap.git" rev-list --count main)"
-out="$(rel --yes)" || fail "re-run failed: $out"
+out="$(rel 9.8.7 --yes)" || fail "re-run failed: $out"
 assert_contains "$out" "tap already on v9.8.7" "idempotent"
 assert_eq "$(git -C "$T/tap.git" rev-list --count main)" "$n_before" "no extra tap commit"
 
 # --- a tag elsewhere needs --retag -------------------------------------------------------
 ( cd "$W" && echo y > y && git add y && git commit -qm fix && git push -q origin main )
-out="$(rel --yes)" && fail "a tag on another commit must not be silently reused"
+out="$(rel 9.8.7 --yes)" && fail "a tag on another commit must not be silently reused"
 assert_contains "$out" "points at" "explains the stale tag"
 # A failed GitHub release must go too: refused without a token...
 : > "$FAKE_RELEASE"
-out="$(rel --yes --retag)" && fail "--retag with a release and no token must refuse"
+out="$(rel 9.8.7 --yes --retag)" && fail "--retag with a release and no token must refuse"
 assert_contains "$out" "needs a token" "explains why"
 # ...deleted through the API with one (sent via --config, not argv).
 : > "$FAKE_LOG"
-out="$(GITHUB_TOKEN=ghp_test rel --yes --retag)" || fail "--retag failed: $out"
+out="$(GITHUB_TOKEN=ghp_test rel 9.8.7 --yes --retag)" || fail "--retag failed: $out"
 grep -q "^DELETE .*/repos/fake/nixenv/releases/777 token$" "$FAKE_LOG" || fail "release not deleted with the token: $(cat "$FAKE_LOG")"
 rm -f "$FAKE_RELEASE"
 assert_eq "$(git -C "$T/origin.git" rev-parse 'v9.8.7^{}')" "$(git -C "$W" rev-parse HEAD~1)" \
@@ -126,7 +150,7 @@ grep -qx '/homebrew-nixenv/' "$REPO_DIR/.gitignore" || fail ".gitignore must ign
 # No GitHub CLI dependency.
 code_only < "$REPO_DIR/release.sh" | grep -qE '(^|[^a-z_-])gh( |$)' && fail "release.sh must not call gh"
 # The tag push shows git's output: hidden, a credential prompt looks like a hang.
-code_only < "$REPO_DIR/release.sh" | grep -q 'push --quiet origin "$tag"' && fail "tag push must not be --quiet"
+code_only < "$REPO_DIR/release.sh" | grep -E 'git push .*"refs/tags/\$tag"' | grep -q -- '--quiet' && fail "tag push must not be --quiet"
 # ONE implementation of the sha256: release.sh delegates to update-formula.sh.
 code_only < "$REPO_DIR/release.sh" | grep -qE 'sha256sum|shasum' \
   && fail "release.sh must not compute the sha256 itself — call update-formula.sh"

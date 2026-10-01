@@ -2,33 +2,31 @@
 
 Pushing a `vX.Y.Z` tag is the whole release. `.github/workflows/release.yml`
 verifies it, publishes a GitHub release, and updates the Homebrew tap.
-`./release.sh` drives all of it from your machine:
+`./release.sh` drives all of it from your machine, version bump included:
 
 ```sh
-# 1. bump the version IN the script — it is the single source of truth
-sed -i '' 's/^NIXENV_VERSION=.*/NIXENV_VERSION="0.2.0"/' nixenv.sh
-git commit -am "release 0.2.0" && git push
-
-# 2. release
-./release.sh
+./release.sh 0.4.0          # the version is mandatory
 ```
 
-`release.sh` checks you're on `main`, clean and pushed, that the version matches
-and the unit tests pass; asks once; pushes the tag; follows the **release**
-workflow through GitHub's REST API (naming the failed step and linking the run
-if it breaks); then publishes the
-formula — to this repo and to the tap, which it clones into `./homebrew-nixenv/`
-(git-ignored). If the workflow's own formula job already did that (`TAP_TOKEN`
-set), those steps are no-ops.
+`release.sh` only runs on `main`. It checks the tree has no uncommitted changes
+and isn't behind `origin/main`, then sets `NIXENV_VERSION` in `nixenv.sh` and
+the `rev` in `docs/index.html`, runs the syntax check and unit tests (reverting
+the bump if they fail), asks once, commits **only those two files** as
+`release X.Y.Z`, tags that commit, and pushes `main` and the tag together
+(`--atomic`). It then follows the **release** workflow through GitHub's REST
+API (naming the failed step and linking the run if it breaks), and publishes
+the formula — to this repo and to the tap, which it clones into
+`./homebrew-nixenv/` (git-ignored). If the workflow's own formula job already
+did that (`TAP_TOKEN` set), those steps are no-ops.
 
 It's safe to re-run: it resumes where it stopped, and does nothing once the
 release is complete. If a release failed and you've pushed a fix, move the tag
-with `./release.sh --retag` (it also deletes the failed GitHub release, after
+with `./release.sh X.Y.Z --retag` (it also deletes the failed GitHub release, after
 confirming). `--yes` skips the prompt. It needs only `git` and `curl` — no
 GitHub CLI. Reads are anonymous (60 API requests/hour per IP, enough for a
 release); a token in `$GITHUB_TOKEN` or `~/.nixenv/github_token` lifts that
 limit, and `--retag` needs one (Contents: write) to delete a failed GitHub
-release — without it, delete the release on its page and re-run. The tag push
+release — without it, delete the release on its page and re-run. The push
 shows git's own output: if it seems to stop there, git is waiting for
 credentials or a signing passphrase.
 

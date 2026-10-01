@@ -2,19 +2,21 @@
 # =============================================================================
 # release.sh — cut a nixenv release end to end
 # =============================================================================
-#   ./release.sh              # release the version declared in nixenv.sh
-#   ./release.sh 0.3.0        # same, but assert that's the version
-#   ./release.sh --yes        # no confirmation prompt
-#   ./release.sh --retag      # the tag exists but is wrong: move it to HEAD
+#   ./release.sh 0.4.0          # bump, commit, tag and publish nixenv 0.4.0
+#   ./release.sh 0.4.0 --yes    # no confirmation prompt
+#   ./release.sh 0.4.0 --retag  # the tag exists but is wrong: move it to HEAD
 #
-# Steps (each is skipped when it's already done, so re-running after a failure
-# resumes where it stopped):
-#   1. preflight  — on the default branch, clean tree, in sync with origin,
-#                   NIXENV_VERSION matches, syntax + unit tests pass
-#   2. tag        — annotated vX.Y.Z tag on HEAD, pushed
-#   3. wait       — follows the `release` workflow (verify → release → formula)
+# The version is mandatory. Steps (each is skipped when it's already done, so
+# re-running after a failure resumes where it stopped):
+#   1. preflight  — on main, clean tree, not behind origin/main
+#   2. bump       — NIXENV_VERSION in nixenv.sh + the rev in docs/index.html;
+#                   syntax + unit tests; commits ONLY those two files
+#                   ("release X.Y.Z"), nothing else is staged
+#   3. tag        — annotated vX.Y.Z tag on that commit; main and the tag are
+#                   pushed together (--atomic: both or neither)
+#   4. wait       — follows the `release` workflow (verify → release → formula)
 #                   through GitHub's REST API and names the failing step
-#   4. formula    — pulls what the workflow committed, clones/updates the tap in
+#   5. formula    — pulls what the workflow committed, clones/updates the tap in
 #                   ./homebrew-nixenv (git-ignored), runs update-formula.sh and
 #                   pushes the formula to BOTH repos if they're not already on it
 #
@@ -51,12 +53,18 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --yes|-y) assume_yes=1;;
     --retag)  retag=1;;
-    -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     -*) die "unknown option: $1";;
-    *)  version="${1#v}";;
+    *)  [ -z "$version" ] || die "one version only (got '$version' and '$1')"
+        version="${1#v}";;
   esac
   shift
 done
+[ -n "$version" ] || die "usage: ./release.sh <X.Y.Z> [--yes] [--retag]   (the version is mandatory)"
+# Strict: it is written into nixenv.sh and a sed replacement below.
+printf '%s\n' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
+  || die "version must be X.Y.Z (got '$version')"
+tag="v$version"
 
 confirm() {
   [ "$assume_yes" = 1 ] && return 0
@@ -68,24 +76,14 @@ confirm() {
 }
 
 # --- 1. preflight -------------------------------------------------------------
+BRANCH=main            # releases are cut from main, and only main
+SCRIPT=nixenv.sh
+SITE=docs/index.html
 have git  || die "git is required"
 have curl || die "curl is required (update-formula.sh downloads the tag tarball)"
-[ -f nixenv.sh ] && [ -f "$FORMULA" ] || die "run this from the nixenv repository"
-
-declared="$(sed -n 's/^NIXENV_VERSION="\([^"]*\)".*/\1/p' nixenv.sh | head -1)"
-[ -n "$declared" ] || die "could not read NIXENV_VERSION from nixenv.sh"
-version="${version:-$declared}"
-case "$version" in
-  [0-9]*.[0-9]*.[0-9]*) ;;
-  *) die "version must be X.Y.Z (got '$version')";;
-esac
-if [ "$version" != "$declared" ]; then
-  die "nixenv.sh declares NIXENV_VERSION=\"$declared\", not $version.
-    Bump it and commit first — the workflow's verify job rejects a mismatch:
-      sed -i.bak 's/^NIXENV_VERSION=.*/NIXENV_VERSION=\"$version\"/' nixenv.sh && rm nixenv.sh.bak
-      git commit -am \"release $version\" && git push"
-fi
-tag="v$version"
+[ -f "$SCRIPT" ] && [ -f "$SITE" ] && [ -f "$FORMULA" ] || die "run this from the nixenv repository"
+grep -q '^NIXENV_VERSION="' "$SCRIPT" || die "could not find NIXENV_VERSION in $SCRIPT"
+grep -q '<b id="rev">[^<]*</b>' "$SITE" || die "could not find <b id=\"rev\"> in $SITE"
 ok "releasing nixenv $version ($tag)"
 
 # The tap clone lives inside this repo; it must never be committed here.
@@ -98,26 +96,26 @@ if ! git check-ignore -q "$TAP_DIR/" 2>/dev/null; then
 fi
 
 branch="$(git rev-parse --abbrev-ref HEAD)"
-default="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
-default="${default:-main}"
-[ "$branch" = "$default" ] || die "on branch '$branch' — releases are cut from '$default'"
+[ "$branch" = "$BRANCH" ] || die "on branch '$branch' — releases are cut from '$BRANCH' only"
 
-if [ -n "$(git status --porcelain)" ]; then
-  git status --short >&2
-  die "working tree is not clean — commit or stash first (the tag must match what's pushed)"
+# Tracked changes would be tested (the unit suite runs on the working tree) but
+# not released; untracked files are ignored — only $SCRIPT and $SITE get staged.
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  git status --short --untracked-files=no >&2
+  die "working tree has uncommitted changes — commit or stash first (the tag must match what's tested)"
 fi
 
 log "fetching origin"
-git fetch --quiet origin "$default" --tags --force
+git fetch --quiet origin "$BRANCH" --tags --force
 local_head="$(git rev-parse HEAD)"
-remote_head="$(git rev-parse "origin/$default")"
-if [ "$local_head" != "$remote_head" ]; then
+remote_head="$(git rev-parse "origin/$BRANCH")"
+if [ "$local_head" != "$remote_head" ] && ! git merge-base --is-ancestor "$remote_head" "$local_head"; then
   if git merge-base --is-ancestor "$local_head" "$remote_head"; then
-    die "origin/$default has commits you don't — git pull --ff-only, then re-run"
+    die "origin/$BRANCH has commits you don't — git pull --ff-only, then re-run"
   fi
-  die "HEAD isn't pushed — git push origin $default, then re-run (the workflow builds what's on GitHub)"
+  die "$BRANCH and origin/$BRANCH have diverged — reconcile them, then re-run"
 fi
-ok "HEAD $(git rev-parse --short HEAD) is on origin/$default"
+ahead="$(git rev-list --count "$remote_head..$local_head")"
 
 # Where does the tag stand? none | here (points at HEAD) | elsewhere
 tag_state="none"
@@ -139,17 +137,36 @@ fi
 
 case "$tag_state" in
   here)
+    [ "$ahead" = 0 ] || die "$tag is released but $BRANCH has $ahead unpushed commit(s) — push them first"
     ok "$tag is already pushed for this code — resuming (workflow, then formula)";;
   elsewhere)
     if [ "$retag" != 1 ]; then
       die "$tag already exists on origin but points at ${remote_tag_sha:0:7}, not HEAD ${local_head:0:7}.
-    If that tag's release failed and you've fixed it, move it:  ./release.sh --retag"
+    If that tag's release failed and you've fixed it, move it:  ./release.sh $version --retag"
     fi;;
 esac
 
+# --- 2. bump --------------------------------------------------------------------
+bumped=0
 if [ "$tag_state" != "here" ]; then
+  # -i.bak + rm: the one in-place form GNU and BSD (macOS) sed both accept.
+  sed -i.bak "s/^NIXENV_VERSION=\"[^\"]*\"/NIXENV_VERSION=\"$version\"/" "$SCRIPT" && rm -f "$SCRIPT.bak"
+  sed -i.bak "s|<b id=\"rev\">[^<]*</b>|<b id=\"rev\">$version</b>|" "$SITE" && rm -f "$SITE.bak"
+  grep -q "^NIXENV_VERSION=\"$version\"" "$SCRIPT" || die "failed to set NIXENV_VERSION in $SCRIPT"
+  grep -q "<b id=\"rev\">$version</b>" "$SITE"     || die "failed to set the rev in $SITE"
+  if git diff --quiet -- "$SCRIPT" "$SITE"; then
+    ok "$SCRIPT and $SITE already say $version"
+  else
+    bumped=1
+    git --no-pager diff --stat -- "$SCRIPT" "$SITE"
+  fi
+
+  # Undo the bump if anything below fails before it is committed.
+  restore() { [ "$bumped" = 1 ] && git checkout --quiet -- "$SCRIPT" "$SITE" 2>/dev/null || true; }
+  trap restore EXIT
+
   log "syntax + unit tests (the same checks the workflow's verify job runs)"
-  bash -n nixenv.sh || die "nixenv.sh has a syntax error"
+  bash -n "$SCRIPT" || die "$SCRIPT has a syntax error"
   ./tests/run.sh unit >/tmp/nixenv-release-tests.log 2>&1 \
     || { tail -30 /tmp/nixenv-release-tests.log >&2; die "unit tests fail — full log: /tmp/nixenv-release-tests.log"; }
   ok "unit tests pass"
@@ -177,16 +194,16 @@ json_first() {
     | head -1 | sed -E "s/^\"$1\"://; s/^\"//; s/\"$//"
 }
 
-# --- 2. tag ---------------------------------------------------------------------
+# --- 3. tag ---------------------------------------------------------------------
 if [ "$tag_state" = "elsewhere" ]; then
-  warn "--retag: $tag will be deleted on origin and re-created on HEAD"
+  warn "--retag: $tag will be deleted on origin and re-created on the release commit"
   release_id="$(api "releases/tags/$tag" 2>/dev/null | json_first id || true)"
   if [ -n "$release_id" ]; then
     [ -n "$api_token" ] || die "a GitHub release for $tag exists, and deleting it needs a token.
     Delete it at https://github.com/$REPO/releases/tag/$tag (or set GITHUB_TOKEN), then re-run --retag"
     warn "the GitHub release for $tag will be deleted too"
   fi
-  confirm "Move $tag to $(git rev-parse --short HEAD)?"
+  confirm "Move $tag?"
   if [ -n "$release_id" ]; then
     api DELETE "releases/$release_id" >/dev/null || die "could not delete the GitHub release for $tag (token lacks Contents: write?)"
   fi
@@ -197,18 +214,32 @@ if [ "$tag_state" = "elsewhere" ]; then
 fi
 
 if [ "$tag_state" = "none" ]; then
-  confirm "Tag $(git rev-parse --short HEAD) as $tag and publish nixenv $version?"
+  if [ "$bumped" = 1 ]; then
+    what="commit $SCRIPT + $SITE as \"release $version\", tag it $tag"
+  else
+    what="tag $(git rev-parse --short HEAD) as $tag"
+  fi
+  [ "$ahead" = 0 ] || what="$what (also pushes $ahead unpushed commit(s) on $BRANCH)"
+  confirm "Release nixenv $version: $what, and push?"
+  if [ "$bumped" = 1 ]; then
+    # Pathspec commit: exactly these two files, whatever else is in the index.
+    git commit --quiet -m "release $version" -- "$SCRIPT" "$SITE"
+    bumped=0                                   # committed: nothing to restore
+    ok "committed $(git rev-parse --short HEAD) release $version"
+  fi
   git tag -d "$tag" >/dev/null 2>&1 || true      # a stale local-only tag
   log "creating $tag (if tag signing is on, gpg may ask for its passphrase)"
   git tag -a "$tag" -m "nixenv $version"
   # Not --quiet: a push waiting for credentials (keychain dialog, browser login,
   # ssh passphrase) looks exactly like a hang when its output is hidden.
-  log "pushing $tag to origin (git may ask for credentials)"
-  git push origin "refs/tags/$tag"
-  ok "pushed $tag"
+  # --atomic: a tag on GitHub whose commit isn't on main (or the reverse) is a
+  # half release; the workflow would build it anyway.
+  log "pushing $BRANCH and $tag to origin (git may ask for credentials)"
+  git push --atomic origin "refs/heads/$BRANCH" "refs/tags/$tag"
+  ok "pushed $BRANCH and $tag"
 fi
 
-# --- 3. wait for the release workflow --------------------------------------------
+# --- 4. wait for the release workflow --------------------------------------------
 tag_sha="$(git rev-parse "$tag^{commit}")"
 log "waiting for the '$WORKFLOW' run for $tag to appear"
 run_id="" i=0
@@ -232,7 +263,7 @@ while :; do
     [ "$status" = completed ] && break
   else
     errs=$((errs + 1))
-    [ "$errs" -lt 5 ] || die "GitHub API keeps failing (rate limit? set GITHUB_TOKEN) — follow it at $run_url, then re-run ./release.sh"
+    [ "$errs" -lt 5 ] || die "GitHub API keeps failing (rate limit? set GITHUB_TOKEN) — follow it at $run_url, then re-run ./release.sh $version"
   fi
   sleep "$POLL"
 done
@@ -244,15 +275,15 @@ if [ "$conclusion" != success ]; then
   echo >&2
   [ -z "$failed" ] || printf '%s\n' "$failed" | sed 's/^/   failed step: /' >&2
   die "the release workflow ended '$conclusion' — logs: $run_url
-    Fix it, commit, push, then: ./release.sh --retag"
+    Fix it, commit, push, then: ./release.sh $version --retag"
 fi
 ok "workflow succeeded"
 
-# --- 4. formula: this repo + the tap -------------------------------------------------
+# --- 5. formula: this repo + the tap -------------------------------------------------
 # The workflow's formula job may already have done this (when TAP_TOKEN is set).
 # Everything below is a no-op if so.
-log "syncing $default (the workflow may have committed the formula)"
-git pull --quiet --ff-only origin "$default"
+log "syncing $BRANCH (the workflow may have committed the formula)"
+git pull --quiet --ff-only origin "$BRANCH"
 
 log "updating the formula in this repo"
 ./packaging/homebrew/update-formula.sh "$version" >/dev/null
@@ -261,7 +292,7 @@ if git diff --quiet -- "$FORMULA"; then
 else
   git add "$FORMULA"
   git commit --quiet -m "homebrew: nixenv $version"
-  git push --quiet origin "$default"
+  git push --quiet origin "$BRANCH"
   ok "committed and pushed $FORMULA"
 fi
 

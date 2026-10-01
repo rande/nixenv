@@ -726,9 +726,13 @@ else `…/rande/nixenv/v$NIXENV_VERSION/templates` — never `main`. `file://` i
 read directly (no curl: paths with spaces), `http://` is refused unless
 `NIXENV_ALLOW_INSECURE_TEMPLATES=1`, and a fetched template's sha256 is logged.
 
-`release.sh` (repo root) is the local driver: preflight (default branch, clean,
-HEAD == origin, version == `NIXENV_VERSION`, unit suite) → annotated tag
-(pushed WITHOUT `--quiet`: a hidden credential prompt looked like a hang) →
+`release.sh <X.Y.Z>` (repo root; the version is MANDATORY) is the local
+driver: preflight (`main` ONLY, no tracked changes, not behind origin) → bump
+`NIXENV_VERSION` in `nixenv.sh` + `<b id="rev">` in `docs/index.html` → syntax +
+unit suite (an EXIT trap reverts the uncommitted bump on any failure) → commit
+ONLY those two files (pathspec commit, `release X.Y.Z`) → annotated tag →
+`git push --atomic origin main <tag>` (WITHOUT `--quiet`: a hidden credential
+prompt looked like a hang) →
 polls `release.yml`'s run through the GitHub REST API with `curl` — NO `gh`
 dependency; anonymous reads, optional token from `$GITHUB_TOKEN` or
 `~/.nixenv/github_token` passed via `curl --config -` (never argv), required
