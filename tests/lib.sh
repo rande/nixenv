@@ -41,7 +41,6 @@ export CONTAINER_PREFIX="nxt"                 # containers nxt-*, volumes nxt_*,
 export NIX_VOLUME="${NIX_VOLUME:-nixenv__nixos_store}"
 export PROXY_HTTP_PORT=18080 PROXY_HTTPS_PORT=18443
 export EGRESS_NET="nxt_net-egress"            # swept with the other nxt_* networks
-export CAPTURE_WEB_PORT=18081                 # never collide with a real capture UI
 export PROXY_MKCERT_INSTALL=0                 # never touch trust stores in tests
 export GIT_USER_NAME="Nix Test" GIT_USER_EMAIL="test@nixenv.local"
 mkdir -p "$NIXTEST_HOME"

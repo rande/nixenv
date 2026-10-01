@@ -126,10 +126,21 @@ assert_contains "$cf" "reverse_proxy @cap_alpha nxt-alpha:{re.cap_alpha.1}"
 assert_contains "$cf" "forward_proxy_url http://$EGRESS_LINK:$((CAPTURE_INGRESS_BASE + 1))"
 assert_contains "$cf" "header_up X-Nixenv-Upstream nxt-alpha:{re.cap_alpha.1}"
 assert_not_contains "$cf" "@cap_beta" "egress-only project: ingress untouched"
+# The mitmweb UI: <p>-mitm.<domain> for EVERY captured project, through Caddy.
+assert_contains "$cf" "@capui_alpha host alpha-mitm.$PROXY_DOMAIN"
+assert_contains "$cf" "@capui_beta host beta-mitm.$PROXY_DOMAIN" "egress-only project still gets the UI"
+assert_contains "$cf" "reverse_proxy @capui_alpha $EGRESS_LINK:$CAPTURE_WEB_IN_PORT"
+assert_not_contains "$cf" "@capui_gamma" "uncaptured project: no UI host"
+# A restricted project may never reach the UI: its guard only admits <name>-<digits>.
+case "alpha-mitm.$PROXY_DOMAIN" in *-[0-9]*.*) fail "UI host would pass the isolation guard";; esac
+assert_eq "$(PROXY_HTTPS_PORT=443 capture_ui_url alpha)" "https://alpha-mitm.$PROXY_DOMAIN"
+assert_eq "$(PROXY_HTTPS_PORT=8443 capture_ui_url alpha)" "https://alpha-mitm.$PROXY_DOMAIN:8443"
 # Order inside route{}: isolation denies → capture route → generic route.
 ln() { printf '%s\n' "$cf" | grep -n -- "$1" | head -1 | cut -d: -f1; }
 [ "$(ln 'respond @xproj_alpha')" -lt "$(ln 'reverse_proxy @cap_alpha')" ] || fail "isolation must run before ingress capture"
 [ "$(ln 'reverse_proxy @cap_alpha')" -lt "$(ln 'reverse_proxy @route')" ] || fail "capture route must precede the generic one"
+[ "$(ln 'respond @xproj_alpha')" -lt "$(ln 'reverse_proxy @capui_alpha')" ] || fail "isolation must run before the UI route"
+[ "$(ln 'reverse_proxy @capui_alpha')" -lt "$(ln 'no route for')" ] || fail "UI route must precede the 502"
 if have caddy; then
   cout="$(caddy adapt --config "$PROXY_DIR/Caddyfile" --adapter caddyfile 2>&1 >/dev/null)" \
     || fail "caddy rejects the generated Caddyfile: $cout"
@@ -150,7 +161,10 @@ eg_fn="$(printf '%s' "$body" | sed -n '/^egress_run()/,/^}/p' | code_only)"
 assert_contains "$eg_fn" '--network-alias "$EGRESS_LINK"'
 assert_contains "$eg_fn" 'container_hardening_args' "egress container hardened"
 up_fn="$(printf '%s' "$body" | sed -n '/^egress_up()/,/^}/p' | code_only)"
-assert_contains "$up_fn" '-p "127.0.0.1:$CAPTURE_WEB_PORT:$CAPTURE_WEB_IN_PORT"' "UI published on loopback only"
+assert_not_contains "$up_fn$eg_fn" '-p "127.0.0.1:' "egress container publishes nothing (UI goes through Caddy)"
+cap_fn="$(printf '%s' "$body" | sed -n '/^cmd_capture()/,/^}/p' | code_only)"
+assert_contains "$cap_fn" 'capture_ui_url "$name"' "capture web prints the Caddy URL"
+assert_not_contains "$(printf '%s' "$body" | code_only)" 'CAPTURE_WEB_PORT' "no host-published UI port left"
 allow_fn="$(printf '%s' "$body" | sed -n '/^cmd_allow()/,/^}/p' | code_only)"
 assert_contains "$allow_fn" 'exec "$EGRESS_NAME" "$PROFILE/bin/squid"' "allow reloads squid where it runs"
 assert_not_contains "$(printf '%s' "$body" | code_only)" 'exec "$PROXY_NAME" "$PROFILE/bin/squid"' "no squid left in the caddy container"

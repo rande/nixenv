@@ -445,8 +445,14 @@ the forge host, no file = old behaviour), and denies to
   checked IP (DNS rebinding between squid's lookup and mitmproxy's); never
   buffers `text/event-stream`. mitmweb UI: `web_host` = link address (never a
   project-facing one), password = `egress-data/mitmweb.token` (`capture web`
-  prints `?token=`), host-published `127.0.0.1:CAPTURE_WEB_PORT` only while
-  something is captured. `write_capture_files` sets `CAPTURE_CHANGED` only when
+  prints `?token=`). NOT host-published: Caddy serves it as
+  `<p>-mitm.<domain>` (`@capui_X` in `caddy_capture_routes`, one per captured
+  project, → `$EGRESS_LINK:CAPTURE_WEB_IN_PORT`, Host kept — mitmweb's
+  websocket compares Origin to Host; `capture_ui_url`; the printed URL adds
+  `#/flows?s=~comment <p>`). Restricted projects can't open it — the SEC-06
+  guard only admits `<self|peer>-<digits>` — so only the host and unrestricted
+  projects reach it, and the token stands. `egress_up` recreates an egress
+  container that still publishes the old 8081. `write_capture_files` sets `CAPTURE_CHANGED` only when
   capture.conf changes; `egress_reload` then kills mitmproxy (pid file) and the
   loop restarts it. A project trusts the capture CA (mitmproxy writes
   `egress-data/mitmproxy/mitmproxy-ca-cert.pem` on first start;

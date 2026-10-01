@@ -154,8 +154,9 @@ check(srv.error, "ingress may NOT reach another project's container")
 
 
 # --- requestheaders: tagging + ingress upstream ------------------------------
-def flow(port, req, peer="127.0.0.1"):
-    return NS(client_conn=client(port, peer), request=req, response=None, error=None, comment="")
+def flow(port, req, peer="127.0.0.1", replay=None):
+    return NS(client_conn=client(port, peer), request=req, response=None, error=None,
+              comment="", is_replay=replay)
 
 
 f = flow(8102, Request("example.org", 443, Headers(host="example.org")))
@@ -177,6 +178,18 @@ for bad in ["nxt-beta:3000", "nxt-alpha:x", "", "nxt-alpha"]:
     f = flow(8201, Request("alpha-3000.nixenv.localhost", 443, hdr), "172.26.0.3")
     cap.requestheaders(f)
     check(f.response is not None and f.response.status_code == 502, f"bad upstream {bad!r} → 502")
+
+# Replay (mitmweb/tui) re-sends the RECORDED request: already aimed at the
+# container, upstream header gone. It must work — and stay on this project.
+req = Request("nxt-alpha", 3000, Headers(host="alpha-3000.nixenv.localhost"))
+f = flow(8201, req, "172.26.0.3", replay="request"); cap.requestheaders(f)
+check(f.response is None, "replay of a recorded ingress request is accepted")
+check((req.host, req.port) == ("nxt-alpha", 3000), "replay keeps the recorded upstream")
+check(req.headers.get("host") == "alpha-3000.nixenv.localhost", "replay keeps the PUBLIC Host")
+check(f.comment == "alpha ingress", "replay is tagged too")
+f = flow(8201, Request("nxt-beta", 3000, Headers(host="nxt-beta")), "172.26.0.3", replay="request")
+cap.requestheaders(f)
+check(f.response is not None and f.response.status_code == 502, "an edited replay to another container → 502")
 
 # --- streaming + saving ------------------------------------------------------
 f = flow(8101, Request("example.com", 443, Headers()))

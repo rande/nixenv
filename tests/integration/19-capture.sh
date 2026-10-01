@@ -29,7 +29,7 @@ nx run c >/dev/null || fail "run"
 # The container was created trusting mitmproxy's CA.
 "$E" inspect nxt-c --format '{{range .Mounts}}{{.Destination}} {{end}}' \
   | grep -q /etc/nixenv-capture-ca.crt || fail "capture CA not mounted"
-"$E" port nxt-egress | grep -q "127.0.0.1:$CAPTURE_WEB_PORT" || fail "UI not published on loopback"
+[ -z "$("$E" port nxt-egress 2>/dev/null)" ] || fail "egress container publishes a port (the UI goes through Caddy)"
 
 # HTTPS out is intercepted (issuer = mitmproxy) AND trusted.
 out="$(dexec c "$PROFILE_PATH/bin/zsh" -lc 'curl -sv -o /dev/null -w "CODE=%{http_code}" https://example.com/ 2>&1' || true)"
@@ -61,7 +61,16 @@ tok="$(cat "$PROXY_DIR/egress-data/mitmweb.token")"
 ui() { "$E" exec nxt-proxy "$PROFILE_PATH/bin/curl" -s -o /dev/null -w %{http_code} --max-time 5 "$@" || true; }
 assert_eq "$(ui "http://$EGRESS_LINK:$CAPTURE_WEB_IN_PORT/flows")" 403 "UI refuses without the token"
 assert_eq "$(ui -H "Authorization: Bearer $tok" "http://$EGRESS_LINK:$CAPTURE_WEB_IN_PORT/flows")" 200 "UI with the token"
-assert_contains "$(nx capture c web)" "token=$tok" "capture web prints the URL"
+assert_contains "$(nx capture c web)" "c-mitm.$PROXY_DOMAIN" "capture web prints the Caddy URL"
+assert_contains "$(nx capture c web)" "token=$tok" "capture web prints the token"
+# Through Caddy as c-mitm.<domain>: token still required.
+via() { "$E" exec nxt-proxy "$PROFILE_PATH/bin/curl" -sk -o /dev/null -w %{http_code} --max-time 5 \
+  --resolve "c-mitm.$PROXY_DOMAIN:443:127.0.0.1" "$@" || true; }
+assert_eq "$(via "https://c-mitm.$PROXY_DOMAIN/flows")" 403 "UI via Caddy refuses without the token"
+assert_eq "$(via -H "Authorization: Bearer $tok" "https://c-mitm.$PROXY_DOMAIN/flows")" 200 "UI via Caddy with the token"
+# ...and never from a restricted project, even the captured one (cross-project guard).
+code="$(dexec c "$PROFILE_PATH/bin/zsh" -lc "curl -sk -o /dev/null -w %{http_code} --max-time 5 -H 'Authorization: Bearer $tok' https://c-mitm.$PROXY_DOMAIN/flows || true")"
+[ "$code" = 403 ] || [ "$code" = 000 ] || fail "restricted project reached the capture UI via Caddy: $code"
 
 # Ingress: a request to c's public URL goes through mitmproxy, app sees the public Host.
 "$E" exec -d nxt-c "$PROFILE_PATH/bin/caddy" respond --listen :8000 'host={http.request.host}'

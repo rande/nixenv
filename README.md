@@ -649,7 +649,7 @@ terminal:
 
 ```sh
 nixenv capture myapp on            # egress + ingress (or: on egress | on ingress)
-nixenv capture myapp web           # prints the UI URL: http://127.0.0.1:8081/?token=…
+nixenv capture myapp web           # prints the UI URL: https://myapp-mitm.nixenv.localhost/?token=…
 nixenv capture myapp log -f        # one line per request, live
 nixenv capture myapp tui           # the recorded flows in mitmproxy's console UI
 nixenv capture myapp har out.har   # export for browser devtools & co
@@ -674,14 +674,21 @@ one talks to the internet directly, with no proxy in the path.
 **Captures are secrets.** They hold whatever crossed the wire: tokens,
 cookies, the `Authorization` header of an HTTPS `git fetch`. They are stored
 owner-only in `~/.nixenv/proxy/egress-data/captures/<project>.{flows,log}`,
-`delete` removes them, and the UI is published on `127.0.0.1` only, behind a
-password (the `token` in the URL — don't paste it around). No project can
-reach mitmproxy directly: its listeners are bound to the egress container's
+`delete` removes them, and the UI is served by the proxy as
+`https://<project>-mitm.nixenv.localhost/` (no extra host port), behind a
+password (the `token` in the URL — don't paste it around). The token is
+required, but only once per browser: the first visit sets a login cookie
+(400 days), after which plain `https://<project>-mitm.nixenv.localhost/` opens
+it. One mitmweb shows every captured project; the printed URL opens it
+pre-filtered to `<project>` (`#/flows?s=~comment <project>`). With
+`PROXY_HTTPS_PORT` other than 443, the URL includes that port. No
+restricted project can open the UI, not even the one being captured, and no project can reach
+mitmproxy directly: its listeners are bound to the egress container's
 loopback (only squid uses them) or to the network it shares with Caddy alone.
 Capture fails closed: if mitmproxy is down, the captured project's requests
 fail rather than go out unrecorded (`nixenv proxy logs egress` shows why).
 mitmproxy keeps flows in memory for the UI; `capture <p> clear` (or `off`)
-restarts it. Set `CAPTURE_WEB_PORT` if 8081 is taken.
+restarts it.
 
 ### Allowlist cheatsheet (tools in the base toolchain + VS Code)
 
@@ -1008,8 +1015,6 @@ Override via environment variables:
   the proxy on `run`), `PROXY_MKCERT_INSTALL` (0 = never run `mkcert -install`).
 - `EGRESS_PORT` (default 3128) — squid's port inside the `nixenv-egress`
   container (not published; used by restricted projects).
-- `CAPTURE_WEB_PORT` (default 8081) — host port (on `127.0.0.1`) of the
-  `capture` web UI.
 
 Projects always live in `~/.nixenv/projects` (not configurable).
 

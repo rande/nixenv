@@ -417,7 +417,7 @@ footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: spac
 
         <!-- recorder (mitmproxy), only for projects with capture on -->
         <path d="M428,107 H444" fill="none" class="s-ok" stroke-width="1.5" stroke-dasharray="2 3" marker-end="url(#arrO)"/>
-        <g class="room" data-note="<b>Recorder</b> (mitmproxy) — off until you run <code>nixenv capture myapp on</code>. That project's traffic then passes through it <b>after</b> the allowlist, and on the way in from the gateway, so every request and response is recorded — browse them in a web UI on <code>127.0.0.1</code> or from your terminal. No project can reach it directly.">
+        <g class="room" data-note="<b>Recorder</b> (mitmproxy) — off until you run <code>nixenv capture myapp on</code>. That project's traffic then passes through it <b>after</b> the allowlist, and on the way in from the gateway, so every request and response is recorded — browse them in a web UI at <code>myapp-mitm.nixenv.localhost</code> or from your terminal. No project can reach it directly.">
           <rect class="body f-paper s-line" x="446" y="78" width="84" height="58" stroke-width="1.5" stroke-dasharray="4 3"/>
           <text x="456" y="100" class="t" style="font-weight:600">Recorder</text>
           <text x="456" y="120" class="t-sm">mitmproxy</text>
@@ -692,8 +692,8 @@ Restart 'myapp' now? [y/N] y
 <span class="c">09:14:09</span> egress  <span class="y">TLS-REFUSED</span> telemetry.example-sdk.io
 
 <span class="p">❯</span> nixenv capture myapp web
-<span class="c">==&gt; mitmweb UI (all captured projects; this one: filter '~comment myapp'):</span>
-    http://127.0.0.1:8081/?token=3f9c…</pre>
+<span class="c">==&gt; mitmweb UI (pre-filtered to 'myapp'; clear the filter to see every captured project):</span>
+    https://myapp-mitm.nixenv.localhost/?token=3f9c…</pre>
         </div>
       </div>
       <div>
@@ -701,7 +701,7 @@ Restart 'myapp' now? [y/N] y
           <li><span><b>Behind the allowlist, never instead of it.</b> The recorder only sees what the exit proxy already let through. A refused host still gets its 403, and is still never looked up.</span></li>
           <li><span><b>Both directions.</b> <em>Egress</em>: everything the project sends out. <em>Ingress</em>: requests to its <code>https://&lt;project&gt;-&lt;port&gt;</code> addresses, on their way in — the app still sees its public host name.</span></li>
           <li><span><b>HTTPS in the clear.</b> While capture is on, the container trusts the recorder's certificate — one restart, which <code>capture on</code> offers. An app that pins its certificates shows up as <code>TLS-REFUSED</code>.</span></li>
-          <li><span><b>Out of the projects' reach.</b> No project can talk to the recorder directly. The web UI listens on <code>127.0.0.1</code> only, behind a password.</span></li>
+          <li><span><b>Out of the projects' reach.</b> No project can talk to the recorder directly. The web UI is served by the gateway at <code>myapp-mitm.nixenv.localhost</code>, behind a password, and no restricted project can open it — not even the one being recorded.</span></li>
           <li><span><b>Treated as secrets.</b> Recordings hold tokens and cookies, so they're owner-only on your machine and <code>delete</code> removes them.</span></li>
         </ul>
         <div class="codeblock" style="margin-top:22px"><button class="copy" data-copy="c-cap">copy</button><pre id="c-cap">nixenv capture myapp on          <span class="c"># both ways</span>

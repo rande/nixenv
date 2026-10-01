@@ -78,8 +78,7 @@ EGRESS_NAME="${CONTAINER_PREFIX}-egress"             # egress container: squid (
 EGRESS_NET="${EGRESS_NET:-${PROXY_NET}-egress}"      # its own outbound network; only it + Caddy join it
 EGRESS_LINK="${CONTAINER_PREFIX}__egress-link"       # its alias on EGRESS_NET ('__': no project can own it)
 EGRESS_DATA_DIR="${EGRESS_DATA_DIR:-$PROXY_DIR/egress-data}"  # squid log, captures, mitmproxy CA
-CAPTURE_WEB_PORT="${CAPTURE_WEB_PORT:-8081}"         # host port (127.0.0.1) of the mitmweb UI while capturing
-CAPTURE_WEB_IN_PORT=8081                             # mitmweb UI port inside the egress container
+CAPTURE_WEB_IN_PORT=8081                             # mitmweb UI port inside the egress container (reached via Caddy: <p>-mitm.<domain>)
 CAPTURE_EGRESS_BASE=8100                             # + n: project n's egress listener (loopback, squid's peer)
 CAPTURE_INGRESS_BASE=8200                            # + n: project n's ingress listener (Caddy only)
 
@@ -1153,7 +1152,8 @@ egress_reload() {
 # captured), separate from the Caddy proxy so recreating Caddy — every restricted
 # 'run' does, for its relays — no longer cuts every project off the network.
 # Run write_egress_configs first. A running container is only reloaded; it is
-# recreated only when missing, or to add/remove the published UI port.
+# recreated only when missing, or when it still publishes a port (the mitmweb UI
+# used to be on 127.0.0.1:8081; Caddy now serves it as <project>-mitm.<domain>).
 egress_up() {
   if [ -z "${EGRESS_PROJECTS:-}" ]; then
     if container_exists "$EGRESS_NAME"; then
@@ -1163,28 +1163,16 @@ egress_up() {
     return 0
   fi
   ensure_egress_net
-  local want_ui=0 has_ui=0
-  [ -n "${CAPTURE_PROJECTS:-}" ] && want_ui=1
-  if container_running "$EGRESS_NAME"; then
-    "$ENGINE" port "$EGRESS_NAME" 2>/dev/null | grep -q . && has_ui=1
-    if [ "$want_ui" = "$has_ui" ]; then
-      egress_connect_nets
-      egress_reload && return 0
-      warn "recreating '$EGRESS_NAME'"
-    fi
+  if container_running "$EGRESS_NAME" \
+     && ! "$ENGINE" port "$EGRESS_NAME" 2>/dev/null | grep -q .; then
+    egress_connect_nets
+    egress_reload && return 0
+    warn "recreating '$EGRESS_NAME'"
   fi
   "$ENGINE" rm -f "$EGRESS_NAME" >/dev/null 2>&1 || true
   mkdir -p "$EGRESS_DATA_DIR"
-  # The mitmweb UI is published on loopback only while something is captured.
-  local ui; ui=()
-  [ "$want_ui" = 1 ] && ui=(-p "127.0.0.1:$CAPTURE_WEB_PORT:$CAPTURE_WEB_IN_PORT")
   log "Starting egress proxy '$EGRESS_NAME' (squid${CAPTURE_PROJECTS:+ + mitmproxy capturing:$CAPTURE_PROJECTS})"
-  if ! egress_run ${ui[@]+"${ui[@]}"}; then
-    [ "$want_ui" = 1 ] || die "failed to start the egress proxy '$EGRESS_NAME'"
-    # Never let the UI cost a project its network: retry without it.
-    warn "could not publish the capture UI on 127.0.0.1:$CAPTURE_WEB_PORT (in use? set CAPTURE_WEB_PORT) — starting without it"
-    egress_run || die "failed to start the egress proxy '$EGRESS_NAME'"
-  fi
+  egress_run || die "failed to start the egress proxy '$EGRESS_NAME'"
   egress_connect_nets
 }
 egress_run() {
@@ -1196,7 +1184,6 @@ egress_run() {
     --user "$(id -u):$(id -g)" \
     $(engine_userns) \
     $(container_hardening_args) \
-    "$@" \
     -v "$NIX_VOLUME":/nix:ro \
     -v "$PROXY_DIR/egress":/etc/egress:ro \
     -v "$EGRESS_DATA_DIR":/data \
@@ -2989,13 +2976,17 @@ ingress";;
       return 0
       ;;
     web)
+      [ -f "$pdir/capture" ] || die "capture is off for '$name' — turn it on first: $0 capture $name on"
       local tok; tok="$(cat "$EGRESS_DATA_DIR/mitmweb.token" 2>/dev/null || true)"
-      [ -n "$tok" ] || die "no capture UI yet — turn it on first: $0 capture $name on"
+      [ -n "$tok" ] || die "no capture UI yet — '$0 proxy up' starts it"
       require_engine
       container_running "$EGRESS_NAME" || warn "the egress proxy is not running — '$0 proxy up'"
-      log "mitmweb UI (all captured projects; this one: filter '~comment $name'):"
-      echo "    http://127.0.0.1:$CAPTURE_WEB_PORT/?token=$tok"
-      echo "    (loopback only; the token is the UI password — treat the URL as a secret)"
+      container_running "$PROXY_NAME" || warn "the proxy is not running — '$0 proxy up'"
+      # One mitmweb serves every captured project; the fragment pre-filters it
+      # to this one (flows are tagged '<project> <direction>').
+      log "mitmweb UI (pre-filtered to '$name'; clear the filter to see every captured project):"
+      echo "    $(capture_ui_url "$name")/?token=$tok#/flows?s=~comment%20$name"
+      echo "    (the token is the UI password — treat the URL as a secret)"
       ;;
     log)
       [ -f "$logf" ] || die "nothing captured for '$name' yet ($logf)"
@@ -3577,6 +3568,16 @@ class Capture:
             return
         flow.comment = f"{w[1]} {w[0]}"   # mitmweb filter: ~comment <project>
         if w[0] == "ingress":
+            if flow.is_replay == "request":
+                # A replay (mitmweb, tui) re-sends the RECORDED request: already
+                # rewritten to the container, header already stripped. Keep it
+                # pointed at this project's container only; server_connect
+                # enforces the same.
+                flow.request.headers.pop(UPSTREAM_HEADER, None)
+                if flow.request.host != w[2]:
+                    flow.response = http.Response.make(
+                        502, f"nixenv: replay for {w[1]} only reaches {w[2]}\n".encode())
+                return
             # Caddy names the upstream it chose in this header (it sends the
             # PUBLIC host as the proxy target). Only this project's container.
             up = flow.request.headers.pop(UPSTREAM_HEADER, "")
@@ -3700,14 +3701,36 @@ EOF
   printf '%s\n--\n%s\n' "$matchers" "$denies"
 }
 
-# Caddy matchers + routes for ingress capture, from CAPTURE_INGRESS ("name port"
-# lines, set by write_egress_configs). Same two-section output as above. Such a
+# Public URL of the mitmweb UI for a captured project (Caddy routes it).
+capture_ui_url() {
+  local port=""
+  [ "$PROXY_HTTPS_PORT" = 443 ] || port=":$PROXY_HTTPS_PORT"
+  printf 'https://%s-mitm.%s%s' "$1" "$PROXY_DOMAIN" "$port"
+}
+
+# Caddy matchers + routes for capture, from CAPTURE_PROJECTS and CAPTURE_INGRESS
+# ("name port" lines), both set by write_egress_configs. Every captured project
+# gets <name>-mitm.<domain> → the mitmweb UI (one instance, on the link net, so
+# only Caddy can reach it; the token is still required). Never a restricted
+# project: the cross-project guard above only lets it reach <self|peer>-<digits>.
+# Ingress: Same two-section output as above. Such a
 # project's requests go to its upstream THROUGH its mitmproxy ingress listener;
 # Caddy sends the PUBLIC host as the proxy target, so the upstream it chose
 # travels in X-Nixenv-Upstream (set here, overwriting anything a client sent;
 # the addon accepts only this project's container and strips it).
 caddy_capture_routes() {
   local dom_re="$1" name port id matchers="" routes=""
+  for name in ${CAPTURE_PROJECTS:-}; do
+    case "$name" in -*|*[!a-zA-Z0-9_-]*) continue;; esac
+    id="$(printf '%s' "$name" | tr -c 'a-zA-Z0-9' '_')"
+    matchers="$matchers
+	@capui_$id host $name-mitm.$PROXY_DOMAIN"
+    routes="$routes
+		# 'nixenv capture $name web': the mitmweb UI (Host kept: its websocket checks Origin).
+		reverse_proxy @capui_$id $EGRESS_LINK:$CAPTURE_WEB_IN_PORT {
+			flush_interval -1
+		}"
+  done
   while read -r name port; do
     [ -n "$name" ] && [ -n "$port" ] || continue
     case "$name" in -*|*[!a-zA-Z0-9_-]*) continue;; esac
@@ -5021,7 +5044,7 @@ Commands:
                             container trusts mitmproxy's CA while capture is on,
                             restart it after 'on'); 'ingress' = requests to its
                             public URLs (via Caddy). Default: both.
-                            'web' prints the mitmweb UI URL (127.0.0.1:$CAPTURE_WEB_PORT),
+                            'web' prints the mitmweb UI URL (<project>-mitm.$PROXY_DOMAIN),
                             'log -f' follows a one-line-per-request log, 'tui'
                             opens the recorded flows in mitmproxy's console UI,
                             'har' exports them. Captures hold tokens and cookies:
@@ -5106,7 +5129,6 @@ Environment overrides:
   PROXY_NET=$PROXY_NET                  (shared user network)
   PROXY_HTTP_PORT=$PROXY_HTTP_PORT / PROXY_HTTPS_PORT=$PROXY_HTTPS_PORT   (host ports; use 8080/8443 for podman rootless)
   PROXY_AUTOSTART=$PROXY_AUTOSTART                     (auto-start the proxy on 'run'; 0 to disable)
-  CAPTURE_WEB_PORT=$CAPTURE_WEB_PORT                  (host port of the 'capture' web UI, on 127.0.0.1)
   PROXY_MKCERT_INSTALL                        (1=run 'mkcert -install' on explicit 'proxy up';
                                                0=never trust — HTTPS works with a warning.
                                                Auto-start on 'run' defaults to 0)
