@@ -91,7 +91,12 @@ eg="$(cat "$edir/egress.sh")"
 sh -n "$edir/egress.sh" || fail "egress.sh parses"
 assert_contains "$eg" '--mode "regular@127.0.0.1:$_port"' "egress listeners: loopback only (squid is the only client)"
 assert_contains "$eg" '--mode "regular@$_bind:$_port"' "ingress listeners: the link address only"
-assert_contains "$eg" 'LINK_SUBNET="172.26.0.0/16"'
+assert_contains "$(cat "$edir/capture.conf")" 'link 172.26.0.0/16' "link subnet in capture.conf"
+# The subnet is read from capture.conf at each mitmproxy start, never baked into
+# egress.sh: that shell outlives 'capture on', and a stale empty value bound the
+# UI to 127.0.0.1 (Caddy 502 on <project>-mitm).
+assert_not_contains "$(code_only < "$edir/egress.sh")" 'LINK_SUBNET' "link subnet not frozen into egress.sh"
+assert_contains "$eg" "s/^link " "loop reads the link subnet from capture.conf"
 assert_contains "$eg" 'if [ "$#" -gt 0 ]' "no listener → don't start (mitmproxy would default to 0.0.0.0:8080)"
 assert_contains "$eg" 'web_host="${_bind:-127.0.0.1}"' "UI never on a project-facing address"
 assert_contains "$eg" 'web_password="$(cat /data/mitmweb.token' "UI password"
