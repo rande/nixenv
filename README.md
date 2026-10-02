@@ -758,7 +758,8 @@ nixenv deploy myapp -- ./release.sh 1.2.0                 # or one command
 |---|---|---|
 | code (app volume) | read-write | read-write (the **same** volume) |
 | home | the home volume | **tmpfs**, rebuilt from the skeleton |
-| git identity + https credentials | home volume | the host seed's files, mounted (shared, not copied) |
+| git identity | home volume | the host seed's (written by `init`) |
+| git https credentials | home volume | **the dev container's** (its `~/.git-credentials`), seed as fallback |
 | tools | base + project profile | the same (base includes `age`, `sops`) |
 | egress | `allowed_hosts` | `allowed_hosts` **+** `deploy_hosts` |
 | your ssh agent | never | forwarded for the session |
@@ -773,10 +774,11 @@ it the deploy container has no network.
 
 **Host-side files** (in `~/.nixenv/projects/<project>/`, none writable from the
 dev container):
-- `home/.gitconfig.identity`, `home/.gitconfig.credentials`, `home/.git-credentials`
-  — written by `init`; mounted into the deploy home, the credentials read-write so
-  a refreshed token lands back in the same file. They are the **seed**: a token you
-  changed inside the dev container's home volume is not seen here.
+- `home/.gitconfig.identity` — your git identity, written by `init`.
+- `home/.git-credentials` — the token `init` stored. Only a fallback: deploy
+  pushes with the **dev container's** `~/.git-credentials` (read from its home
+  volume as plain data), so a token you changed there is the one used. Nothing
+  else from the dev home volume is read.
 - `deploy_gitconfig` — included by the deploy `.gitconfig`, e.g. to push an
   https remote over ssh with the agent:
   `[url "git@github.com:"] pushInsteadOf = https://github.com/`.

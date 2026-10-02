@@ -19,8 +19,10 @@ enforced-by:
   volume read-write at the app mount (the SAME volume), a **tmpfs** home, the
   store, passwd files, the project's authorized_keys + host key, and the
   `deploy-entrypoint.sh`.
-- It MUST NOT mount the home volume or the Claude profile. Tools = the dev
-  container's (project profile, then base; `age`/`sops` in base).
+- It MUST NOT mount the home volume AS its home, nor the Claude profile. The
+  dev home volume is mounted only at `/etc/nixenv/dev-home`, and only its
+  `.git-credentials` is read (DEP-04). Tools = the dev container's (project
+  profile, then base; `age`/`sops` in base).
 - The deploy entrypoint runs no repo/profile hooks or services, copies the
   skeleton into the tmpfs home, exports `GIT_CONFIG_*` overrides for
   `core.fsmonitor`, `core.hooksPath`, `core.sshCommand`, and execs sshd with

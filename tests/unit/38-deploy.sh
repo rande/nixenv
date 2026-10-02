@@ -129,7 +129,11 @@ assert_contains "$src" '-v "$appv":"$appmnt" ' "app volume mounted read-write (r
 assert_not_contains "$src" '"$appmnt":ro' "not read-only any more"
 # git identity + credentials: the HOST seed's files, shared (bind-mounted), not copied
 assert_contains "$src" '"$pdir/home/.gitconfig.identity:/home/$APP_USER/.gitconfig.identity:ro"'
-assert_contains "$src" '"$pdir/home/.gitconfig.credentials:/home/$APP_USER/.gitconfig.credentials:ro"'
+assert_not_contains "$src" '.gitconfig.credentials:' "the helper config is generated, never mounted"
+# credentials = the DEV container's (its home volume, at a side path) — the
+# seed's copy goes stale when the token is changed in the dev container
+assert_contains "$src" '"$homev:/etc/nixenv/dev-home"' "dev home volume at a side path"
+assert_eq "$(printf '%s\n' "$src" | grep -c 'homev')" "4" "the home volume is used for that mount only"
 assert_contains "$src" '"$pdir/home/.git-credentials:/home/$APP_USER/.git-credentials")' "credentials rw (store helper rewrites)"
 assert_contains "$src" '"$pdir/deploy_known_hosts:/etc/nixenv/known_hosts"' "known_hosts persists on the host"
 # same tools as the dev container: the project profile, always (no flag)
@@ -139,7 +143,8 @@ assert_contains "$src" '--tmpfs "/home/$APP_USER' "home is a tmpfs"
 assert_contains "$src" 'deploy_net "$name"' "own network"
 assert_contains "$src" '"$DEPLOY_ENTRYPOINT_FILE"' "deploy entrypoint, not the project one"
 assert_contains "$src" "container_hardening_args" "same hardening as project containers"
-for bad in home_volume db_volume claude_profile_dir CLAUDE_DIR ENTRYPOINT_FILE:/ extra-parameters project_extra_args '-p '; do
+assert_not_contains "$src" '"$homev":/home' "never mounted AS the home"
+for bad in db_volume claude_profile_dir CLAUDE_DIR ENTRYPOINT_FILE:/ extra-parameters project_extra_args '-p '; do
   assert_not_contains "$src" "$bad" "deploy container does not use: $bad"
 done
 assert_contains "$src" "trap " "removed on exit"
@@ -166,6 +171,12 @@ assert_contains "$body" "core.hooksPath" "git: no hooks from the repo"
 assert_contains "$body" "StrictHostKeyChecking accept-new" "TOFU into the host-side known_hosts"
 assert_contains "$body" "/etc/nixenv/deploy_gitconfig" "deploy_gitconfig included"
 assert_not_contains "$body" "cp /etc/nixenv/git" "git files are shared, not copied"
+# dev credentials first, seed second; nothing else is read from the dev volume
+assert_contains "$body" 'helper = store --file=/etc/nixenv/dev-home/.git-credentials' "dev credentials first"
+cred_order="$(grep -n 'helper = store' "$dep" | cut -d: -f1 | tr '\n' ' ')"
+case "$cred_order" in *" "*" "*) ;; *) fail "two store helpers expected, got lines: $cred_order";; esac
+[ "$(code_only < "$dep" | grep -oE 'dev-home/[A-Za-z0-9._-]+' | sort -u)" = "dev-home/.git-credentials" ] \
+  || fail "only .git-credentials may be read from the dev home volume"
 for bad in hooks.sh nixenv-hooks.sh "/sv/" runsv .nixenv/sv nixenv_pre_ssh_start; do
   assert_not_contains "$body" "$bad" "deploy entrypoint runs nothing from the repo: $bad"
 done

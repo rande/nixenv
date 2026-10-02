@@ -67,6 +67,12 @@ rm -f "$NIXENV_PROJECTS_DIR/dp/deploy_hosts"
 out="$(nx deploy dp --no-agent -- 'getent hosts nxt-egress >/dev/null && echo NET || echo NONET' 2>/dev/null)"
 assert_contains "$out" "NONET" "no deploy hosts → no route to the egress proxy"
 
+# Credentials: the DEV container's win over the (stale) seed copy.
+involume nxt_dp_home 'printf "https://u:DEV-TOKEN@git.example\n" > /v/.git-credentials; chown '"$(id -u):$(id -g)"' /v/.git-credentials; chmod 600 /v/.git-credentials'
+printf 'https://u:STALE-SEED@git.example\n' > "$NIXENV_PROJECTS_DIR/dp/home/.git-credentials"
+out="$(nx deploy dp --no-agent -- 'printf "protocol=https\nhost=git.example\n\n" | git credential fill' 2>/dev/null)"
+assert_contains "$out" "password=DEV-TOKEN" "deploy uses the dev container's credentials"
+
 # A leftover container is refused, then removed by 'stop'.
 "$E" run -d --name nxt__dp-deploy debian:stable-slim sleep 60 >/dev/null
 nx deploy dp --no-agent -- true >/dev/null 2>&1 && fail "a second session must be refused"
