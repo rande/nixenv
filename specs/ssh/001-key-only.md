@@ -21,7 +21,8 @@ enforced-by:
   It is mounted read-only at `/etc/nixenv/authorized_keys`, sshd's ONLY
   `AuthorizedKeysFile` (`AuthenticationMethods publickey`, passwords off).
 - The entrypoint MUST NOT build authorized keys from the home volume.
-- `ssh/` is never exported.
+- The project key, host key and generated `ssh/` files are never exported
+  (re-created on import); only `ssh/authorized_keys.extra` travels, gated.
 
 ## Why
 

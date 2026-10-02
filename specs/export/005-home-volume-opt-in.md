@@ -14,8 +14,10 @@ enforced-by:
 
 - A default archive is `app + databases` only. The home volume is included only
   with `--with-home`, and only then does the SECRET warning fire.
-- With no home volume, import calls `seed_project_home` +
-  `configure_git_identity` BEFORE `ensure_volumes`.
+- The same opt-in covers the seed's secrets (EXP-02).
+- With no home volume, import calls `seed_project_home` (no-clobber, so the
+  archive's seed files win) and, only if no identity came across,
+  `configure_git_identity` — BEFORE `ensure_volumes`.
 - `seed_project_home` is shared with `cmd_init` (one definition).
 
 ## Why

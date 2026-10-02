@@ -24,4 +24,4 @@ ssh to an arbitrary allowed host is a tunnel for anything.
 
 ## How
 
-`ssh_hosts` is in `EXPORT_META_FILES`.
+`ssh_hosts` travels in exports (re-validated on import).

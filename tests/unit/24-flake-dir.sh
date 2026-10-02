@@ -18,10 +18,7 @@ printf '%s' "$bp" | code_only | grep -q 'elif \[ -f "$dirfile" \]' \
   || fail "the remembered dir must be an elif on dir_given, or it cannot be overridden"
 
 # It is per-project and machine-independent, so it belongs in an export.
-case " $EXPORT_META_FILES " in
-  *" flake_dir "*) ;;
-  *) fail "flake_dir should travel with an export (a rebuild there needs it too)";;
-esac
+exports_path flake_dir || fail "flake_dir should travel with an export (a rebuild there needs it too)"
 
 # --- behaviour, with the engine stubbed out ----------------------------------
 rm -rf "$PROJECTS_DIR"; mkdir -p "$PROJECTS_DIR/demo"

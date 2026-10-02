@@ -118,7 +118,7 @@ enforced-by:                    # optional: tests that fail when it is broken
 ### Export / import — Moving and backing up projects
 
 - [EXP-01](export/001-archive-format.md) Export archive format
-- [EXP-02](export/002-meta-allowlist.md) Only allowlisted host-side files travel
+- [EXP-02](export/002-project-files-travel.md) The whole project dir travels, except what is regenerated
 - [EXP-03](export/003-regenerated-on-import.md) Machine-specific state is regenerated on import
 - [EXP-04](export/004-imported-meta-untrusted.md) Imported meta files are untrusted (SEC-01)
 - [EXP-05](export/005-home-volume-opt-in.md) The home volume is opt-in

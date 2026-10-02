@@ -75,6 +75,15 @@ nx() {
   fi
 }
 
+# Unit tests (after source_nixenv): does an export carry <relpath> of the
+# project dir? exports_path <relpath> [with_home=0|1]
+exports_path() {
+  local d rc=0; d="$(mktemp -d)"
+  mkdir -p "$d/$(dirname "$1")"; echo x > "$d/$1"
+  export_project_files "$d" "${2:-0}" | grep -qxF "$1" || rc=1
+  rm -rf "$d"; return "$rc"
+}
+
 # Source nixenv.sh for unit tests (functions defined, nothing executed).
 source_nixenv() {
   # shellcheck disable=SC1090

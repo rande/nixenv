@@ -130,9 +130,10 @@ for bad in home_volume db_volume claude_profile_dir CLAUDE_DIR ENTRYPOINT_FILE:/
 done
 assert_contains "$src" "trap " "removed on exit"
 
-# Never exported: an imported archive must not grant deploy egress.
-for f in deploy_hosts deploy_ssh_config; do
-  case " $EXPORT_META_FILES " in *" $f "*) fail "$f must not be in EXPORT_META_FILES";; esac
+# Deploy settings travel; import re-validates the hosts and gates the configs
+# (unit 27 covers the import side).
+for f in deploy_hosts deploy_ssh_config deploy_gitconfig deploy_known_hosts; do
+  exports_path "$f" || fail "$f should travel with an export"
 done
 
 # ── deploy entrypoint ────────────────────────────────────────────────────────

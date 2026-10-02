@@ -800,7 +800,8 @@ that would run a program on ordinary commands (`core.fsmonitor`, hooks,
 matter. Review what you run. An agent that asks before each use
 (1Password, Secretive) lets you notice an unexpected signature.
 
-None of the `deploy_*` files are exported.
+The `deploy_*` files travel in an export; on import, `deploy_hosts` is
+re-validated and the config files are applied only after you confirm them.
 
 ## Updating dotfiles (`sync-home`)
 
@@ -1106,9 +1107,19 @@ machine — handy for forking a database-heavy environment. Importing onto a nam
 that already exists needs `--force`, which **replaces that project's volumes** —
 it warns and asks first (`--yes` to skip the prompt).
 
-**What travels by default:** the `app` and `databases` volumes, plus the portable
-host-side state (`ports`, `app_mount`, `hosts.extra`, `allowed_hosts`,
-`unrestricted`, `extra-parameters`).
+**What travels by default:** the `app` and `databases` volumes, plus everything
+in `~/.nixenv/projects/<project>/` that isn't regenerated per machine — egress
+and deploy settings, ports, hosts, extra engine parameters, your extra
+authorized ssh keys, and the home seed with its git identity. Git credentials in
+the seed travel only with `--with-home`.
+
+**An archive may be someone else's, so `import` checks what it restores.** Host
+lists and ports are re-validated (ports stay on loopback), the git identity is
+rebuilt from name and email only, and anything that changes how the container is
+created or who can log in — `extra-parameters`, `unrestricted`, the deploy ssh/git
+configs and known hosts, extra authorized keys — is shown and applied only after
+you answer yes. Without a terminal, or if you say no, those files are kept next
+to their target as `<file>.imported` for you to review and rename.
 
 **A token in the repo's `.git/config` is the other leak.** If you ever cloned
 with `https://user:token@host/…`, git stored that URL verbatim — and the app
@@ -1119,7 +1130,8 @@ to fix the remote; `import` strips any it finds. Only `http(s)` URLs are touched
 **The home volume is opt-in.** It holds `~/.ssh` and `~/.git-credentials`, so
 including it by default would make every backup a credential leak. A default
 archive is safe to hand to a colleague; `import` builds a fresh home instead —
-skeleton dotfiles, `.ssh/` at mode 700, and a prompt for your git identity.
+the archived seed's dotfiles and git identity (skeleton for anything missing),
+and `.ssh/` at mode 700.
 
 ```sh
 nixenv export myapp --with-home       # keeps shell history, nvim plugins,
@@ -1147,6 +1159,11 @@ nixenv ssh myapp && ssh-keygen -t ed25519
   machine's ownership.
 - **The SSH port.** `import` assigns a fresh free one and prints it; the exported
   port may already be taken here.
+- **The project's ssh key, host key and ssh config.** Re-created on import, so
+  an archive you receive can't come with a key someone else holds. The host
+  ssh config embeds this machine's port and paths.
+- **Capture state** (`capture`, `capture-trust`): whether this machine's
+  mitmproxy CA is trusted is a local decision.
 
 `export` refuses while the project is running, because copying a live Postgres or
 MySQL data directory is crash-consistent at best. `--force` overrides it with a

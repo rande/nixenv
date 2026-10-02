@@ -61,7 +61,7 @@ rm -rf "$CONTEXT_DIR"; materialize_context
 ep="$(cat "$CONTEXT_DIR/entrypoint.sh")"
 assert_contains "$ep" 'cp /etc/nixenv/ssh_host_ed25519_key' "entrypoint uses the mounted host key"
 assert_contains "$ep" 'chmod 600 "$SSHRUN/ssh_host_ed25519_key"' "as a private copy sshd accepts"
-case " $EXPORT_META_FILES " in *" ssh "*|*host_ed25519*) fail "host key must not be exported";; esac
+exports_path ssh/host_ed25519_key 1 && fail "host key must not be exported"
 
 # --- zmx session names survive HostKeyAlias -----------------------------------
 # %k expands to the HostKeyAlias when one is set, so `ssh demo.x` would attach

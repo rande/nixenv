@@ -13,6 +13,11 @@ dexec src sh -lc 'echo hello-app > "$NIXENV_APP_MOUNT/marker.txt"'
 dexec src sh -lc 'mkdir -p /databases/pgsql && echo hello-db > /databases/pgsql/marker.txt'
 dexec src sh -lc 'echo hello-home > "$HOME/marker.txt"'
 src_port="$(cat "$PROJECTS_DIR/src/port")"
+# Project configuration that must survive the move.
+printf 'db.example.org\n' > "$PROJECTS_DIR/src/deploy_hosts"
+printf '10.0.0.5\tdb\n' > "$PROJECTS_DIR/src/hosts.extra"
+printf -- '--device /dev/fuse\n' > "$PROJECTS_DIR/src/extra-parameters"
+printf 'ssh-ed25519 AAAAmine me@laptop\n' > "$PROJECTS_DIR/src/ssh/authorized_keys.extra"
 
 # --- export refuses while the project is running ------------------------------
 out="$(nx export src /tmp/nxt-export.tar 2>&1 || true)"
@@ -39,8 +44,8 @@ for e in passwd shadow port; do
 done
 
 # --- import under a new name --------------------------------------------------
-# Identity comes from env here so the test doesn't depend on the runner's global
-# git config (configure_git_identity only prompts when stdin is a TTY).
+# The env identity must NOT win: the source project's identity travels with the
+# archive (configure_git_identity only runs when none came across).
 GIT_USER_NAME="Test User" GIT_USER_EMAIL="test@example.com" \
   nx import /tmp/nxt-export.tar dst >/dev/null || fail "import failed"
 [ -d "$PROJECTS_DIR/dst" ] || fail "import created no project dir"
@@ -67,8 +72,17 @@ assert_file "$PROJECTS_DIR/dst/passwd" "regenerated the user db"
 grep -q ":$(id -u):" "$PROJECTS_DIR/dst/passwd" || fail "passwd does not carry our uid"
 assert_file "$PROJECTS_DIR/dst/ssh/config" "wrote a host ssh config"
 grep -q "Port $dst_port" "$PROJECTS_DIR/dst/ssh/config" || fail "ssh config has the wrong port"
-grep -q "test@example.com" "$PROJECTS_DIR/dst/home/.gitconfig.identity" \
-  || fail "import did not write a git identity into the fresh home"
+grep -q "$GIT_USER_EMAIL" "$PROJECTS_DIR/dst/home/.gitconfig.identity" \
+  || fail "the source project's git identity did not travel"
+
+# --- project configuration travelled ------------------------------------------
+assert_eq "$(cat "$PROJECTS_DIR/dst/deploy_hosts")" "db.example.org" "deploy_hosts kept"
+assert_file "$PROJECTS_DIR/dst/hosts.extra" "hosts.extra kept"
+# No TTY here: what changes container creation or logins is parked, not applied.
+assert_file "$PROJECTS_DIR/dst/extra-parameters.imported" "extra-parameters parked for review"
+assert_file "$PROJECTS_DIR/dst/ssh/authorized_keys.extra.imported" "extra keys parked for review"
+[ "$(cut -d' ' -f2 "$PROJECTS_DIR/dst/ssh/id_ed25519.pub")" != "$(cut -d' ' -f2 "$PROJECTS_DIR/src/ssh/id_ed25519.pub")" ] \
+  || fail "the project key must be re-created, not imported"
 
 # --- --with-home round-trips the home volume ---------------------------------
 nx stop src >/dev/null 2>&1 || true

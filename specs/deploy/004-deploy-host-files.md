@@ -19,8 +19,9 @@ enforced-by:
 - Host files `deploy_gitconfig` (included by `.gitconfig`), `deploy_ssh_config`
   (included by `.ssh/config`) and `deploy_known_hosts` (read-write,
   `StrictHostKeyChecking accept-new`) are mounted when present.
-- Every one of these MUST be refused if it is a symlink, and none is in
-  `EXPORT_META_FILES`.
+- Every one of these MUST be refused if it is a symlink. They travel in
+  exports; on import the configs are gated and the seed's identity and
+  credentials sanitised (EXP-04).
 
 ## Why
 

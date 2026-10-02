@@ -35,5 +35,5 @@ net first. Host requests and unrestricted projects are deliberately unguarded
 
 ## How
 
-`accept-from` is in `EXPORT_META_FILES`. `pick_addr_fn` emits the function
+`accept-from` travels in exports. `pick_addr_fn` emits the function
 into generated scripts; it falls back to the first address.

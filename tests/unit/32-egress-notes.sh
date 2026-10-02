@@ -18,5 +18,5 @@ assert_eq "$(egress_allowlist_notes p)" "" "nothing to say → silent"
 
 grep -q '### What egress restriction does not protect against' "$REPO_DIR/README.md" \
   || fail "README must list the limits of the allowlist"
-case " $EXPORT_META_FILES " in *" ssh_hosts "*) ;; *) fail "ssh_hosts should travel with an export";; esac
+exports_path ssh_hosts || fail "ssh_hosts should travel with an export"
 true

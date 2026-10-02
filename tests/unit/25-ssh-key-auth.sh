@@ -91,6 +91,10 @@ assert_contains "$ssh_fn" '-i "$pdir/ssh/id_ed25519"' "nixenv ssh uses the proje
 assert_contains "$ssh_fn" 'IdentitiesOnly=yes'        "and only that key"
 
 # The key must never travel in an export.
-case " $EXPORT_META_FILES " in *" ssh "*|*"id_ed25519"*|*"authorized_keys"*)
-  fail "the project ssh key must not be in EXPORT_META_FILES";; esac
+# (not even with --with-home: it is re-created on import)
+for f in ssh/id_ed25519 ssh/id_ed25519.pub ssh/authorized_keys ssh/config ssh/known_hosts; do
+  exports_path "$f" 1 && fail "$f must not travel in an export"
+done
+# your OWN extra keys do travel (import applies them only after a yes)
+exports_path ssh/authorized_keys.extra || fail "ssh/authorized_keys.extra should travel"
 true

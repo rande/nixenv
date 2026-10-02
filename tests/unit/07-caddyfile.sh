@@ -81,8 +81,7 @@ allowed my_app "my-app-80.nixenv.localhost"       || fail "my-app → itself mus
 allowed my_app "beta-80.nixenv.localhost"         && fail "my-app → beta must be denied"
 
 # accept-from travels with an export (project config, machine independent).
-case " $EXPORT_META_FILES " in *" accept-from "*) ;;
-  *) fail "accept-from should be in EXPORT_META_FILES";; esac
+exports_path accept-from || fail "accept-from should travel with an export"
 
 # --- relays: bound to the proxy's primary address ------------------------------
 body="$(cat "$REPO_DIR/nixenv.sh")"

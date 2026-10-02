@@ -4677,10 +4677,40 @@ cmd_delete() {
 #     container whose files it cannot write, and a port that may be taken.
 #   * flake/ and etc-hosts — build artefacts, rebuilt on demand.
 #
-# Only these host-side files travel. Anything not listed is machine-specific or
-# regenerated, so the list is an allowlist rather than an exclude list: a new
-# per-project file is left behind until someone adds it here deliberately.
-EXPORT_META_FILES="ports app_mount hosts.extra allowed_hosts unrestricted extra-parameters flake_dir accept-from ssh_hosts"
+# Everything ELSE under <project>/ travels (meta/<same relative path>), so a
+# project's configuration survives a move: egress, ports, hosts, extra engine
+# parameters, deploy settings, your extra authorized keys, the home seed and
+# its git identity. Import still treats all of it as untrusted (import_meta_files).
+#
+# Regenerated per machine, never exported:
+#   * passwd/group/shadow, port, etc-hosts, flake/ — see above;
+#   * the generated ssh/ files: config and known_hosts embed this machine's port
+#     and paths, and the project's keys are re-created so an archive someone
+#     hands you can't come with a key they also hold;
+#   * capture, capture-trust — whether THIS machine's mitmproxy CA is trusted.
+EXPORT_SKIP_PATHS="passwd group shadow port etc-hosts flake ssh/config ssh/known_hosts ssh/authorized_keys ssh/id_ed25519 ssh/id_ed25519.pub ssh/host_ed25519_key ssh/host_ed25519_key.pub capture capture-trust"
+# Secrets in the home seed: exported only with --with-home, like the home volume.
+EXPORT_SECRET_PATHS="home/.git-credentials home/.gitconfig.credentials home/.ssh"
+
+# path_in_list <relative path> <list>: the path, or a dir it sits under, is listed.
+path_in_list() {
+  local p
+  for p in $2; do
+    case "$1" in "$p"|"$p"/*) return 0;; esac
+  done
+  return 1
+}
+
+# Regular files under <project>/ that an export carries, one relative path per
+# line. $2=1 (--with-home) adds the seed's secrets.
+export_project_files() {
+  local pdir="$1" with_home="${2:-0}" rel
+  ( cd "$pdir" && find . -type f ) | sed 's#^\./##' | LC_ALL=C sort | while IFS= read -r rel; do
+    path_in_list "$rel" "$EXPORT_SKIP_PATHS" && continue
+    if [ "$with_home" != 1 ] && path_in_list "$rel" "$EXPORT_SECRET_PATHS"; then continue; fi
+    printf '%s\n' "$rel"
+  done
+}
 
 # Outer archive is NOT gzipped: each volume inside is already a .tar.gz, so
 # compressing twice costs time and saves nothing.
@@ -4801,7 +4831,7 @@ cmd_export() {
     esac
     shift
   done
-  [ -n "$name" ] || die "usage: $0 export <project> [archive.tar] [--force]"
+  [ -n "$name" ] || die "usage: $0 export <project> [archive.tar] [--with-home] [--force]"
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
   local pdir; pdir="$(project_dir "$name")"
   [ -d "$pdir" ] || die "unknown project '$name'"
@@ -4841,10 +4871,15 @@ cmd_export() {
   trap "rm -rf '$stage'" EXIT
   mkdir -p "$stage/nixenv-export/meta" "$stage/nixenv-export/volumes"
 
-  local f
-  for f in $EXPORT_META_FILES; do
-    [ -e "$pdir/$f" ] && cp -a "$pdir/$f" "$stage/nixenv-export/meta/$f"
-  done
+  local f nmeta=0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    mkdir -p "$stage/nixenv-export/meta/$(dirname "$f")"
+    cp -p "$pdir/$f" "$stage/nixenv-export/meta/$f"
+    nmeta=$((nmeta + 1))
+  done <<EOF
+$(export_project_files "$pdir" "$with_home")
+EOF
 
   # The home volume holds ~/.ssh and ~/.git-credentials, so it is OPT-IN: the
   # default archive is safe to hand to a colleague. `import` reseeds a fresh home
@@ -4891,10 +4926,10 @@ cmd_export() {
 
   ok "Exported '$name' → $out"
   echo "   size:   $(human_size "$out")"
-  echo "   holds:  $(printf '%s' "$vols" | tr ' ' '+') volumes, and $(printf '%s' "$EXPORT_META_FILES" | wc -w | tr -d ' ') host-side files"
+  echo "   holds:  $(printf '%s' "$vols" | tr ' ' '+') volumes, and $nmeta files from $pdir"
   echo "   import: $0 import $out [new-name]"
   if [ "$with_home" = 1 ]; then
-    warn "--with-home: this archive contains ~/.ssh and ~/.git-credentials — treat it as a SECRET"
+    warn "--with-home: this archive contains ~/.ssh and git credentials (volume + seed) — treat it as a SECRET"
   else
     echo "   home:   NOT included (no ssh keys or git credentials)."
     echo "           import reseeds dotfiles and asks for a git identity."
@@ -4927,44 +4962,52 @@ confirm_tty() {
   return 1
 }
 
-# Bring an archive's host-side settings in WITHOUT trusting them. They
-# decide how the container is CREATED on this host, and the archive is someone
-# else's input:
-#   * regular files only — a symlinked meta file (hosts.extra -> ~/.ssh/id_…)
-#     would get bind-mounted into the container. Content is copied with `cat`
-#     into a fresh file, never `cp -a`, so no link or mode survives;
-#   * extra-parameters  → written INERT as extra-parameters.imported, shown, and
-#     left for you to review and rename (`--privileged -v /:/host` otherwise);
+# Bring an archive's project files in WITHOUT trusting them. They decide how
+# the container is CREATED on this host, and the archive may be someone else's:
+#   * regular files with plain relative paths only — a symlinked meta file
+#     (hosts.extra -> ~/.ssh/id_…) would get bind-mounted into the container.
+#     Content is copied with `cat` into a fresh file, so no link or mode survives;
+#   * files regenerated here (EXPORT_SKIP_PATHS) are ignored even if present;
+#   * extra-parameters, deploy_ssh_config, deploy_gitconfig, deploy_known_hosts,
+#     ssh/authorized_keys.extra → shown and applied only after an interactive
+#     yes (import_gated); otherwise parked as <file>.imported;
 #   * ports             → loopback-only specs kept, anything binding another
-#                         address dropped (and bare host:container rewritten to
-#                         127.0.0.1:host:container);
+#                         address dropped (bare host:container → 127.0.0.1:…);
 #   * unrestricted      → honoured only after an interactive yes; --yes does
 #                         NOT accept it, and without a TTY the project stays
 #                         restricted;
-#   * allowed_hosts     → each entry re-validated, the list shown;
-#   * app_mount / flake_dir / accept-from → validated like the commands that
-#                         normally write them.
+#   * allowed_hosts / deploy_hosts / ssh_hosts → each entry re-validated;
+#   * app_mount / flake_dir → validated like the commands that write them;
+#   * home/.gitconfig.identity → rebuilt from name + email only;
+#     home/.git-credentials → credential-store lines only, mode 600;
+#     home/.gitconfig.credentials → rewritten by us (no foreign helper);
+#   * anything else (accept-from, hosts.extra, the seed's dotfiles…) is copied;
+#     accept-from is re-validated where it is used (project_accept_from).
 import_meta_files() {
-  local meta="$1" pdir="$2" name="$3" f src dst line spec kept dropped
-  for f in $EXPORT_META_FILES; do
-    src="$meta/$f"; dst="$pdir/$f"
-    [ -e "$src" ] || [ -L "$src" ] || continue
-    if [ -L "$src" ] || [ ! -f "$src" ]; then
-      warn "archive meta/$f is not a regular file (symlink?) — ignored"
-      continue
-    fi
-    case "$f" in
+  local meta="$1" pdir="$2" name="$3" rel src dst line spec kept dropped gname gemail
+  # Symlinks and other non-regular files never come in — a symlinked
+  # hosts.extra -> ~/.ssh/id_… would be bind-mounted into the container.
+  ( cd "$meta" && find . ! -type f ! -type d ) | sed 's#^\./##' | while IFS= read -r rel; do
+    warn "archive meta/$rel is not a regular file (symlink?) — ignored"
+  done
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    # Paths become paths under <project>/: plain names only, no '..'.
+    case "/$rel/" in
+      */../*|*/./*|*[!a-zA-Z0-9._/@+-]*) warn "archive meta/$rel has an unsafe path — ignored"; continue;;
+    esac
+    path_in_list "$rel" "$EXPORT_SKIP_PATHS" && continue   # regenerated here
+    src="$meta/$rel"; dst="$pdir/$rel"
+    mkdir -p "$(dirname "$dst")"
+    case "$rel" in
       extra-parameters)
-        # A comments-only scaffold carries nothing; anything else is quarantined.
-        if [ -n "$(sed 's/#.*//' "$src" | tr -d '[:space:]')" ]; then
-          cat "$src" > "$pdir/extra-parameters.imported"
-          warn "the archive carries extra engine parameters — NOT applied:"
-          sed 's/#.*//' "$src" | grep -v '^[[:space:]]*$' | sed 's/^/      /'
-          echo "    they change how the container is created (they can grant root on the"
-          echo "    engine host). Review $pdir/extra-parameters.imported, then:"
-          echo "      mv $pdir/extra-parameters.imported $pdir/extra-parameters"
-        fi
-        continue;;
+        import_gated "$src" "$dst" "$name" "extra engine parameters (they change how the container is created and can grant root on the engine host)";;
+      deploy_ssh_config|deploy_gitconfig)
+        import_gated "$src" "$dst" "$name" "$rel (it runs inside the deploy container, which holds your ssh agent)";;
+      deploy_known_hosts)
+        import_gated "$src" "$dst" "$name" "deploy_known_hosts (pre-trusted server host keys for deploy)";;
+      ssh/authorized_keys.extra)
+        import_gated "$src" "$dst" "$name" "extra authorized ssh keys (they can log into the project container)";;
       ports)
         kept=""; dropped=""
         while IFS= read -r line || [ -n "$line" ]; do
@@ -4982,16 +5025,15 @@ import_meta_files() {
           warn "dropped port specs that bind beyond loopback:$dropped"
           echo "    (re-add deliberately with '$0 expose $name <spec>' if you want them)"
         fi
-        printf '%s' "$kept" > "$dst";;
+        printf '%s' "$kept" > "$dst"; chmod 0644 "$dst";;
       unrestricted)
         warn "this archive turns egress restriction OFF for '$name'"
         if confirm_tty "Import '$name' UNRESTRICTED (full network access)?"; then
           : > "$dst"
         else
           log "keeping '$name' restricted (lift it later with '$0 restrict $name off')"
-        fi
-        continue;;
-      allowed_hosts)
+        fi;;
+      allowed_hosts|deploy_hosts|ssh_hosts)
         : > "$dst"
         while IFS= read -r line || [ -n "$line" ]; do
           spec="$(printf '%s' "${line%%#*}" | tr -d '[:space:]')"
@@ -4999,28 +5041,69 @@ import_meta_files() {
           if spec="$(normalize_allowed_host "$spec")"; then
             grep -qxF "$spec" "$dst" || printf '%s\n' "$spec" >> "$dst"
           else
-            warn "dropped invalid allowlist entry from the archive: $line"
+            warn "dropped invalid $rel entry from the archive: $line"
           fi
         done < "$src"
-        log "egress allowlist from the archive: $(tr '\n' ' ' < "$dst")"
-        continue;;
+        chmod 0644 "$dst"
+        log "$rel from the archive: $(tr '\n' ' ' < "$dst")";;
       app_mount)
         spec="$(tr -d '[:space:]' < "$src")"
         if [ -n "$spec" ] && ! valid_app_mount "$spec"; then
           warn "ignoring the archive's app path — using /app"; continue
         fi
-        printf '%s' "$spec" > "$dst"; continue;;
+        printf '%s' "$spec" > "$dst";;
       flake_dir)
         spec="$(tr -d '[:space:]' < "$src")"
         case "$spec" in
           /*|*..*|*[!a-zA-Z0-9._/-]*) warn "ignoring the archive's flake dir '$spec'"; continue;;
         esac
-        printf '%s' "$spec" > "$dst"; continue;;
+        printf '%s' "$spec" > "$dst";;
+      home/.gitconfig.identity)
+        # Rebuilt from name + email only: the file is included by every git
+        # config, deploy's too, and a crafted one could add a credential helper.
+        gname="$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*//p' "$src" | head -n 1)"
+        gemail="$(sed -n 's/^[[:space:]]*email[[:space:]]*=[[:space:]]*//p' "$src" | head -n 1)"
+        case "$gname$gemail" in
+          *[\"\\\[\]\;#]*) warn "ignoring the archive's git identity (unexpected characters)"; continue;;
+        esac
+        [ -n "$gname$gemail" ] || continue
+        printf '[user]\n\tname = %s\n\temail = %s\n' "$gname" "$gemail" > "$dst"
+        ok "git identity from the archive → $gname <$gemail>";;
+      home/.git-credentials)
+        # Data only: keep credential-store lines, nothing else.
+        grep -E '^https?://[^[:space:]]+@[^[:space:]/]+' "$src" > "$dst" || : > "$dst"
+        chmod 600 "$dst";;
+      home/.gitconfig.credentials)
+        # Ours to write, never theirs: a helper here would run on every fetch.
+        printf '[credential]\n\thelper = store\n' > "$dst";;
+      home/.ssh/*)
+        cat "$src" > "$dst"; chmod 700 "$(dirname "$dst")"; chmod 600 "$dst";;
       *)
-        cat "$src" > "$dst";;
+        cat "$src" > "$dst"; chmod 0644 "$dst";;
     esac
-    chmod 0644 "$dst" 2>/dev/null || true
-  done
+  done <<EOF
+$( cd "$meta" && find . -type f | sed 's#^\./##' | LC_ALL=C sort )
+EOF
+}
+
+# Bring in a file that changes how a container is created, who can log in, or
+# what runs next to your agent: shown, then applied only after an interactive
+# yes (--yes does NOT grant it; no TTY = parked as <file>.imported).
+# A comments-only file carries nothing and is copied as-is.
+import_gated() {
+  local src="$1" dst="$2" name="$3" what="$4"
+  if [ -z "$(sed 's/#.*//' "$src" | tr -d '[:space:]')" ]; then
+    cat "$src" > "$dst"; return 0
+  fi
+  warn "the archive carries $what:"
+  sed 's/#.*//' "$src" | grep -v '^[[:space:]]*$' | head -n 20 | sed 's/^/      /'
+  if confirm_tty "Apply it to '$name'?"; then
+    cat "$src" > "$dst"
+    ok "applied ${dst#"$PROJECTS_DIR/"}"
+  else
+    cat "$src" > "$dst.imported"
+    echo "    NOT applied. Review $dst.imported, then: mv $dst.imported $dst"
+  fi
 }
 
 cmd_import() {
@@ -5104,8 +5187,8 @@ cmd_import() {
     has_home=1
   else
     log "No home volume in the archive — seeding a fresh one"
-    seed_project_home "$pdir"
-    configure_git_identity "$pdir"
+    seed_project_home "$pdir"   # no-clobber: the archive's seed files win
+    [ -f "$pdir/home/.gitconfig.identity" ] || configure_git_identity "$pdir"
   fi
   ensure_volumes "$name"
 
@@ -5573,18 +5656,21 @@ Commands:
   delete <project>          Permanently remove a project (container; app, home and
                             databases volumes; host dir) — prints the commands and
                             asks to confirm
-  export <project> [file]   Archive the project (app + databases volumes and
-                            portable host state) into one .tar for another
-                            machine or a backup. Refuses while it is running
-                            (--force snapshots live). --with-home also archives
-                            the home volume, which holds ~/.ssh and git
-                            credentials — that archive is a SECRET.
+  export <project> [file] [--with-home] [--force]
+                            Archive the project (app + databases volumes and
+                            its whole project dir except per-machine state) into
+                            one .tar for another machine or a backup. Refuses
+                            while it is running (--force snapshots live).
+                            --with-home also archives the home volume and the
+                            seed's git credentials — that archive is a SECRET.
   import <file> [new-name] [--force] [--yes]
                             Recreate a project from such an archive: restores the
-                            volumes, chowns them to YOUR uid, regenerates
-                            passwd/shadow, assigns a fresh SSH port, and (when
-                            the archive has no home) seeds dotfiles and prompts
-                            for a git identity.
+                            volumes and settings (re-validated; engine
+                            parameters, deploy configs and extra ssh keys only
+                            after you confirm), chowns to YOUR uid, regenerates
+                            passwd/shadow, ssh keys and a fresh SSH port, and
+                            (without a home) seeds dotfiles, asking for a git
+                            identity only if none came across.
   sync-home <project>       Refresh home dotfiles into the existing home volume:
                             embedded templates first, then per-project overrides
                             from <repo>/.nixenv/home/; backs up overwritten files,

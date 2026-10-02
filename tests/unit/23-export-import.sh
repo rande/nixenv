@@ -8,18 +8,28 @@ body="$(cat "$REPO_DIR/nixenv.sh")"
 exp="$(printf '%s' "$body" | sed -n '/^cmd_export()/,/^}/p')"
 imp="$(printf '%s' "$body" | sed -n '/^cmd_import()/,/^}/p')"
 
-# --- the meta list is an ALLOWLIST of portable files --------------------------
-[ -n "${EXPORT_META_FILES:-}" ] || fail "EXPORT_META_FILES is unset"
-for f in ports app_mount hosts.extra allowed_hosts unrestricted extra-parameters; do
-  case " $EXPORT_META_FILES " in *" $f "*) ;; *) fail "meta list is missing $f";; esac
+# --- everything under <project>/ travels, except what is regenerated ----------
+for f in ports app_mount hosts.extra allowed_hosts unrestricted extra-parameters \
+         flake_dir accept-from ssh_hosts deploy_hosts some-new-file \
+         home/.zshrc home/.gitconfig home/.gitconfig.identity home/.config/nvim/init.lua \
+         ssh/authorized_keys.extra; do
+  exports_path "$f" || fail "an export should carry $f"
 done
 # Machine-specific state must NEVER travel: restoring it onto another uid gives a
 # container that cannot write its own files, or a port already in use here.
-for f in passwd group shadow port etc-hosts flake ssh home; do
-  case " $EXPORT_META_FILES " in
-    *" $f "*) fail "meta list must not carry machine-specific '$f'";;
-  esac
+for f in passwd group shadow port etc-hosts flake/flake.nix flake/flake.lock \
+         ssh/config ssh/known_hosts ssh/authorized_keys ssh/id_ed25519 ssh/host_ed25519_key; do
+  exports_path "$f" 1 && fail "an export must not carry machine-specific '$f'"
 done
+# Secrets in the seed travel only with --with-home, like the home volume.
+for f in home/.git-credentials home/.gitconfig.credentials home/.ssh/id_ed25519; do
+  exports_path "$f" 0 && fail "$f must not travel without --with-home"
+  exports_path "$f" 1 || fail "$f should travel with --with-home"
+done
+# A symlink in the project dir is never followed into the archive.
+d="$(mktemp -d)"; ln -s /etc/hostname "$d/hosts.extra"
+[ -z "$(export_project_files "$d" 1)" ] || fail "symlinks are not exported"
+rm -rf "$d"
 
 # --- manifest round-trip, and it must never be sourced ------------------------
 m="$(mktemp)"
