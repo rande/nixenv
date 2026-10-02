@@ -12,8 +12,9 @@ change is *right for this codebase*, not whether it would be fine somewhere else
 
 ## Before you start
 
-1. Read `CLAUDE.md` in full. It records the invariants and the bugs that
-   produced them; most review findings are violations of something written there.
+1. Read `specs/README.md`, then every spec whose `applies-to` matches a changed
+   file. They record the invariants and the bugs that produced them; most review
+   findings are violations of something written there.
 2. Establish the scope: `git diff --stat <base>...HEAD` (or the files you were
    given). Read every changed hunk, then the *callers* of every changed function
    (`grep -n 'fn_name' nixenv.sh`) — breakage usually hides at a call site.
@@ -51,7 +52,8 @@ change is *right for this codebase*, not whether it would be fine somewhere else
   in a `case` pattern, assertions after an unguarded `exit`).
 
 **Docs and release**
-- `CLAUDE.md` updated for anything a future maintainer must know (the *why*).
+- The matching `specs/` file added or updated for anything a future maintainer
+  must know (the *why*); `tests/unit/39-specs.sh` passes.
 - `README.md` uses bare `nixenv`; `DEVELOPING.md`/`RELEASING.md` still match reality.
 - Help text (`usage`) lists new commands. Version/formula rules in `RELEASING.md`.
 

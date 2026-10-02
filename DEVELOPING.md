@@ -2,8 +2,9 @@
 
 How to set up a working environment for changing nixenv itself, run its tests,
 and review changes. Releasing is covered in [RELEASING.md](RELEASING.md); the
-design and its hard-won rules are in [CLAUDE.md](CLAUDE.md) — read that before
-changing `nixenv.sh`.
+design and its hard-won rules are in [`specs/`](specs/README.md), one rule per
+file — read the ones that govern a file before changing it ([AGENTS.md](AGENTS.md)
+explains how).
 
 Two ways to work:
 
@@ -241,7 +242,7 @@ angles. In Claude Code, working in this repo (the CLI is in the dev project):
 
 | Skill | Looks at |
 |---|---|
-| `/review-principal-engineer` | design, invariants from CLAUDE.md, failure modes, migrations of users' existing `~/.nixenv` state, tests and docs |
+| `/review-principal-engineer` | design, invariants from `specs/`, failure modes, migrations of users' existing `~/.nixenv` state, tests and docs |
 | `/review-security` | escapes to the host or another project, egress bypass, secrets, untrusted inputs — against the threat model in `tasks/security/` |
 | `/review-linux-macos` | Bash 3.2 and BSD tools on macOS, POSIX sh in the entrypoint, Docker vs Podman vs Docker Desktop differences |
 
@@ -251,6 +252,7 @@ findings with severity, location, evidence and a fix.
 ## 5. Before you push
 
 - `./tests/run.sh` is green (CI also runs it on macOS, where Bash 3.2 lives).
-- `CLAUDE.md` explains anything a future maintainer would otherwise trip over.
-- `README.md` uses bare `nixenv` in examples; `CLAUDE.md` uses `./nixenv.sh`.
+- The `specs/` file for every rule you added or changed is up to date (the
+  *why* a future maintainer would otherwise trip over).
+- `README.md` uses bare `nixenv` in examples; specs and `AGENTS.md` use `./nixenv.sh`.
 - Releasing: bump `NIXENV_VERSION`, commit, push, then `./release.sh` ([RELEASING.md](RELEASING.md)).

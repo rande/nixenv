@@ -90,7 +90,7 @@ for v in CONTEXT_DIR PROJECTS_DIR PROXY_DIR CLAUDE_DIR ENGINE_FILE GITHUB_TOKEN_
   line="$(grep -m1 "^$v=" "$REPO_DIR/nixenv.sh")"
   assert_contains "$line" '$HOME/.nixenv' "$v lives under \$HOME"
 done
-[ -f "$REPO_DIR/flake.nix" ] && fail "no root flake.nix: the base flake is embedded in nixenv.sh (CLAUDE.md)"
+[ -f "$REPO_DIR/flake.nix" ] && fail "no root flake.nix: the base flake is embedded in nixenv.sh (specs/core/001)"
 
 # --- examples/hello --------------------------------------------------------------------
 h="$REPO_DIR/examples/hello/flake.nix"
