@@ -14,8 +14,8 @@
 class Nixenv < Formula
   desc "Per-project dev containers sharing one pinned Nix store"
   homepage "https://github.com/rande/nixenv"
-  url "https://github.com/rande/nixenv/archive/refs/tags/v0.4.1.tar.gz"
-  sha256 "de6a26c7d6b43d7b49a7547d2716f45f0375907982db3384676b0a357a197bc0"
+  url "https://github.com/rande/nixenv/archive/refs/tags/v0.4.2.tar.gz"
+  sha256 "e5f4cf1cc53bd0ceff1827fc3e1c1558639cd1a3f04c7cd577adb4d01b51a9ab"
   license "GPL-3.0-or-later"
   head "https://github.com/rande/nixenv.git", branch: "main"
 
