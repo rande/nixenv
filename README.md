@@ -742,7 +742,7 @@ DENIED section of `nixenv egress myapp` — it names the exact domains.
 
 ## Deploying (`deploy`)
 
-Your ssh agent (or 1Password's) should never be forwarded into the dev
+Your ssh agent should never be forwarded into the dev
 container: everything running there — dependencies, scripts, an AI agent — runs
 as the same user and could use it. `nixenv deploy <project>` gives you a
 separate, throwaway container for that, which can still edit the code, commit
@@ -750,7 +750,7 @@ and push (e.g. a `release.sh` that bumps a version):
 
 ```sh
 nixenv deploy myapp allow 5.196.77.220 51.255.65.147     # deploy-only hosts
-nixenv deploy myapp --agent=~/.1password/agent.sock       # shell; exit = gone
+nixenv deploy myapp --agent=~/.ssh/deploy-agent.sock      # shell; exit = gone
 nixenv deploy myapp -- ./release.sh 1.2.0                 # or one command
 ```
 
@@ -788,9 +788,21 @@ dev container):
 host reaches it with `ProxyCommand <engine> exec -i … socat`, so there is no
 published port or relay, and the agent rides the ssh session. That works the
 same on Docker Desktop, Linux and podman. The session uses the project's key and
-pinned host key, and ignores your `~/.ssh/config` (no `ControlMaster` reuse).
-`--agent` defaults to `$SSH_AUTH_SOCK` (`NIXENV_DEPLOY_AGENT` sets another
-default); `--no-agent` forwards none.
+pinned host key.
+The session connects to the host name `nixenv-deploy-<project>`, so your
+`~/.ssh/config` can choose the agent for every deploy:
+
+```
+Host nixenv-deploy-*
+    IdentityAgent ~/.ssh/deploy-agent.sock
+```
+
+The agent ssh would use (`IdentityAgent`, else `$SSH_AUTH_SOCK`) is forwarded,
+unless your config sets `ForwardAgent` itself. `--agent=<socket>` forwards a
+specific one and `--no-agent` none (`NIXENV_DEPLOY_AGENT` changes the default).
+Your config can't change how the session connects: the transport, key,
+host-key check and the no-`ControlMaster` rule are fixed on the command line,
+which ssh gives precedence.
 
 **What it does not protect against:** the code is shared with the dev
 container, which can change it at any moment. A script you run in the deploy
@@ -798,7 +810,7 @@ container runs with your agent. The deploy shell neutralises the git settings
 that would run a program on ordinary commands (`core.fsmonitor`, hooks,
 `core.sshCommand`), but a modified `release.sh` or `Makefile` is a different
 matter. Review what you run. An agent that asks before each use
-(1Password, Secretive) lets you notice an unexpected signature.
+lets you notice an unexpected signature.
 
 The `deploy_*` files travel in an export; on import, `deploy_hosts` is
 re-validated and the config files are applied only after you confirm them.

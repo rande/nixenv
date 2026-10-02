@@ -4413,27 +4413,43 @@ deploy_log() {
   grep "$prefix" "$logf" | tail -30 || warn "no deploy egress logged yet"
 }
 
+# The host name a deploy session connects to, so ~/.ssh/config can match it:
+#   Host nixenv-deploy-*
+#       IdentityAgent ~/.ssh/deploy-agent.sock
+# Fixed 'nixenv-' like ssh_host_alias: the user's config shouldn't depend on
+# CONTAINER_PREFIX.
+deploy_ssh_host() { printf 'nixenv-deploy-%s' "$1"; }
+
 # ssh argv for a deploy session, in DEPLOY_SSH (an array: paths may hold
-# spaces). -F /dev/null: the user's ~/.ssh/config must not leak in — a
-# 'Host *' ControlMaster would let a later, unrelated session reuse this one.
+# spaces). The user's ~/.ssh/config applies (IdentityAgent, ForwardAgent, …),
+# but ssh takes the FIRST value it sees and -o comes before the config, so
+# everything the session depends on is pinned here: transport, key, host-key
+# check, no ControlMaster (a 'Host *' master would let a later, unrelated
+# session reuse this one), no RemoteCommand/LocalCommand.
+# $3 = auto (ForwardAgent from the config, else yes) | yes | no | <socket>.
 deploy_ssh_argv() {
-  local name="$1" cname="$2" agent="$3" pdir fwd; pdir="$(project_dir "$name")"
-  case "$agent" in
-    yes|no) fwd="ForwardAgent=$agent";;
-    *)      fwd="ForwardAgent=\"$agent\"";;   # quoted: ssh parses -o like a config line
-  esac
-  DEPLOY_SSH=(ssh -F /dev/null
+  local name="$1" cname="$2" agent="$3" pdir fa; pdir="$(project_dir "$name")"
+  DEPLOY_SSH=(ssh
     -i "$pdir/ssh/id_ed25519" -o IdentitiesOnly=yes
     -o StrictHostKeyChecking=yes -o HostKeyAlias="$(ssh_host_alias "$name")"
     -o UserKnownHostsFile="$pdir/ssh/known_hosts"
-    -o ControlMaster=no -o ControlPath=none -o LogLevel=ERROR
-    -o "ProxyCommand=$ENGINE exec -i $cname $PROFILE/bin/socat - TCP:127.0.0.1:$SSHD_PORT"
-    -o "$fwd")
+    -o ControlMaster=no -o ControlPath=none
+    -o RemoteCommand=none -o PermitLocalCommand=no -o LogLevel=ERROR
+    -o "ProxyCommand=$ENGINE exec -i $cname $PROFILE/bin/socat - TCP:127.0.0.1:$SSHD_PORT")
+  case "$agent" in
+    auto)
+      # Leave it to the config when it forwards something; else forward the
+      # agent ssh uses (IdentityAgent from the config, or $SSH_AUTH_SOCK).
+      fa="$(ssh -G "$(deploy_ssh_host "$name")" 2>/dev/null | awk '$1 == "forwardagent" {print $2; exit}')"
+      case "$fa" in ""|no) DEPLOY_SSH+=(-o ForwardAgent=yes);; esac;;
+    yes|no) DEPLOY_SSH+=(-o "ForwardAgent=$agent");;
+    *)      DEPLOY_SSH+=(-o "ForwardAgent=\"$agent\"");;   # quoted: -o is parsed like a config line
+  esac
 }
 
 deploy_open() {
   local name="$1"; shift
-  local agent="${NIXENV_DEPLOY_AGENT:-yes}" cmd; cmd=()
+  local agent="${NIXENV_DEPLOY_AGENT:-auto}" cmd; cmd=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --agent=*) agent="${1#--agent=}";;
@@ -4445,7 +4461,11 @@ deploy_open() {
   done
   case "$agent" in "~/"*) agent="$HOME/${agent#"~/"}";; esac
   case "$agent" in
-    yes) [ -n "${SSH_AUTH_SOCK:-}" ] || warn "SSH_AUTH_SOCK is not set — no agent to forward (use --agent=<socket>)";;
+    auto|yes)
+      if [ -z "${SSH_AUTH_SOCK:-}" ] && \
+         ! ssh -G "$(deploy_ssh_host "$name")" 2>/dev/null | grep -q '^identityagent '; then
+        warn "no agent to forward: SSH_AUTH_SOCK is unset and ~/.ssh/config sets no IdentityAgent for $(deploy_ssh_host "$name") (or use --agent=<socket>)"
+      fi;;
     no)  ;;
     *)   [ -S "$agent" ] || die "--agent: '$agent' is not a socket";;
   esac
@@ -4550,9 +4570,9 @@ deploy_open() {
   log "deploy shell for '$name' (agent: $agent) — exit to destroy the container"
   local rc=0
   if [ "${#cmd[@]}" -gt 0 ]; then
-    "${DEPLOY_SSH[@]}" "$APP_USER@$name-deploy" "${cmd[@]}" || rc=$?
+    "${DEPLOY_SSH[@]}" "$APP_USER@$(deploy_ssh_host "$name")" "${cmd[@]}" || rc=$?
   else
-    "${DEPLOY_SSH[@]}" -t "$APP_USER@$name-deploy" || rc=$?
+    "${DEPLOY_SSH[@]}" -t "$APP_USER@$(deploy_ssh_host "$name")" || rc=$?
   fi
   "$ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
   trap - EXIT INT TERM

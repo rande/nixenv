@@ -93,7 +93,13 @@ rm -f "$PROJECTS_DIR/open/deploy_hosts"
 ENGINE=podman
 deploy_ssh_argv alpha nxt__alpha-deploy "/Users/me/Library/Group Containers/agent.sock"
 argv="${DEPLOY_SSH[*]}"
-assert_contains "$argv" "-F /dev/null" "user ssh config ignored"
+# ~/.ssh/config applies (Host nixenv-deploy-* → IdentityAgent …); what the
+# session depends on is pinned with -o, which wins over the config.
+assert_not_contains "$argv" "-F /dev/null" "the user's ssh config applies"
+assert_eq "$(deploy_ssh_host alpha)" "nixenv-deploy-alpha" "matchable host name"
+assert_contains "$(declare -f deploy_open)" 'deploy_ssh_host "$name"' "sessions connect to that name"
+assert_contains "$argv" "RemoteCommand=none" "a config RemoteCommand can't hijack the session"
+assert_contains "$argv" "PermitLocalCommand=no"
 assert_contains "$argv" "ControlMaster=no" "no shared master connection"
 assert_contains "$argv" "ControlPath=none"
 assert_contains "$argv" "StrictHostKeyChecking=yes"
@@ -107,6 +113,14 @@ done
 assert_eq "$found" 1 "the agent option is ONE argv entry"
 deploy_ssh_argv alpha nxt__alpha-deploy yes
 assert_contains "${DEPLOY_SSH[*]}" "ForwardAgent=yes"
+# auto: the config's ForwardAgent wins when it sets one, else yes
+ssh() { [ "$1" = -G ] && printf 'forwardagent /x/agent.sock\n'; }
+deploy_ssh_argv alpha nxt__alpha-deploy auto
+assert_not_contains "${DEPLOY_SSH[*]}" "ForwardAgent" "config decides when it forwards"
+ssh() { [ "$1" = -G ] && printf 'identityagent /x/op.sock\nforwardagent no\n'; }
+deploy_ssh_argv alpha nxt__alpha-deploy auto
+assert_contains "${DEPLOY_SSH[*]}" "ForwardAgent=yes" "else forward (IdentityAgent's agent)"
+unset -f ssh
 ENGINE=docker
 
 # ── deploy container: mounts ─────────────────────────────────────────────────
