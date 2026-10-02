@@ -124,8 +124,8 @@ names() {
   env -u NIX_VOLUME -u PROXY_NET -u EGRESS_NET CONTAINER_PREFIX="$1" bash -c \
     'source "$1"; echo "$NIX_VOLUME $PROXY_NET $EGRESS_NET $PROXY_NAME $EGRESS_NAME"' _ "$NIXENV_SH"
 }
-assert_eq "$(names nixdev)" "nixdev__nixos_store nixdev_net nixdev_net-egress nixdev-proxy nixdev-egress" "nixdev names"
-assert_eq "$(names nixenv)" "nixenv__nixos_store nixenv_net nixenv_net-egress nixenv-proxy nixenv-egress" "default names unchanged"
+assert_eq "$(names nixdev)" "nixdev__nixos_store nixdev_net nixdev_net-egress nixdev__proxy nixdev__egress" "nixdev names"
+assert_eq "$(names nixenv)" "nixenv__nixos_store nixenv_net nixenv_net-egress nixenv__proxy nixenv__egress" "default names"
 # Inside the container, sibling names use the prefix too (NO_PROXY, ssh bypass).
 ep="$(cat "$CONTEXT_DIR/entrypoint.sh" 2>/dev/null || { materialize_context; cat "$CONTEXT_DIR/entrypoint.sh"; })"
 assert_contains "$ep" '!$_cpfx-*' "ssh: siblings bypass the egress proxy whatever the prefix"

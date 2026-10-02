@@ -19,15 +19,15 @@ assert_contains "$nets" "nxt_p1_egress" "on internal network"
 
 # ssh works through the proxy relay
 port="$(cat "$NIXENV_PROJECTS_DIR/p1/port")"
-"$E" port nxt-proxy | grep -q "$port" || fail "relay port not published by proxy"
+"$E" port nxt__proxy | grep -q "$port" || fail "relay port not published by proxy"
 wait_tcp "$port" 25 || fail "ssh relay not reachable"
 out="$(ssh "${ssh_opts[@]}" -p "$port" app@127.0.0.1 'echo RELAY-OK' 2>/dev/null)" || fail "ssh via relay"
 assert_eq "$out" "RELAY-OK"
 
 # proxy env exported in the container — squid lives in its own container
-assert_contains "$(dexec p1 "$PROFILE_PATH/bin/zsh" -lc 'echo $HTTPS_PROXY')" "nxt-egress:3128" "proxy env"
-"$E" exec nxt-proxy sh -c 'ls /proc/*/exe -l 2>/dev/null' | grep -q squid && fail "squid still runs in the caddy container"
-enets="$("$E" inspect nxt-egress --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}')"
+assert_contains "$(dexec p1 "$PROFILE_PATH/bin/zsh" -lc 'echo $HTTPS_PROXY')" "nxt__egress:3128" "proxy env"
+"$E" exec nxt__proxy sh -c 'ls /proc/*/exe -l 2>/dev/null' | grep -q squid && fail "squid still runs in the caddy container"
+enets="$("$E" inspect nxt__egress --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}')"
 assert_contains "$enets" "nxt_p1_egress" "egress container on the project's internal net"
 assert_contains "$enets" "$EGRESS_NET" "egress container on its own outbound net"
 assert_not_contains "$nets" "$EGRESS_NET" "project NOT on the egress net"
@@ -43,14 +43,14 @@ code="$(dexec p1 "$PROFILE_PATH/bin/zsh" -lc \
 case "$code" in 2*|3*) ;; *) fail "validated host not reachable (got $code)";; esac
 
 # hot-reload: newly allowed host works without recreating the proxy
-egress_id="$("$E" inspect nxt-egress --format '{{.Id}}')"
+egress_id="$("$E" inspect nxt__egress --format '{{.Id}}')"
 nx allow p1 httpbin.org >/dev/null
-assert_eq "$("$E" inspect nxt-egress --format '{{.Id}}')" "$egress_id" "egress NOT recreated by allow"
+assert_eq "$("$E" inspect nxt__egress --format '{{.Id}}')" "$egress_id" "egress NOT recreated by allow"
 
 # Recreating the ingress proxy (every restricted 'run' does, for its relays)
 # leaves the egress container — and so the network — alone.
 nx proxy up >/dev/null || fail "proxy up"
-assert_eq "$("$E" inspect nxt-egress --format '{{.Id}}')" "$egress_id" "egress NOT recreated by proxy up"
+assert_eq "$("$E" inspect nxt__egress --format '{{.Id}}')" "$egress_id" "egress NOT recreated by proxy up"
 code="$(dexec p1 "$PROFILE_PATH/bin/zsh" -lc \
   'curl -s -o /dev/null -w %{http_code} https://example.com/ || true')"
 case "$code" in 2*|3*) ;; *) fail "egress broken after proxy up (got $code)";; esac
@@ -59,7 +59,7 @@ case "$code" in 2*|3*) ;; *) fail "egress broken after proxy up (got $code)";; e
 # rule) must parse under the REAL squid. A config it rejects would take out all
 # egress, and the unit test can only check the text. The no-lookup property is
 # covered by tests/squid_acl_sim.py in unit/08.
-out="$("$E" exec nxt-egress "$PROFILE_PATH/bin/squid" -k parse -f /etc/egress/squid.conf 2>&1)" \
+out="$("$E" exec nxt__egress "$PROFILE_PATH/bin/squid" -k parse -f /etc/egress/squid.conf 2>&1)" \
   || fail "squid rejected the generated config: $out"
 printf '%s' "$out" | grep -qiE 'FATAL|unrecognized|Bungled' \
   && fail "squid complained about the generated config: $out"

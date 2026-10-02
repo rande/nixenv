@@ -21,8 +21,8 @@ nx stop >/dev/null || fail "stop (no args) failed"
 
 [ "$(running nxt-a)" = 0 ] || fail "project a still running after stop"
 [ "$(running nxt-b)" = 0 ] || fail "project b still running after stop"
-[ "$(running nxt-proxy)" = 0 ] || fail "proxy still running after stop"
-[ "$(running nxt-egress)" = 0 ] || fail "egress proxy still running after stop"
+[ "$(running nxt__proxy)" = 0 ] || fail "proxy still running after stop"
+[ "$(running nxt__egress)" = 0 ] || fail "egress proxy still running after stop"
 [ "$(running nixenv-test-bystander)" = 1 ] || fail "stop killed an unrelated container!"
 
 # volumes must survive, and projects must restart cleanly

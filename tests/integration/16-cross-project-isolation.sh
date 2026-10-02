@@ -18,7 +18,7 @@ wait_tcp "$PROXY_HTTPS_PORT" 20 || fail "proxy https port not listening"
 
 # The generated Caddyfile must be accepted by the REAL caddy — the unit test
 # only checks text.
-out="$("$E" exec nxt-proxy "$PROFILE_PATH/bin/caddy" validate \
+out="$("$E" exec nxt__proxy "$PROFILE_PATH/bin/caddy" validate \
         --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1)" \
   || fail "caddy rejected the generated Caddyfile: $out"
 
@@ -42,13 +42,13 @@ assert_contains "$body" "b-OK" "host reaches b through the proxy"
 # Relays: b's port 8000 is relayed by the proxy on the host side only.
 wait_tcp 8000 15 || fail "b's relayed port not reachable from the host"
 code="$(dexec a "$PROFILE_PATH/bin/zsh" -lc \
-  "curl -s --noproxy '*' --max-time 5 -o /dev/null -w '%{http_code}' http://nxt-proxy:8000/ || true")"
+  "curl -s --noproxy '*' --max-time 5 -o /dev/null -w '%{http_code}' http://nxt__proxy:8000/ || true")"
 [ "$code" = 200 ] && fail "a reached b's service through the proxy's port relay"
 
 # Opt-in: b accepts a → hot reload, no proxy recreate.
-proxy_id="$("$E" inspect nxt-proxy --format '{{.Id}}')"
+proxy_id="$("$E" inspect nxt__proxy --format '{{.Id}}')"
 echo a > "$NIXENV_PROJECTS_DIR/b/accept-from"
 nx proxy reload >/dev/null || fail "proxy reload failed"
-assert_eq "$("$E" inspect nxt-proxy --format '{{.Id}}')" "$proxy_id" "reload did not recreate the proxy"
+assert_eq "$("$E" inspect nxt__proxy --format '{{.Id}}')" "$proxy_id" "reload did not recreate the proxy"
 assert_eq "$(from_a "https://b-8000.nixenv.localhost/")" "200" "accept-from lets a reach b"
 true

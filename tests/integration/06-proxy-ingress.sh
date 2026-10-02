@@ -7,7 +7,7 @@ require_store_bin caddy
 command -v curl >/dev/null 2>&1 || skip "curl not installed"
 
 mkproj p1 --unrestricted
-nx run p1 >/dev/null              # auto-starts nxt-proxy on test ports
+nx run p1 >/dev/null              # auto-starts nxt__proxy on test ports
 wait_tcp "$PROXY_HTTPS_PORT" 20 || fail "proxy https port not listening"
 
 # backend: python http server on :3000 inside the project

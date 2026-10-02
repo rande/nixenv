@@ -37,5 +37,5 @@ Squid ACLs are keyed by the internal net's subnet (`net_subnet`: docker
 sibling containers are reached directly.
 
 From inside, external DNS fails by design (`ping`, `dig`, QUIC never work);
-`getent hosts <prefix>-egress` works, `getent hosts google.com` fails. UDP/QUIC
+`getent hosts <prefix>__egress` works, `getent hosts google.com` fails. UDP/QUIC
 isn't proxied and `clone_repo` runs once unrestricted — known limits.

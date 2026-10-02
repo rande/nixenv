@@ -6,6 +6,7 @@ applies-to:
   - "nixenv.sh"
 enforced-by:
   - tests/unit/04-project-names.sh
+  - tests/unit/40-helper-names.sh
   - tests/unit/35-dev-environment.sh
 ---
 
@@ -18,16 +19,22 @@ enforced-by:
   volumes `<prefix>_<p>_{app,home,databases}`, `NIX_VOLUME`
   `<prefix>__nixos_store`, `PROXY_NET` `<prefix>_net`, `EGRESS_NET`
   `${PROXY_NET}-egress`.
-- Helper containers that are not projects use `<prefix>__…` (double
-  underscore): no project name can produce them, and `stop` with no argument
-  sweeps `^<prefix>(-|__)`.
-- `proxy` and `egress` are reserved project names.
+- Every shared helper container uses `<prefix>__…` (double underscore):
+  `<prefix>__proxy` (Caddy), `<prefix>__egress` (squid), the `__egress-link`
+  alias, `<prefix>__<p>-deploy`, the dev sidecars. No project name can produce
+  them, and `stop` with no argument sweeps `^<prefix>(-|__)`.
+- `proxy` and `egress` stay reserved project names: until 0.4 the helpers were
+  `<prefix>-proxy`/`<prefix>-egress`, and `remove_legacy_helper` cleans those up
+  (by their `/etc/egress/` command, never by name alone) on `proxy up`/egress
+  start. Running containers created with the old names are reported by
+  `container_needs_recreate` (egress address AND `NIXENV_PROXY_NAME`).
 
 ## Why
 
 Two prefixes on one engine must share nothing (the dev environment uses
 `nixdev`; tests use `nxt`). A project must never be able to shadow a helper by
-choosing its name.
+choosing its name — with the helpers in the `<prefix>-` namespace, only the
+reserved-name check stood between a project and the proxy's name.
 
 ## How
 

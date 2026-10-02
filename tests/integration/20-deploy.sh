@@ -64,7 +64,7 @@ grep '^acl d_dp ' "$PROXY_DIR/egress/squid.conf" | grep -q deploy-only.example \
 
 # No allowlist → no network at all (and the session still works).
 rm -f "$NIXENV_PROJECTS_DIR/dp/deploy_hosts"
-out="$(nx deploy dp --no-agent -- 'getent hosts nxt-egress >/dev/null && echo NET || echo NONET' 2>/dev/null)"
+out="$(nx deploy dp --no-agent -- 'getent hosts nxt__egress >/dev/null && echo NET || echo NONET' 2>/dev/null)"
 assert_contains "$out" "NONET" "no deploy hosts → no route to the egress proxy"
 
 # Credentials: the DEV container's win over the (stale) seed copy.

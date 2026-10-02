@@ -13,7 +13,7 @@ enforced-by:
 
 ## Rule
 
-- A single `${PREFIX}-proxy` Caddy container (caddy from the store) on the
+- A single `${PREFIX}__proxy` Caddy container (caddy from the store) on the
   shared user network `PROXY_NET`, which every project container joins.
 - Caddy serves `*.PROXY_DOMAIN` (`nixenv.localhost`), parses
   `Host = <project>-<port>.<domain>` and proxies to `<prefix>-<project>:<port>`

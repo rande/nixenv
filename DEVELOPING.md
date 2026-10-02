@@ -106,8 +106,8 @@ Nested ports and the nested proxy live in the sidecar's network: reach them with
 
 **Nested names are `nixdev-*`, never `nixenv-*`.** The dev wrappers (`nixenv`,
 `nixenv-docker`, `nixenv-podman`) default `CONTAINER_PREFIX=nixdev`, and every
-engine-side name follows the prefix: containers `nixdev-<p>`, `nixdev-proxy`,
-`nixdev-egress`, volumes `nixdev_<p>_*`, networks `nixdev_net*` and the store
+engine-side name follows the prefix: containers `nixdev-<p>`, `nixdev__proxy`,
+`nixdev__egress`, volumes `nixdev_<p>_*`, networks `nixdev_net*` and the store
 volume `nixdev__nixos_store`. So even on an engine shared with your hosted
 nixenv, a nested `stop`, `delete` or `build` can only touch nested things. An
 explicit `CONTAINER_PREFIX=…` still wins.

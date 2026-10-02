@@ -21,7 +21,8 @@ enforced-by:
 ## Why
 
 Those blocks are written once into the home volume and the `-e` is fixed at
-creation; when squid moved to `<prefix>-egress` they kept pointing at a proxy
+creation; when squid moved to `<prefix>-egress` (and again when the helpers
+became `<prefix>__egress`/`<prefix>__proxy`) they kept pointing at a proxy
 that no longer existed.
 
 ## How

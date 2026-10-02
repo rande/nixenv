@@ -68,14 +68,16 @@ ENGINE=""                                            # resolved at runtime
 
 # --- Reverse proxy (nixenv proxy) --------------------------------------------
 PROXY_NET="${PROXY_NET:-${CONTAINER_PREFIX}_net}"    # shared user network all projects join
-PROXY_NAME="${CONTAINER_PREFIX}-proxy"               # the Caddy proxy container name
+# Shared helpers are '<prefix>__<name>': '<prefix>-<name>' is the PROJECTS'
+# namespace (container_name), and '__' can't come out of a project name.
+PROXY_NAME="${CONTAINER_PREFIX}__proxy"              # the Caddy proxy container name
 PROXY_DIR="${PROXY_DIR:-$HOME/.nixenv/proxy}"        # Caddyfile + certs + caddy data
 PROXY_DOMAIN="${PROXY_DOMAIN:-nixenv.localhost}"     # base domain: <project>-<port>.<PROXY_DOMAIN>
 PROXY_HTTP_PORT="${PROXY_HTTP_PORT:-80}"             # host port → caddy 8080 (use 8080 for podman rootless)
 PROXY_HTTPS_PORT="${PROXY_HTTPS_PORT:-443}"          # host port → caddy 8443 (use 8443 for podman rootless)
 PROXY_AUTOSTART="${PROXY_AUTOSTART:-1}"              # auto-start the proxy on 'run' (0 to disable)
 EGRESS_PORT="${EGRESS_PORT:-3128}"                   # squid egress port INSIDE the egress container (not published)
-EGRESS_NAME="${CONTAINER_PREFIX}-egress"             # egress container: squid (+ mitmproxy while capturing)
+EGRESS_NAME="${CONTAINER_PREFIX}__egress"            # egress container: squid (+ mitmproxy while capturing)
 EGRESS_NET="${EGRESS_NET:-${PROXY_NET}-egress}"      # its own outbound network; only it + Caddy join it
 EGRESS_LINK="${CONTAINER_PREFIX}__egress-link"       # its alias on EGRESS_NET ('__': no project can own it)
 EGRESS_DATA_DIR="${EGRESS_DATA_DIR:-$PROXY_DIR/egress-data}"  # squid log, captures, mitmproxy CA
@@ -473,7 +475,8 @@ EOF
   _ephost="${_ep%%:*}"; _epport="${_ep##*:}"
   # The blocks below are written ONCE (marker-guarded) into the home volume, so
   # they keep the egress address they were written with. When it changes
-  # (squid moved from <prefix>-proxy to <prefix>-egress), rewrite the old
+  # (squid moved from <prefix>-proxy to <prefix>-egress, then to
+  # <prefix>__egress), rewrite the old
   # address in place — otherwise yarn/npm/ssh would keep using a proxy that no
   # longer exists. The previous address: our record, else the old .npmrc block.
   _prev="$(cat "$HOME_DIR/.nixenv-egress-proxy" 2>/dev/null || true)"
@@ -1300,6 +1303,24 @@ egress_reload() {
   return 0
 }
 
+# Before the helpers moved to '<prefix>__…', they were '<prefix>-proxy' and
+# '<prefix>-egress' — in the projects' namespace. Remove those leftovers: the
+# old proxy still holds the published ports, so the new one couldn't start.
+# Identified by their command (/etc/egress/…), never by name alone, so a
+# project container (it runs the entrypoint) is never mistaken for one.
+# usage: remove_legacy_helper proxy|egress
+remove_legacy_helper() {
+  local c="${CONTAINER_PREFIX}-$1" cmd
+  container_exists "$c" || return 0
+  cmd="$("$ENGINE" inspect -f '{{json .Config.Cmd}}' "$c" 2>/dev/null || true)"
+  case "$cmd" in
+    *"/etc/egress/"*)
+      "$ENGINE" rm -f "$c" >/dev/null 2>&1 || true
+      log "removed the old '$c' (renamed '${CONTAINER_PREFIX}__$1')";;
+  esac
+  return 0
+}
+
 # Start or refresh the egress container (squid, + mitmproxy while a project is
 # captured), separate from the Caddy proxy so recreating Caddy — every restricted
 # 'run' does, for its relays — no longer cuts every project off the network.
@@ -1307,6 +1328,7 @@ egress_reload() {
 # recreated only when missing, or when it still publishes a port (the mitmweb UI
 # used to be on 127.0.0.1:8081; Caddy now serves it as <project>-mitm.<domain>).
 egress_up() {
+  remove_legacy_helper egress
   if [ -z "${EGRESS_PROJECTS:-}${EGRESS_DEPLOYS:-}" ]; then
     if container_exists "$EGRESS_NAME"; then
       "$ENGINE" rm -f "$EGRESS_NAME" >/dev/null 2>&1 || true
@@ -1380,6 +1402,12 @@ container_needs_recreate() {
   mounts="$("$ENGINE" inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$cname" 2>/dev/null || true)"
   if [ "$restricted" = 1 ] && ! printf '%s\n' "$env" | grep -qx "NIXENV_EGRESS_PROXY=http://$EGRESS_NAME:$EGRESS_PORT"; then
     warn "'$name' still points at the OLD egress proxy (squid now runs in '$EGRESS_NAME') — it has no network"
+    stale=1
+  fi
+  # The loopback relays (public URLs from inside) target the proxy by name.
+  if printf '%s\n' "$env" | grep -q '^NIXENV_PROXY_NAME=' \
+     && ! printf '%s\n' "$env" | grep -qx "NIXENV_PROXY_NAME=$PROXY_NAME"; then
+    warn "'$name' still points at the OLD proxy name (now '$PROXY_NAME') — its public URLs fail from inside"
     stale=1
   fi
   if [ "$restricted" = 1 ] && capture_ca_trusted "$name" && [ -s "$EGRESS_DATA_DIR/mitmproxy/mitmproxy-ca-cert.pem" ] \
@@ -2668,9 +2696,6 @@ cmd_run() {
   appmnt="$(project_app_mount "$name")"
   [ -f "$ENTRYPOINT_FILE" ] || die "missing entrypoint at $ENTRYPOINT_FILE"
   [ "$#" -eq 0 ] || die "run takes no command — use '$0 shell $name' or '$0 ssh $name'"
-  # 'egress' became reserved when squid moved to <prefix>-egress; an older
-  # project of that name would now collide with the shared container.
-  [ "$cname" != "$EGRESS_NAME" ] || die "a project named 'egress' collides with the egress proxy container '$EGRESS_NAME' — rename it (export + import under a new name)"
   # Defence in depth: these files shape the container's creation, and a
   # symlink among them could make the engine bind-mount (or read) a host file
   # outside the project dir — e.g. hosts.extra -> ~/.ssh/id_ed25519.
@@ -3534,7 +3559,7 @@ http_access allow deploysrc_$aclname deploydst_$aclname"
 # Bind IPv4 explicitly: a bare port makes squid bind [::] which, without
 # dual-stack (v6only=0), refuses the IPv4 connections containers actually make.
 http_port 0.0.0.0:$EGRESS_PORT
-visible_hostname $PROXY_NAME
+visible_hostname nixenv-squid
 pid_filename /data/run/squid.pid
 access_log stdio:/data/egress.log buffer-size=0KB
 cache_log /data/squid-cache.log
@@ -4088,6 +4113,7 @@ cmd_proxy() {
   case "$sub" in
     up|start|restart)
       volume_exists && store_is_populated || die "shared store not built — run '$0 build' first (caddy comes from it)"
+      remove_legacy_helper proxy   # it holds the ports the new one publishes
       ensure_proxy_net
       ensure_egress_net
       mkdir -p "$PROXY_DIR/data"
@@ -4128,12 +4154,16 @@ cmd_proxy() {
         "$ENGINE" network connect "$(internal_net "$rp")" "$PROXY_NAME" >/dev/null 2>&1 || true
       done
       "$ENGINE" network connect "$EGRESS_NET" "$PROXY_NAME" >/dev/null 2>&1 || true
-      # Name every running restricted project still wired the old way (e.g.
-      # created when squid ran in this container): it has no network now.
-      for rp in $EGRESS_PROJECTS; do
-        if container_running "$(container_name "$rp")"; then
-          container_needs_recreate "$rp" 1 || true
-        fi
+      # Name every running project still wired the old way (created when squid
+      # ran in this container, or before the helpers became '<prefix>__…'):
+      # names are fixed at creation, so it needs 'stop && run'.
+      local _pd _rflag
+      for _pd in "$PROJECTS_DIR"/*/; do
+        [ -d "$_pd" ] || continue
+        rp="$(basename "$_pd")"
+        container_running "$(container_name "$rp")" || continue
+        _rflag=0; is_restricted "$rp" && _rflag=1
+        container_needs_recreate "$rp" "$_rflag" || true
       done
       # Caddy writes its internal CA on first start; give it a moment, then
       # publish it so containers can trust the certs it serves.
@@ -4173,6 +4203,7 @@ cmd_proxy() {
       ok "proxy config reloaded (no restart)"
       ;;
     stop|down)
+      remove_legacy_helper proxy; remove_legacy_helper egress
       "$ENGINE" rm -f "$PROXY_NAME" >/dev/null 2>&1 && ok "proxy stopped" || log "proxy not running"
       if container_exists "$EGRESS_NAME"; then
         "$ENGINE" rm -f "$EGRESS_NAME" >/dev/null 2>&1 || true

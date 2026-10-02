@@ -358,12 +358,12 @@ flowchart LR
         CLIENT["psql / TablePlus / ssh"]
     end
 
-    subgraph PROXYC["📦 nixenv-proxy"]
+    subgraph PROXYC["📦 nixenv__proxy"]
         CADDY["Caddy :80/:443<br/><i>ingress — routes on Host</i>"]
         RELAYS["socat relays<br/><i>ssh + declared ports</i>"]
     end
 
-    subgraph EGRESSC["📦 nixenv-egress"]
+    subgraph EGRESSC["📦 nixenv__egress"]
         SQUID["squid :3128<br/><i>egress allowlist</i>"]
         MITM["mitmproxy<br/><i>only with 'capture'</i>"]
     end
@@ -562,9 +562,9 @@ nixenv init open-project --unrestricted   # opt out at creation
 
 How it works: the restricted project runs on its own **internal** network — the
 kernel gives it *no route to the internet at all* — and its only way out is a
-**squid** allowlist proxy (default-deny) running in the shared `nixenv-egress`
+**squid** allowlist proxy (default-deny) running in the shared `nixenv__egress`
 container. Enforcement is the missing route; squid is just policy, so nothing
-in the container can bypass the list. (squid used to run inside `nixenv-proxy`
+in the container can bypass the list. (squid used to run inside the proxy
 next to Caddy; it has its own container now, so restarting the reverse proxy
 no longer cuts every project off the network. A project container created
 before that still points at the old address — `run` tells you, and
@@ -1099,7 +1099,7 @@ Override via environment variables:
   `<prefix>_net`, i.e. `nixenv_net`), `PROXY_HTTP_PORT` / `PROXY_HTTPS_PORT` (default 80/443; use
   8080/8443 for rootless Podman), `PROXY_AUTOSTART` (default 1; 0 = don't start
   the proxy on `run`), `PROXY_MKCERT_INSTALL` (0 = never run `mkcert -install`).
-- `EGRESS_PORT` (default 3128) — squid's port inside the `nixenv-egress`
+- `EGRESS_PORT` (default 3128) — squid's port inside the `nixenv__egress`
   container (not published; used by restricted projects).
 
 Projects always live in `~/.nixenv/projects` (not configurable).

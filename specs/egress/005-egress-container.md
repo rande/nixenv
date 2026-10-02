@@ -13,7 +13,7 @@ enforced-by:
 
 ## Rule
 
-- `egress_up` runs `${PREFIX}-egress` on its own network `EGRESS_NET`
+- `egress_up` runs `${PREFIX}__egress` on its own network `EGRESS_NET`
   (`${PROXY_NET}-egress`); only it and Caddy join it, Caddy via alias
   `EGRESS_LINK` = `${PREFIX}__egress-link`. It is `network connect`ed to every
   restricted internal net (and every deploy net).
