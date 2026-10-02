@@ -36,6 +36,7 @@ CONTEXT_DIR="${CONTEXT_DIR:-$HOME/.nixenv/context}"  # embedded files written he
 FLAKE_DIR="${FLAKE_DIR:-$CONTEXT_DIR}"               # dir containing flake.nix
 HOME_SKEL="${HOME_SKEL:-$CONTEXT_DIR/home-skel}"     # project home template
 ENTRYPOINT_FILE="${ENTRYPOINT_FILE:-$CONTEXT_DIR/entrypoint.sh}"
+DEPLOY_ENTRYPOINT_FILE="${DEPLOY_ENTRYPOINT_FILE:-$CONTEXT_DIR/deploy-entrypoint.sh}"
 BUILDER_IMAGE="${BUILDER_IMAGE:-nixos/nix:2.32.8}"
 # Some source builds sandbox with bubblewrap (needs user namespaces the builder
 # can't create). Set to 1 to run the nix builder --privileged if you hit that.
@@ -205,6 +206,8 @@ materialize_context() {
               mitmproxy    # 'nixenv capture': records restricted projects' traffic, behind squid.
                            # A Python app, but nixpkgs wraps it — no python on PATH.
               socat        # ssh-over-CONNECT ProxyCommand + tcp relays for restricted projects
+              age          # 'nixenv deploy': encrypt secrets to a public key (no runtime needed)
+              sops         # 'nixenv deploy': encrypted secrets files (Go binary, no runtime)
               rsync
               jq
               yq-go
@@ -747,6 +750,142 @@ done
 exec "$RUNSV" "$SVROOT/sshd"
 NIXENV_ENTRYPOINT
 
+  cat > "$c/deploy-entrypoint.sh" <<'NIXENV_DEPLOY_ENTRYPOINT'
+#!/bin/sh
+# =============================================================================
+# 'nixenv deploy' container entrypoint — a throwaway shell for deploying.
+# =============================================================================
+# Deliberately NOT the project entrypoint: what that one runs from the app
+# volume (repo hooks, repo services) is writable from the dev container, and
+# this one holds your forwarded agent. So: no hooks, no services, the same
+# tools as the dev container (project + base profile), a tmpfs HOME rebuilt
+# from the embedded skeleton + your git identity/credentials, and an sshd that
+# listens on loopback ONLY — the host reaches it through '<engine> exec …
+# socat', never over a network.
+# =============================================================================
+set -eu
+
+APP_USER="${APP_USER:-app}"
+PROFILE="${PROFILE:-/nix/var/nix/profiles/shared}"
+HOME_DIR="${HOME:-/home/$APP_USER}"
+SSHD_PORT="${SSHD_PORT:-2222}"
+APP_MOUNT="${NIXENV_APP_MOUNT:-/app}"
+CA_BUNDLE="$PROFILE/etc/ssl/certs/ca-bundle.crt"
+
+# HOME is a fresh tmpfs: lay the skeleton down (shell/editor config), minus the
+# example ssh config, which is replaced below.
+[ -d /etc/nixenv/home-skel ] && cp -R /etc/nixenv/home-skel/. "$HOME_DIR/" 2>/dev/null || true
+mkdir -p "$HOME_DIR/.ssh" "$HOME_DIR/.cache/omz" "$HOME_DIR/.local/bin" "$HOME_DIR/.nixenv-sshd"
+chmod 700 "$HOME_DIR" "$HOME_DIR/.ssh"
+
+# PATH: same order as the dev container — ~/.local/bin, project, base.
+_extra=""
+[ -n "${NIXENV_EXTRA_PROFILE:-}" ] && [ -d "$NIXENV_EXTRA_PROFILE/bin" ] && _extra="$NIXENV_EXTRA_PROFILE/bin:"
+cat > "$HOME_DIR/.zshenv" <<EOF
+export PROFILE="$PROFILE"
+export NIXENV_PROJECT="${NIXENV_PROJECT:-}"
+export NIXENV_APP_MOUNT="$APP_MOUNT"
+export NIXENV_EXTRA_PROFILE="${NIXENV_EXTRA_PROFILE:-}"
+export NIXENV_DEPLOY=1
+export PATH="\$HOME/.local/bin:$_extra$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export ZSH="$PROFILE/share/oh-my-zsh"
+export ZSH_CACHE_DIR="\$HOME/.cache/omz"
+export SSL_CERT_FILE="$CA_BUNDLE"
+export NIX_SSL_CERT_FILE="$CA_BUNDLE"
+export CURL_CA_BUNDLE="$CA_BUNDLE"
+export GIT_SSL_CAINFO="$CA_BUNDLE"
+export EDITOR=vim
+export LANG=C.UTF-8
+# The repo's .git/config is writable from the dev container. Override the keys
+# that run a program on ordinary git commands (they win over repo config).
+# Other routes remain (aliases, filter drivers) — treat the code as untrusted.
+export GIT_CONFIG_COUNT=3
+export GIT_CONFIG_KEY_0=core.fsmonitor   GIT_CONFIG_VALUE_0=false
+export GIT_CONFIG_KEY_1=core.hooksPath   GIT_CONFIG_VALUE_1=/dev/null
+export GIT_CONFIG_KEY_2=core.sshCommand  GIT_CONFIG_VALUE_2=ssh
+EOF
+
+# Git identity + https credentials: the HOST-side home seed's files, mounted
+# straight into HOME by 'deploy' (shared, not copied — a token the store helper
+# rewrites lands back in the seed). The skeleton .gitconfig includes them.
+# <project>/deploy_gitconfig: anything else, e.g. a pushInsteadOf.
+if [ -f /etc/nixenv/deploy_gitconfig ]; then
+  printf '\n# <project>/deploy_gitconfig (host side, read-only here)\n[include]\n\tpath = /etc/nixenv/deploy_gitconfig\n' >> "$HOME_DIR/.gitconfig"
+fi
+
+# Egress: the deploy network is --internal; squid (the project's allowed_hosts
+# + deploy_hosts) is the only way out — HTTP via the env vars, ssh via CONNECT.
+# Without any allowed host there is no proxy and no network at all.
+{
+  if [ -f /etc/nixenv/deploy_ssh_config ]; then
+    echo "# Your host-side <project>/deploy_ssh_config (read-only here)."
+    echo "Include /etc/nixenv/deploy_ssh_config"
+    echo
+  fi
+  if [ -n "${NIXENV_EGRESS_PROXY:-}" ]; then
+    _ep="${NIXENV_EGRESS_PROXY#http://}"; _ep="${_ep%/}"
+    _ephost="${_ep%%:*}"; _epport="${_ep##*:}"
+    echo "# nixenv-egress: everything tunnels through the egress proxy's CONNECT."
+    echo "Host * !localhost !127.0.0.1 !$_ephost"
+    echo "    ProxyCommand $PROFILE/bin/socat - PROXY:$_ephost:%h:%p,proxyport=$_epport"
+    echo
+  fi
+  # Known hosts outlive the tmpfs HOME: <project>/deploy_known_hosts on the
+  # host, mounted read-write. First contact is trust-on-first-use; a CHANGED
+  # key is still refused.
+  if [ -f /etc/nixenv/known_hosts ]; then
+    echo "Host *"
+    echo "    UserKnownHostsFile /etc/nixenv/known_hosts"
+    echo "    StrictHostKeyChecking accept-new"
+  fi
+} > "$HOME_DIR/.ssh/config"
+chmod 600 "$HOME_DIR/.ssh/config"
+if [ -n "${NIXENV_EGRESS_PROXY:-}" ]; then
+  cat >> "$HOME_DIR/.zshenv" <<EOF
+export HTTP_PROXY="$NIXENV_EGRESS_PROXY" HTTPS_PROXY="$NIXENV_EGRESS_PROXY"
+export http_proxy="$NIXENV_EGRESS_PROXY" https_proxy="$NIXENV_EGRESS_PROXY"
+export NO_PROXY="localhost,127.0.0.1,::1" no_proxy="localhost,127.0.0.1,::1"
+EOF
+fi
+
+SSHD="$PROFILE/bin/sshd"
+[ -x "$SSHD" ] || { echo "nixenv: sshd not found in profile"; exit 1; }
+SSHRUN="$HOME_DIR/.nixenv-sshd"
+cp /etc/nixenv/ssh_host_ed25519_key "$SSHRUN/ssh_host_ed25519_key"
+chmod 600 "$SSHRUN/ssh_host_ed25519_key"
+
+{
+  # Loopback only: the host connects through '<engine> exec … socat'. Nothing
+  # on any network — dev containers included — can reach this sshd.
+  echo "ListenAddress 127.0.0.1"
+  echo "Port $SSHD_PORT"
+  echo "HostKey $SSHRUN/ssh_host_ed25519_key"
+  echo "PidFile $SSHRUN/sshd.pid"
+  echo "PermitRootLogin no"
+  echo "PubkeyAuthentication yes"
+  echo "AuthenticationMethods publickey"
+  echo "PasswordAuthentication no"
+  echo "PermitEmptyPasswords no"
+  echo "KbdInteractiveAuthentication no"
+  echo "AuthorizedKeysFile /etc/nixenv/authorized_keys"
+  echo "AllowUsers $APP_USER"
+  echo "UsePAM no"
+  echo "StrictModes no"
+  echo "PrintMotd no"
+  # The agent is the point of this container; nothing else is forwarded.
+  echo "AllowAgentForwarding yes"
+  echo "AllowTcpForwarding no"
+  echo "AllowStreamLocalForwarding no"
+  echo "X11Forwarding no"
+  echo "PermitTunnel no"
+  echo "PermitUserRC no"
+  echo "PermitUserEnvironment no"
+  echo "AcceptEnv LANG LC_*"
+} > "$SSHRUN/sshd_config"
+
+exec "$SSHD" -D -e -f "$SSHRUN/sshd_config"
+NIXENV_DEPLOY_ENTRYPOINT
+
   cat > "$c/home-skel/.zshrc" <<'NIXENV_ZSHRC'
 # =============================================================================
 # .zshrc for the shared-store runtime container (per-project HOME)
@@ -1129,6 +1268,9 @@ egress_connect_nets() {
   for rp in $EGRESS_PROJECTS; do
     "$ENGINE" network connect "$(internal_net "$rp")" "$EGRESS_NAME" >/dev/null 2>&1 || true
   done
+  for rp in ${EGRESS_DEPLOYS:-}; do
+    "$ENGINE" network connect "$(deploy_net "$rp")" "$EGRESS_NAME" >/dev/null 2>&1 || true
+  done
 }
 
 # Restart mitmproxy in place (egress.sh's loop starts it again, re-reading
@@ -1155,10 +1297,10 @@ egress_reload() {
 # recreated only when missing, or when it still publishes a port (the mitmweb UI
 # used to be on 127.0.0.1:8081; Caddy now serves it as <project>-mitm.<domain>).
 egress_up() {
-  if [ -z "${EGRESS_PROJECTS:-}" ]; then
+  if [ -z "${EGRESS_PROJECTS:-}${EGRESS_DEPLOYS:-}" ]; then
     if container_exists "$EGRESS_NAME"; then
       "$ENGINE" rm -f "$EGRESS_NAME" >/dev/null 2>&1 || true
-      log "no restricted project — removed the egress proxy '$EGRESS_NAME'"
+      log "no restricted project or deploy allowlist — removed the egress proxy '$EGRESS_NAME'"
     fi
     return 0
   fi
@@ -1593,6 +1735,41 @@ internal_net()         { printf '%s_%s_egress' "$CONTAINER_PREFIX" "$1"; }
 ensure_internal_net()  {
   "$ENGINE" network inspect "$(internal_net "$1")" >/dev/null 2>&1 || \
     "$ENGINE" network create --internal "$(internal_net "$1")" >/dev/null
+}
+# 'deploy': the throwaway container and its OWN --internal network. '__' (like
+# the dev sidecars) so no project's '<prefix>-<name>' can collide, and 'stop'
+# with no project sweeps it. Squid gives that network the project's
+# allowed_hosts PLUS <project>/deploy_hosts: production goes in the second
+# file only, so the dev container still can't reach it.
+deploy_container_name() { printf '%s__%s-deploy' "$CONTAINER_PREFIX" "$1"; }
+deploy_net()            { printf '%s__%s-deploy' "$CONTAINER_PREFIX" "$1"; }
+ensure_deploy_net()     {
+  "$ENGINE" network inspect "$(deploy_net "$1")" >/dev/null 2>&1 || \
+    "$ENGINE" network create --internal "$(deploy_net "$1")" >/dev/null
+}
+# Hosts in <project>/deploy_hosts, normalised, one per line (empty if none).
+deploy_hosts() {
+  local f d; f="$(project_dir "$1")/deploy_hosts"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  while IFS= read -r d || [ -n "$d" ]; do
+    d="$(printf '%s' "${d%%#*}" | tr -d '[:space:]')"
+    [ -n "$d" ] || continue
+    if d="$(normalize_allowed_host "$d")"; then printf '%s\n' "$d"; fi
+  done < "$f"
+}
+# What the deploy container may reach: allowed_hosts + deploy_hosts, deduplicated.
+deploy_allowlist() {
+  local f d; f="$(project_dir "$1")/allowed_hosts"
+  {
+    if [ -f "$f" ] && [ ! -L "$f" ]; then
+      while IFS= read -r d || [ -n "$d" ]; do
+        d="$(printf '%s' "${d%%#*}" | tr -d '[:space:]')"
+        [ -n "$d" ] || continue
+        if d="$(normalize_allowed_host "$d")"; then printf '%s\n' "$d"; fi
+      done < "$f"
+    fi
+    deploy_hosts "$1"
+  } | awk '!seen[$0]++'
 }
 
 # Subnet of a network (for squid's per-project source ACLs). Docker exposes it
@@ -3166,7 +3343,7 @@ write_egress_configs() {
   # (a live 'squid -k reconfigure' would then read the OLD config forever).
   # Overwriting files in place keeps the mount coherent.
   mkdir -p "$edir"
-  EGRESS_PUB=(); EGRESS_PROJECTS=""; EGRESS_SUBNETS=""
+  EGRESS_PUB=(); EGRESS_PROJECTS=""; EGRESS_SUBNETS=""; EGRESS_DEPLOYS=""
   CAPTURE_PROJECTS=""; CAPTURE_INGRESS=""; CAPTURE_CHANGED=0
   local relays="" acls="" gates="" sshgates="" allows="" all_srcs="" sshdoms d pdir name subnet aclname doms ips sshport _line _spec hp cp
   local peers="" capconf="" capn=0
@@ -3310,7 +3487,37 @@ never_direct allow p_$aclname !nocapture_ports"
     fi
   done
 
-  if [ -n "$EGRESS_PROJECTS" ]; then
+  # 'deploy' networks: one per project with a deploy_hosts file, keyed by the
+  # deploy net's subnet — never the project's, so the dev container gets none
+  # of the deploy-only hosts. The deploy container gets the dev allowlist too.
+  # Same shape as above: the NAME gate (no DNS) comes before 'to_localnets'.
+  # Every allowed host may use every Connect_ports port, 22 included (no
+  # ssh_hosts limit): ssh to those hosts is what a deploy is for.
+  for pdir in "$PROJECTS_DIR"/*/; do
+    [ -d "$pdir" ] || continue
+    name="$(basename "$pdir")"
+    [ -f "$pdir/deploy_hosts" ] || continue
+    doms="$(deploy_allowlist "$name" | tr '\n' ' ')"
+    [ -n "${doms// /}" ] || continue
+    ensure_deploy_net "$name"
+    subnet="$(net_subnet "$(deploy_net "$name")")"
+    if [ -z "$subnet" ]; then
+      warn "cannot determine subnet of $(deploy_net "$name") — skipping deploy egress for '$name'"
+      continue
+    fi
+    EGRESS_DEPLOYS="$EGRESS_DEPLOYS $name"
+    aclname="$(printf '%s' "$name" | tr -c 'a-zA-Z0-9' '_')"
+    all_srcs="$all_srcs $subnet"
+    acls="$acls
+acl deploysrc_$aclname src $subnet
+acl deploydst_$aclname dstdomain -n ${doms% }"
+    gates="$gates
+http_access deny deploysrc_$aclname !deploydst_$aclname"
+    allows="$allows
+http_access allow deploysrc_$aclname deploydst_$aclname"
+  done
+
+  if [ -n "$EGRESS_PROJECTS$EGRESS_DEPLOYS" ]; then
     cat > "$edir/squid.conf" <<EOF
 # Generated by nixenv — egress allowlist for restricted projects. Do not edit
 # (edit <project>/allowed_hosts and re-run 'proxy up' / 'allow' instead).
@@ -4116,6 +4323,244 @@ cmd_ssh() {
 }
 
 # =============================================================================
+# deploy — a THROWAWAY container to deploy from, holding your forwarded agent.
+#   usage: deploy <project> [--agent=<socket>|--no-agent] [-- <command>…]
+#          deploy <project> allow <host>…   add to <project>/deploy_hosts
+#          deploy <project> hosts           show what deploy can reach
+#          deploy <project> log [-f]        its egress log
+#          deploy <project> stop            remove a leftover deploy container
+# =============================================================================
+# The dev container is where untrusted code (and Claude) runs, so the agent is
+# never forwarded there. The deploy container:
+#   * mounts the app volume read-write (a release edits, commits and pushes
+#     there) and nothing else of the project's state: no home volume, no
+#     Claude profile. Same tools as the dev container. From the HOST side it
+#     adds your git identity + https credentials (the home seed), and
+#     deploy_gitconfig / deploy_ssh_config / deploy_known_hosts (rw);
+#   * has a tmpfs HOME, so nothing else survives the session;
+#   * sits on its own --internal network, whose only exit is squid with the
+#     project's allowed_hosts + <project>/deploy_hosts — production goes in
+#     the second, so the dev container can't reach it;
+#   * runs sshd on loopback only. The host connects with
+#     ProxyCommand '<engine> exec -i … socat', so it needs no published port or
+#     relay, and the agent rides the ssh session — the one way to hand a
+#     container your agent that works the same on Docker Desktop, Linux and podman.
+# The code is shared with the dev container, which can change it at any time:
+# running its scripts here runs them with your agent. Review what you run.
+cmd_deploy() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: $0 deploy <project> [--agent=<socket>|--no-agent] [-- <command>…]   (or: allow|hosts|log|stop)"
+  # Strict charset, not just the path check: the container name is spliced into
+  # ssh's ProxyCommand, which ssh runs through a shell.
+  valid_project_name "$name" || die "invalid project name: $name"
+  shift
+  [ -d "$(project_dir "$name")" ] || die "unknown project '$name' — run '$0 init $name' first"
+  case "${1:-}" in
+    allow) shift; deploy_allow "$name" "$@";;
+    hosts)
+      local h; h="$(deploy_hosts "$name")"
+      echo "── deploy only ($(project_dir "$name")/deploy_hosts) ──"
+      if [ -n "$h" ]; then printf '   %s\n' $h
+      else echo "   (none — add with: $0 deploy $name allow <host>…)"; fi
+      echo "── from the dev allowlist (allowed_hosts) ──"
+      h="$(deploy_allowlist "$name" | grep -vxF -f <(deploy_hosts "$name"; echo) || true)"
+      if [ -n "$h" ]; then printf '   %s\n' $h; else echo "   (none)"; fi;;
+    log)  shift; require_engine; deploy_log "$name" "${1:-}";;
+    stop)
+      require_engine
+      local c; c="$(deploy_container_name "$name")"
+      if container_exists "$c"; then "$ENGINE" rm -f "$c" >/dev/null && ok "Removed '$c'"
+      else warn "no deploy container for '$name'"; fi;;
+    *) require_engine; deploy_open "$name" "$@";;
+  esac
+}
+
+deploy_allow() {
+  local name="$1" pdir f d nd; shift
+  [ "$#" -gt 0 ] || die "usage: $0 deploy $name allow <domain|ip>…"
+  pdir="$(project_dir "$name")"; f="$pdir/deploy_hosts"
+  [ ! -L "$f" ] || die "$f is a symlink — refusing to use it (replace it with a regular file)"
+  touch "$f"
+  for d in "$@"; do
+    [ -n "$(printf '%s' "$d" | tr -d '[:space:]')" ] || continue
+    nd="$(normalize_allowed_host "$d")" \
+      || die "invalid host '$d' (domain, .domain for subdomains, or IP — no schemes/ports/paths)"
+    if grep -qxF "$nd" "$f" 2>/dev/null; then
+      warn "already allowed for deploy: $nd"
+    elif grep -qxF "$nd" "$pdir/allowed_hosts" 2>/dev/null; then
+      warn "$nd is in the dev allowlist — deploy can already reach it"
+    else
+      printf '%s\n' "$nd" >> "$f"; ok "deploy host: $nd"
+    fi
+  done
+  if resolve_engine 2>/dev/null && container_running "$EGRESS_NAME"; then
+    write_egress_configs
+    egress_up && ok "deploy allowlist reloaded (hot — no proxy restart)"
+  else
+    log "applies at the next '$0 deploy $name'"
+  fi
+}
+
+deploy_log() {
+  local name="$1" follow="$2" logf="$EGRESS_DATA_DIR/egress.log" prefix
+  [ -f "$logf" ] || die "no egress log at $logf yet"
+  prefix="$(net_subnet "$(deploy_net "$name")" 2>/dev/null | cut -d/ -f1 | sed 's/\.0*$//')"
+  [ -n "$prefix" ] || die "no deploy network for '$name' yet — run '$0 deploy $name' first"
+  if [ "$follow" = "-f" ]; then
+    log "following deploy egress for '$name' (Ctrl-C to stop)"
+    exec tail -f "$logf" | grep --line-buffered "$prefix"
+  fi
+  grep "$prefix" "$logf" | tail -30 || warn "no deploy egress logged yet"
+}
+
+# ssh argv for a deploy session, in DEPLOY_SSH (an array: paths may hold
+# spaces). -F /dev/null: the user's ~/.ssh/config must not leak in — a
+# 'Host *' ControlMaster would let a later, unrelated session reuse this one.
+deploy_ssh_argv() {
+  local name="$1" cname="$2" agent="$3" pdir fwd; pdir="$(project_dir "$name")"
+  case "$agent" in
+    yes|no) fwd="ForwardAgent=$agent";;
+    *)      fwd="ForwardAgent=\"$agent\"";;   # quoted: ssh parses -o like a config line
+  esac
+  DEPLOY_SSH=(ssh -F /dev/null
+    -i "$pdir/ssh/id_ed25519" -o IdentitiesOnly=yes
+    -o StrictHostKeyChecking=yes -o HostKeyAlias="$(ssh_host_alias "$name")"
+    -o UserKnownHostsFile="$pdir/ssh/known_hosts"
+    -o ControlMaster=no -o ControlPath=none -o LogLevel=ERROR
+    -o "ProxyCommand=$ENGINE exec -i $cname $PROFILE/bin/socat - TCP:127.0.0.1:$SSHD_PORT"
+    -o "$fwd")
+}
+
+deploy_open() {
+  local name="$1"; shift
+  local agent="${NIXENV_DEPLOY_AGENT:-yes}" cmd; cmd=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --agent=*) agent="${1#--agent=}";;
+      --no-agent) agent=no;;
+      --) shift; cmd=("$@"); break;;
+      *) die "unknown option '$1' — usage: $0 deploy $name [--agent=<socket>|--no-agent] [-- <command>…]";;
+    esac
+    shift
+  done
+  case "$agent" in "~/"*) agent="$HOME/${agent#"~/"}";; esac
+  case "$agent" in
+    yes) [ -n "${SSH_AUTH_SOCK:-}" ] || warn "SSH_AUTH_SOCK is not set — no agent to forward (use --agent=<socket>)";;
+    no)  ;;
+    *)   [ -S "$agent" ] || die "--agent: '$agent' is not a socket";;
+  esac
+  command -v ssh >/dev/null 2>&1 || die "host 'ssh' client not found"
+
+  volume_exists || die "volume '$NIX_VOLUME' missing — run '$0 build' first"
+  store_is_populated || die "shared profile not found in volume — run '$0 build' first"
+  [ -f "$DEPLOY_ENTRYPOINT_FILE" ] || die "missing deploy entrypoint at $DEPLOY_ENTRYPOINT_FILE"
+
+  local pdir cname appv appmnt _mf; pdir="$(project_dir "$name")"
+  cname="$(deploy_container_name "$name")"
+  appv="$(app_volume "$name")"; appmnt="$(project_app_mount "$name")"
+  for _mf in app_mount allowed_hosts deploy_hosts deploy_ssh_config deploy_gitconfig deploy_known_hosts \
+             home/.gitconfig.identity home/.gitconfig.credentials home/.git-credentials; do
+    [ ! -L "$pdir/$_mf" ] || die "$pdir/$_mf is a symlink — refusing to use it (replace it with a regular file)"
+  done
+  valid_app_mount "$appmnt" || die "invalid app path in $pdir/app_mount"
+  vol_exists "$appv" || die "no app volume '$appv' — '$0 run $name' creates it"
+  if container_exists "$cname"; then
+    die "a deploy session for '$name' is already open — close it, or remove a leftover one: $0 deploy $name stop"
+  fi
+
+  write_passwd_files "$pdir"
+  ensure_project_ssh_key "$pdir"   # same key + pinned host key as 'ssh <project>'
+
+  ensure_deploy_net "$name"
+  local egress_env; egress_env=()
+  if [ -f "$pdir/deploy_hosts" ] && [ -n "$(deploy_allowlist "$name")" ]; then
+    write_egress_configs
+    egress_up || die "the egress proxy did not start — the deploy container would have no network"
+    egress_env=(-e NIXENV_EGRESS_PROXY="http://$EGRESS_NAME:$EGRESS_PORT")
+  else
+    warn "no deploy allowlist — the deploy container has NO network (enable: $0 deploy $name allow <host>…)"
+  fi
+
+  # Host-side files only: the dev container can write none of them.
+  touch "$pdir/deploy_known_hosts"; chmod 600 "$pdir/deploy_known_hosts"
+  local extra _g; extra=(-v "$pdir/deploy_known_hosts:/etc/nixenv/known_hosts")
+  if [ -f "$pdir/deploy_ssh_config" ]; then
+    extra+=(-v "$pdir/deploy_ssh_config:/etc/nixenv/deploy_ssh_config:ro")
+  fi
+  if [ -f "$pdir/deploy_gitconfig" ]; then
+    extra+=(-v "$pdir/deploy_gitconfig:/etc/nixenv/deploy_gitconfig:ro")
+  fi
+  # Git identity + https credentials: the seed's own files, shared (not
+  # copied). .git-credentials is rw — the store helper rewrites it.
+  [ -f "$pdir/home/.gitconfig.identity" ] && \
+    extra+=(-v "$pdir/home/.gitconfig.identity:/home/$APP_USER/.gitconfig.identity:ro")
+  [ -f "$pdir/home/.gitconfig.credentials" ] && \
+    extra+=(-v "$pdir/home/.gitconfig.credentials:/home/$APP_USER/.gitconfig.credentials:ro")
+  [ -f "$pdir/home/.git-credentials" ] && \
+    extra+=(-v "$pdir/home/.git-credentials:/home/$APP_USER/.git-credentials")
+  local harden uid gid; harden=($(container_hardening_args)); uid="$(id -u)"; gid="$(id -g)"
+  log "Starting '$cname' — $appv → $appmnt, home on tmpfs"
+  "$ENGINE" run -d --rm \
+    --name "$cname" \
+    --hostname "$name-deploy" \
+    --network "$(deploy_net "$name")" \
+    --user "$uid:$gid" \
+    $(engine_userns) \
+    ${harden[@]+"${harden[@]}"} \
+    --tmpfs "/home/$APP_USER:rw,exec,nosuid,nodev,mode=0700,uid=$uid,gid=$gid" \
+    ${egress_env[@]+"${egress_env[@]}"} \
+    ${extra[@]+"${extra[@]}"} \
+    -v "$NIX_VOLUME":/nix:ro \
+    -v "$appv":"$appmnt" \
+    -v "$HOME_SKEL":/etc/nixenv/home-skel:ro \
+    -v "$pdir/passwd":/etc/passwd:ro \
+    -v "$pdir/group":/etc/group:ro \
+    -v "$pdir/shadow":/etc/shadow:ro \
+    -v "$pdir/ssh/authorized_keys":/etc/nixenv/authorized_keys:ro \
+    -v "$pdir/ssh/host_ed25519_key":/etc/nixenv/ssh_host_ed25519_key:ro \
+    -v "$DEPLOY_ENTRYPOINT_FILE":/usr/local/bin/nixenv-deploy-entrypoint:ro \
+    -w "$appmnt" \
+    -e HOME=/home/"$APP_USER" \
+    -e PROFILE="$PROFILE" \
+    -e APP_USER="$APP_USER" \
+    -e SSHD_PORT="$SSHD_PORT" \
+    -e NIXENV_PROJECT="$name" \
+    -e NIXENV_APP_MOUNT="$appmnt" \
+    -e NIXENV_EXTRA_PROFILE="$(project_profile "$name")" \
+    "$(img "$RUNTIME_IMAGE")" \
+    sh /usr/local/bin/nixenv-deploy-entrypoint >/dev/null \
+    || die "failed to start the deploy container"
+  # From here on, whatever happens, the container (and the agent socket in
+  # it) goes away with this command.
+  trap '"$ENGINE" rm -f "'"$cname"'" >/dev/null 2>&1 || true' EXIT
+  trap 'exit 130' INT TERM
+
+  local i=0
+  until "$ENGINE" exec "$cname" "$PROFILE/bin/socat" -u OPEN:/dev/null "TCP:127.0.0.1:$SSHD_PORT" >/dev/null 2>&1; do
+    i=$((i + 1))
+    if [ "$i" -gt 40 ] || ! container_running "$cname"; then
+      "$ENGINE" logs "$cname" 2>&1 | tail -20 >&2 || true
+      die "the deploy container's sshd did not come up"
+    fi
+    sleep 0.25
+  done
+
+  deploy_ssh_argv "$name" "$cname" "$agent"
+  warn "$appmnt is shared with the dev container, which can change it — review scripts before running them with your agent"
+  log "deploy shell for '$name' (agent: $agent) — exit to destroy the container"
+  local rc=0
+  if [ "${#cmd[@]}" -gt 0 ]; then
+    "${DEPLOY_SSH[@]}" "$APP_USER@$name-deploy" "${cmd[@]}" || rc=$?
+  else
+    "${DEPLOY_SSH[@]}" -t "$APP_USER@$name-deploy" || rc=$?
+  fi
+  "$ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
+  trap - EXIT INT TERM
+  ok "deploy container removed"
+  return "$rc"
+}
+
+# =============================================================================
 # stop — stop and remove a project's service container
 # =============================================================================
 cmd_stop() {
@@ -4142,7 +4587,10 @@ cmd_stop() {
   fi
 
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
-  local cname; cname="$(container_name "$name")"
+  local cname dname; cname="$(container_name "$name")"; dname="$(deploy_container_name "$name")"
+  if container_exists "$dname"; then
+    "$ENGINE" rm -f "$dname" >/dev/null && ok "Removed deploy container '$dname'"
+  fi
   container_exists "$cname" || { warn "no container '$cname' (already stopped)"; return 0; }
   "$ENGINE" rm -f "$cname" >/dev/null && ok "Stopped '$cname'"
 }
@@ -4172,7 +4620,7 @@ cmd_delete() {
 
   log "This will PERMANENTLY delete project '$name' by running:"
   if [ -n "$ENGINE" ]; then
-    echo "    $ENGINE rm -f $cname"
+    echo "    $ENGINE rm -f $cname $(deploy_container_name "$name")"
     [ -n "$vols" ] && echo "    $ENGINE volume rm$vols   (app + home + databases volumes)"
     echo "    rm -f $prof*   (its extra-tooling profile, inside the store)"
   else
@@ -4191,12 +4639,14 @@ cmd_delete() {
   esac
 
   if [ -n "$ENGINE" ]; then
-    "$ENGINE" rm -f "$cname" >/dev/null 2>&1 || true
+    "$ENGINE" rm -f "$cname" "$(deploy_container_name "$name")" >/dev/null 2>&1 || true
     [ -n "$vols" ] && "$ENGINE" volume rm $vols >/dev/null 2>&1 || true
     # Egress internal network (restricted projects): detach both proxies, then remove.
     "$ENGINE" network disconnect "$(internal_net "$name")" "$PROXY_NAME" >/dev/null 2>&1 || true
     "$ENGINE" network disconnect "$(internal_net "$name")" "$EGRESS_NAME" >/dev/null 2>&1 || true
     "$ENGINE" network rm "$(internal_net "$name")" >/dev/null 2>&1 || true
+    "$ENGINE" network disconnect "$(deploy_net "$name")" "$EGRESS_NAME" >/dev/null 2>&1 || true
+    "$ENGINE" network rm "$(deploy_net "$name")" >/dev/null 2>&1 || true
     volume_exists && "$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" \
       sh -c "rm -f '$prof' '$prof'-*-link" >/dev/null 2>&1 || true
   fi
@@ -5100,6 +5550,19 @@ Commands:
                             opens the recorded flows in mitmproxy's console UI,
                             'har' exports them. Captures hold tokens and cookies:
                             they stay owner-only in $EGRESS_DATA_DIR/captures
+  deploy <project> [--agent=<socket>|--no-agent] [-- <command>…]
+                            Open a shell in a THROWAWAY deploy container with
+                            your ssh agent forwarded (never into the dev
+                            container). Code = the app volume (shared, rw); git
+                            identity + https credentials from the home seed;
+                            same tools as the dev container; tmpfs home;
+                            removed on exit. Egress: the
+                            project's allowed_hosts + <project>/deploy_hosts.
+                            Host files: deploy_ssh_config, deploy_gitconfig,
+                            deploy_known_hosts.
+  deploy <project> allow <host>… | hosts | log [-f] | stop
+                            Add deploy-only hosts / show what deploy can reach /
+                            its egress log / remove a leftover deploy container
   ssh-config [--install]    Print (or install) the ~/.ssh/config Include so
                             'ssh <project>' works via each <project>/ssh/config
   up <project>              build if needed, then start the service
@@ -5235,6 +5698,7 @@ main() {
     allow)    cmd_allow "$@";;
     egress)   cmd_egress "$@";;
     capture)  cmd_capture "$@";;
+    deploy)   cmd_deploy "$@";;
     stop)     cmd_stop "$@";;
     logs)     cmd_logs "$@";;
     delete|rm) cmd_delete "$@";;

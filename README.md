@@ -186,6 +186,10 @@ interactive `zsh` via `docker exec` (no SSH key needed).
 - `capture <project> [on|off|untrust|web|log -f|tui|har <file>|clear]` — record a
   restricted project's HTTP(S) traffic with mitmproxy, with a web UI and CLI
   views (see [Capturing traffic](#capturing-traffic-capture)).
+- `deploy <project> [--agent=<socket>|--no-agent] [-- <command>…]` — open a shell
+  in a **throwaway** container with your ssh agent forwarded, the shared code,
+  your git credentials and an extended egress allowlist; `deploy <project> allow|hosts|log|stop` manage it
+  (see [Deploying](#deploying-deploy)).
 - `proxy [up|reload|stop|status|logs [egress]|renew|remove-cert]` — shared HTTPS
   reverse proxy for all projects, plus the egress container restricted projects
   go out through (see [Reverse proxy](#reverse-proxy-httpsproject-portnixenvlocalhost)).
@@ -736,6 +740,68 @@ nixenv allow myapp update.code.visualstudio.com vscode.download.prss.microsoft.c
 server over ssh.) For anything not listed, run the tool once and read the
 DENIED section of `nixenv egress myapp` — it names the exact domains.
 
+## Deploying (`deploy`)
+
+Your ssh agent (or 1Password's) should never be forwarded into the dev
+container: everything running there — dependencies, scripts, an AI agent — runs
+as the same user and could use it. `nixenv deploy <project>` gives you a
+separate, throwaway container for that, which can still edit the code, commit
+and push (e.g. a `release.sh` that bumps a version):
+
+```sh
+nixenv deploy myapp allow 5.196.77.220 51.255.65.147     # deploy-only hosts
+nixenv deploy myapp --agent=~/.1password/agent.sock       # shell; exit = gone
+nixenv deploy myapp -- ./release.sh 1.2.0                 # or one command
+```
+
+| | dev container (`run`) | deploy container (`deploy`) |
+|---|---|---|
+| code (app volume) | read-write | read-write (the **same** volume) |
+| home | the home volume | **tmpfs**, rebuilt from the skeleton |
+| git identity + https credentials | home volume | the host seed's files, mounted (shared, not copied) |
+| tools | base + project profile | the same (base includes `age`, `sops`) |
+| egress | `allowed_hosts` | `allowed_hosts` **+** `deploy_hosts` |
+| your ssh agent | never | forwarded for the session |
+| lifetime | until `stop` | removed when you exit |
+
+**Allowlist.** The deploy container can reach everything the dev container can,
+plus `~/.nixenv/projects/<project>/deploy_hosts` (`deploy … allow`). Put
+production there and **not** in `allowed_hosts`, and the dev container can't
+reach it at all. Deploy egress is switched on by that file existing (`deploy
+allow` creates it; `touch` it to give deploy just the dev allowlist). Without
+it the deploy container has no network.
+
+**Host-side files** (in `~/.nixenv/projects/<project>/`, none writable from the
+dev container):
+- `home/.gitconfig.identity`, `home/.gitconfig.credentials`, `home/.git-credentials`
+  — written by `init`; mounted into the deploy home, the credentials read-write so
+  a refreshed token lands back in the same file. They are the **seed**: a token you
+  changed inside the dev container's home volume is not seen here.
+- `deploy_gitconfig` — included by the deploy `.gitconfig`, e.g. to push an
+  https remote over ssh with the agent:
+  `[url "git@github.com:"] pushInsteadOf = https://github.com/`.
+- `deploy_ssh_config` — included by the deploy `~/.ssh/config` (server aliases, users).
+- `deploy_known_hosts` — persists across sessions; first contact is
+  trust-on-first-use, a changed key is refused.
+
+**How it connects:** the container's sshd listens on **loopback only**, and the
+host reaches it with `ProxyCommand <engine> exec -i … socat`, so there is no
+published port or relay, and the agent rides the ssh session. That works the
+same on Docker Desktop, Linux and podman. The session uses the project's key and
+pinned host key, and ignores your `~/.ssh/config` (no `ControlMaster` reuse).
+`--agent` defaults to `$SSH_AUTH_SOCK` (`NIXENV_DEPLOY_AGENT` sets another
+default); `--no-agent` forwards none.
+
+**What it does not protect against:** the code is shared with the dev
+container, which can change it at any moment. A script you run in the deploy
+container runs with your agent. The deploy shell neutralises the git settings
+that would run a program on ordinary commands (`core.fsmonitor`, hooks,
+`core.sshCommand`), but a modified `release.sh` or `Makefile` is a different
+matter. Review what you run. An agent that asks before each use
+(1Password, Secretive) lets you notice an unexpected signature.
+
+None of the `deploy_*` files are exported.
+
 ## Updating dotfiles (`sync-home`)
 
 The home volume is seeded from the skeleton **once**, so template updates (a new
@@ -798,7 +864,9 @@ Host-side, `~/.nixenv/projects/<name>/` keeps only small state: `home/` (the
 the generated `passwd`/`group`/`shadow` (the container's user db), `port`,
 `ports`, `app_mount` (custom code-volume path, if set), `hosts.extra`
 (local `/etc/hosts` entries, if any), `extra-parameters` (see below),
-`capture` (present while [`capture`](#capturing-traffic-capture) is on), and
+`capture` (present while [`capture`](#capturing-traffic-capture) is on),
+`deploy_hosts`/`deploy_ssh_config`/`deploy_gitconfig`/`deploy_known_hosts` (for
+[`deploy`](#deploying-deploy)), and
 `ssh/config`. Recorded traffic lives outside it, in
 `~/.nixenv/proxy/egress-data/captures/<name>.{flows,log}`. Because the code and home are in volumes, they're not directly
 editable from the host — you work through the container (`nixenv ssh` /
@@ -915,7 +983,7 @@ and any repo you `init … --build`, falls under the same rule.
 ## Toolchain
 
 The shared profile includes git, zsh + oh-my-zsh + starship, OpenSSH, runit,
-Caddy (for the shared reverse proxy), the
+Caddy (for the shared reverse proxy), `age` and `sops` (encrypted secrets), the
 Claude CLI (`claude`), zmx (terminal session persistence), common CLI tools
 (curl, wget, ping, host/dig, ripgrep,
 fd, fzf, bat, jq, delta, lazygit, …), a build toolchain (gnumake, gcc, binutils,

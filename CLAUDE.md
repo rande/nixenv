@@ -36,6 +36,8 @@ single-quoted heredocs in the `materialize_context()` function:
 - `flake.nix` — the shared toolchain (delimiter `NIXENV_FLAKE`)
 - `Dockerfile` — reference only, not used by the build (`NIXENV_DOCKERFILE`)
 - `entrypoint.sh` — runtime container entrypoint (`NIXENV_ENTRYPOINT`)
+- `deploy-entrypoint.sh` — the `deploy` container's entrypoint
+  (`NIXENV_DEPLOY_ENTRYPOINT`; see `deploy` below)
 - `home-skel/*` — the per-project home template (`.zshrc`, `.gitconfig`,
   `.config/starship.toml`, `.config/nvim/init.lua` (AstroNvim bootstrap),
   `.vimrc`, `.gitignore`, `.ssh/config`)
@@ -492,6 +494,50 @@ the forge host, no file = old behaviour), and denies to
   default; wrapped in a subshell so a `cmd_proxy` `die` can't fail `run`; no-op when
   already running).
 
+- **`deploy <p>` (`cmd_deploy`) — a throwaway container holding the forwarded
+  agent**, so the agent never goes into the dev container (where anything,
+  Claude included, runs as the same uid and could use it). `deploy_open` runs
+  `deploy_container_name` = `<prefix>__<p>-deploy` (`__`: no project name can
+  collide, and `stop` with no args sweeps it; `stop <p>` and `delete` remove it,
+  `delete` also the net) with `--rm`, `container_hardening_args`, the app volume
+  **read-write** (releases edit/commit/push there — it's the SAME volume the dev
+  container writes), a **tmpfs** home, base store, passwd files, the project's
+  authorized_keys + host key, and `deploy-entrypoint.sh`. It mounts NO home
+  volume or Claude profile (unit `38` greps `deploy_open`). Tools = the dev
+  container's (project profile via `NIXENV_EXTRA_PROFILE`, then base) — a
+  `--profile` opt-in existed briefly and was dropped as needless complexity.
+  From the HOST side only:
+  the home SEED's `.gitconfig.identity`/`.gitconfig.credentials` (ro) and
+  `.git-credentials` (rw — the store helper rewrites it) bind-mounted straight
+  into the tmpfs home (shared, NOT copied — the user asked; the skeleton
+  `.gitconfig` includes them), plus `deploy_gitconfig` (Included),
+  `deploy_ssh_config` (Included) and `deploy_known_hosts` (rw,
+  `StrictHostKeyChecking accept-new`). All are symlink-refused. The deploy
+  entrypoint runs no repo/profile hooks or services, exports `GIT_CONFIG_*`
+  overrides for `core.fsmonitor`/`core.hooksPath`/`core.sshCommand` (aliases and
+  filter drivers remain — documented), and execs sshd with
+  `ListenAddress 127.0.0.1`, agent forwarding on, TCP/stream forwarding off,
+  `PermitUserRC no`. The host connects via `deploy_ssh_argv` (`DEPLOY_SSH`
+  array): `-F /dev/null` (no user `ControlMaster` reuse), the project key +
+  pinned `HostKeyAlias`, `ProxyCommand $ENGINE exec -i <c> socat -
+  TCP:127.0.0.1:$SSHD_PORT` — no published port or relay, identical on Docker
+  Desktop/Linux/podman, which is why ssh (not a socket mount) carries the agent.
+  `cmd_deploy` checks `valid_project_name` because the name is spliced into
+  that shell-run ProxyCommand. `--agent=<socket>` → `ForwardAgent="<path>"`
+  (quoted: ssh parses `-o` like a config line; ≥ OpenSSH 8.2), default
+  `NIXENV_DEPLOY_AGENT` or `yes`; `--no-agent`; `-- cmd…`. An EXIT trap removes
+  the container; an existing one is refused (`deploy <p> stop`). **Egress:** its
+  own `--internal` net `deploy_net`; squid ACL = `deploy_allowlist` = the
+  project's `allowed_hosts` + `<project>/deploy_hosts` (dedup'd), enabled by the
+  `deploy_hosts` FILE existing (no file = no egress = no network). Production
+  belongs in `deploy_hosts` only. `deploy <p> allow` normalises, refuses
+  symlinks, and skips hosts already in `allowed_hosts`. `write_egress_configs`
+  adds `deploysrc_X`/`deploydst_X` keyed by the deploy subnet, in the same
+  gate→`to_localnets`→allow order (port 22 open to every listed host, no
+  `ssh_hosts` limit), and fills `EGRESS_DEPLOYS`; `egress_up` keeps squid for
+  deploy-only setups and `egress_connect_nets` joins those nets. No `deploy_*`
+  file is in `EXPORT_META_FILES`. `age` + `sops` are in the base flake for it.
+  Tests: unit `38`, integration `20` (sweep now also removes `nxt__*`).
 - **GitHub token (optional).** `github:` flake inputs resolve through
   api.github.com: 60 anonymous requests/hour PER IP, which a shared office/VPN
   address exhausts fast. `github_token` reads `$GITHUB_TOKEN`, then
@@ -568,6 +614,7 @@ README back to `./nixenv.sh`.
 `expose <project> <port>…`, `host <project> <name:ip>…`,
 `proxy [up|reload|stop|status|logs|renew|remove-cert]`, `restrict <project> [on|off]`,
 `allow <project> <host>…`, `egress <project> [-f]`, `up`, `stop`, `logs`,
+`deploy <project> [--agent=…|--no-agent] [-- cmd] | allow|hosts|log|stop`,
 `delete`/`rm`, `export <project>`, `import <file>`, `sync-home <project>`,
 `projects`, `update`, `status`,
 `gc [--dry-run]` (nix-collect-garbage -d + store optimise in the builder

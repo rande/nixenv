@@ -94,7 +94,8 @@ if [ "${1:-}" = "it" ]; then
   # Remove every test-prefixed container/volume/network + the state dir.
   sweep() {
     local ids
-    ids="$("$E" ps -aq --filter "name=^nxt-" 2>/dev/null || true)"
+    # nxt-* projects/proxy AND nxt__* helpers (deploy containers, dev sidecars).
+    ids="$("$E" ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^nxt(-|__)' || true)"
     [ -n "$ids" ] && "$E" rm -f $ids >/dev/null 2>&1 || true
     ids="$("$E" volume ls -q 2>/dev/null | grep '^nxt_' || true)"
     [ -n "$ids" ] && "$E" volume rm -f $ids >/dev/null 2>&1 || true
