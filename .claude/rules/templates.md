@@ -29,3 +29,4 @@ change alters a rule, update its spec in the same commit.
 - TPL-11 Declare every host setup needs; a clean log proves nothing: @../../specs/templates/011-declare-egress-hosts.md
 - TPL-12 Verify a template by running it: @../../specs/templates/012-verify-by-running.md
 - TPL-13 Windmill template specifics: @../../specs/templates/013-windmill.md
+- TPL-14 templates/flake.nix and the dashboard's model flake stay identical: @../../specs/templates/014-model-flake-in-sync.md

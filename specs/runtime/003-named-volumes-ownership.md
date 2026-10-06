@@ -14,6 +14,7 @@ enforced-by:
 
 - Code, home and databases are named volumes `<prefix>_<p>_app` → app mount,
   `<prefix>_<p>_home` → `/home/app`, `<prefix>_<p>_databases` → `/databases`.
+  The deploy state volume is created separately, on first `deploy` (DEP-05).
 - `ensure_volumes` creates missing volumes, then a one-time root helper (`-u 0`)
   seeds an empty home from `<project>/home`, drops `.keep` into empty
   `/app`/`/databases`, and chowns to your uid ONLY when the root isn't already

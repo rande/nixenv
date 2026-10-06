@@ -26,7 +26,7 @@ enforced-by:
 
 ## Why
 
-Recreating Caddy (every restricted `run` does, for relays) used to cut egress
+Recreating Caddy (a restricted `start` does when its relays change) used to cut egress
 for every project. The container parsing untrusted traffic must never mount
 Caddy's CA key. Replacing the dir inode would detach the mount and reloads
 would read stale config forever.

@@ -38,6 +38,9 @@ done
 printf '%s\n' "$names" | grep -q 'volumes/home.tar.gz' \
   && fail "default export leaked the home volume (secrets!)"
 printf '%s\n' "$names" | grep -q 'nix/store' && fail "archive contains the nix store!"
+# No deploy has run, so there is no deploy state volume to carry.
+printf '%s\n' "$names" | grep -q 'volumes/deploy.tar.gz' \
+  && fail "archived a deploy state volume that does not exist"
 # Machine-specific files must not be in there.
 for e in passwd shadow port; do
   printf '%s\n' "$names" | grep -q "meta/$e\$" && fail "archive carries machine state: $e"
@@ -93,6 +96,17 @@ nx import /tmp/nxt-export-home.tar withhome >/dev/null || fail "--with-home impo
 nx run withhome >/dev/null
 assert_eq "$(dexec withhome sh -lc 'cat "$HOME/marker.txt"')" "hello-home" "home restored with --with-home"
 rm -f /tmp/nxt-export-home.tar
+
+# --- the deploy state volume travels once it exists (DEP-05) -----------------
+"$E" volume create nxt_src_deploy >/dev/null
+involume nxt_src_deploy 'echo hello-deploy > /v/state.txt'
+nx export src /tmp/nxt-export-deploy.tar >/dev/null || fail "export with a deploy volume failed"
+tar -tf /tmp/nxt-export-deploy.tar | grep -q 'volumes/deploy.tar.gz' \
+  || fail "the deploy state volume was not archived"
+nx import /tmp/nxt-export-deploy.tar withdeploy >/dev/null || fail "import with a deploy volume failed"
+assert_eq "$(involume nxt_withdeploy_deploy 'cat /v/state.txt')" "hello-deploy" "deploy state restored"
+assert_eq "$(involume nxt_withdeploy_deploy 'stat -c %u /v/state.txt')" "$(id -u)" "deploy state chowned to our uid"
+rm -f /tmp/nxt-export-deploy.tar
 
 # --- importing over an existing project needs --force -------------------------
 out="$(nx import /tmp/nxt-export.tar dst 2>&1 || true)"

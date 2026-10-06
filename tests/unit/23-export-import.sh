@@ -56,6 +56,14 @@ assert_contains "$imp" '-u 0'      "restore runs as root so it can chown"
 assert_contains "$imp" 'write_passwd_files' "regenerates the user db for THIS uid"
 assert_contains "$imp" 'project_port'       "assigns a port here, not the exported one"
 
+# --- the deploy state volume travels when it exists (DEP-05) -----------------
+assert_contains "$exp" 'vols="$vols deploy"'      "export adds the deploy volume…"
+assert_contains "$exp" 'vol_exists "$(deploy_volume "$name")"' "…only when it exists"
+assert_contains "$exp" 'echo "deploy=$with_deploy"' "manifest records it"
+assert_contains "$exp" 'deploy_container_name "$name"' "refuses while a deploy session is open"
+assert_contains "$imp" 'for v in app home databases deploy; do' "import restores it"
+assert_contains "$imp" 'deploy_volume "$name"' "import creates it when the archive has one"
+
 # --- the home volume is OPT-IN: a default archive holds no secrets ------------
 # It carries ~/.ssh and ~/.git-credentials, so shipping it by default would make
 # every backup a credential leak.

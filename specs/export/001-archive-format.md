@@ -14,7 +14,8 @@ enforced-by:
 ## Rule
 
 - `export <p> [file] [--with-home] [--force]` writes a plain `.tar` (NOT
-  gzipped) containing `nixenv-export/{manifest,meta/,volumes/{app,databases[,home]}.tar.gz}`.
+  gzipped) containing `nixenv-export/{manifest,meta/,volumes/{app,databases[,home][,deploy]}.tar.gz}`
+  (`deploy` = the deploy state volume when it exists, DEP-05).
 - The shared Nix store is never included (gigabytes; reproducible by `build`).
 - `export` refuses on a running project unless `--force`.
 - `manifest_get` parses with `sed`, never `source`; the project name from it is
@@ -28,4 +29,4 @@ we didn't create.
 
 ## How
 
-`import <file> [new-name] [--force]`. The manifest records `home=0|1`.
+`import <file> [new-name] [--force]`. The manifest records `home=0|1` and `deploy=0|1`.

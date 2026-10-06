@@ -89,6 +89,7 @@ enforced-by:                    # optional: tests that fail when it is broken
 - [NET-02](networking/002-proxy-tls-mkcert.md) TLS: mkcert only if present, never a surprise prompt
 - [NET-03](networking/003-public-url-from-inside.md) Public URLs work from inside a container
 - [NET-04](networking/004-cross-project-isolation.md) Restricted projects cannot reach other projects through the proxy (SEC-06)
+- [NET-05](networking/005-project-dashboard.md) ps and the dashboard: probed from the host, read-only, no secrets
 
 ### Egress — Restricted-by-default egress through squid
 
@@ -114,6 +115,7 @@ enforced-by:                    # optional: tests that fail when it is broken
 - [DEP-02](deploy/002-deploy-ssh-transport.md) deploy connects over ssh carried by engine exec
 - [DEP-03](deploy/003-deploy-egress.md) deploy egress: allowed_hosts + deploy_hosts on its own network
 - [DEP-04](deploy/004-deploy-host-files.md) deploy reads git and ssh settings from host-side files only
+- [DEP-05](deploy/005-deploy-state-volume.md) deploy keeps state in its own volume, created on first use
 
 ### Export / import — Moving and backing up projects
 
@@ -140,6 +142,7 @@ enforced-by:                    # optional: tests that fail when it is broken
 - [TPL-11](templates/011-declare-egress-hosts.md) Declare every host setup needs; a clean log proves nothing
 - [TPL-12](templates/012-verify-by-running.md) Verify a template by running it
 - [TPL-13](templates/013-windmill.md) Windmill template specifics
+- [TPL-14](templates/014-model-flake-in-sync.md) templates/flake.nix and the dashboard's model flake stay identical
 
 ### Release — Versioning, Homebrew, release script, CI
 

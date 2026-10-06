@@ -11,6 +11,7 @@ command -v ssh >/dev/null 2>&1 || skip "ssh client not installed"
 mkproj dp
 nx run dp >/dev/null
 nx stop dp >/dev/null
+"$E" volume inspect nxt_dp_deploy >/dev/null 2>&1 && fail "the deploy state volume exists before the first deploy"
 dexec_vol() { involume nxt_dp_app "$1"; }
 dexec_vol 'echo marker > /v/MARKER'
 
@@ -34,6 +35,13 @@ assert_contains "$out" "/bin/sops" "sops available"
 assert_contains "$out" "/bin/age" "age available"
 "$E" ps -a --format '{{.Names}}' | grep -qx nxt__dp-deploy && fail "deploy container left behind"
 
+# ── /deploy: a state volume created by the first deploy, reused after ─────────
+"$E" volume inspect nxt_dp_deploy >/dev/null 2>&1 || fail "the first deploy creates the state volume"
+out="$(nx deploy dp --no-agent -- 'echo kept > "$NIXENV_DEPLOY_STATE/state.txt" && echo STATE=rw' 2>&1)" || fail "writing /deploy failed: $out"
+assert_contains "$out" "STATE=rw" "/deploy is writable"
+out="$(nx deploy dp --no-agent -- 'cat /deploy/state.txt' 2>&1)"
+assert_contains "$out" "kept" "state survives the session"
+
 # ── the agent rides the session ──────────────────────────────────────────────
 if command -v ssh-agent >/dev/null 2>&1 && command -v ssh-add >/dev/null 2>&1; then
   eval "$(ssh-agent -s)" >/dev/null
@@ -50,6 +58,7 @@ fi
 nx run dp >/dev/null
 out="$(dexec dp sh -c 'ls /tmp/ssh-* 2>/dev/null; echo END')"
 assert_eq "$out" "END" "no agent socket in the dev container"
+dexec dp sh -c 'test -e /deploy' && fail "the deploy state volume must not be in the dev container"
 nx stop dp >/dev/null
 
 # ── egress: allowed_hosts + deploy_hosts; nothing else ───────────────────────

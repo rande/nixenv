@@ -52,14 +52,14 @@ which is what lets a nested nixenv bind-mount its own files.
 brew install rande/nixenv/nixenv
 nixenv build                                          # the shared toolchain, once
 nixenv init nixenv git@github.com:rande/nixenv.git    # or your fork / an https URL
-nixenv run nixenv
+nixenv start nixenv
 
 # engines.sh runs on your Mac: copy it out of the checkout you just cloned
 docker exec nixenv-nixenv cat /app/dev/engines.sh > engines.sh && chmod +x engines.sh
 ./engines.sh up nixenv                                # the sidecars + the socket mount
 
 nixenv build nixenv --dir=dev                         # dev/flake.nix (--dir is remembered)
-nixenv stop nixenv && nixenv run nixenv               # recreate: picks up sockets + tools
+nixenv stop nixenv && nixenv start nixenv               # recreate: picks up sockets + tools
 nixenv ssh-config --install                           # once: enables `ssh <project>`
 ssh nixenv
 ```
@@ -97,7 +97,7 @@ Boot a nested project — the hello example:
 ```sh
 nixenv build                                                  # nested store (slow the first time; kept in the sidecar)
 nixenv init hello --template=examples/hello/flake.nix --yes
-nixenv run hello
+nixenv start hello
 docker exec nixdev-hello /nix/var/nix/profiles/shared/bin/curl -s localhost:8080 | grep nixenv-hello-ok
 ```
 

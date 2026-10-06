@@ -59,7 +59,7 @@ assert_not_contains "$cf" "@xproj_gamma" "unrestricted projects are not guarded"
 
 # Denies must sit INSIDE the ordered 'route' block, BEFORE the reverse_proxy —
 # otherwise Caddy's directive sorting could proxy first.
-route_ln="$(printf '%s\n' "$cf" | grep -n '^	route {' | cut -d: -f1)"
+route_ln="$(printf '%s\n' "$cf" | grep -n '^	route {' | head -1 | cut -d: -f1)"   # the first: the dashboard block has its own
 deny_ln="$(printf '%s\n' "$cf" | grep -n 'respond @xproj_alpha' | cut -d: -f1)"
 rp_ln="$(printf '%s\n' "$cf" | grep -n 'reverse_proxy @route' | cut -d: -f1)"
 [ -n "$route_ln" ] && [ "$route_ln" -lt "$deny_ln" ] && [ "$deny_ln" -lt "$rp_ln" ] \

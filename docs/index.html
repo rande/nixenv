@@ -536,7 +536,7 @@ footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: spac
         <ol id="stepsList">
           <li data-step="0"><b>nixenv build</b><span>Downloads the shared toolchain into the store volume. Slow once, then never again.</span></li>
           <li data-step="1"><b>nixenv init myapp &lt;git-url&gt;</b><span>Clones into the project's own volume, asks for a git identity, and allows the forge in the egress list.</span></li>
-          <li data-step="2"><b>nixenv run myapp</b><span>Starts the container as your user, with sshd under runit and the shared HTTPS proxy.</span></li>
+          <li data-step="2"><b>nixenv start myapp</b><span>Starts the container as your user, with sshd under runit and the shared HTTPS proxy.</span></li>
           <li data-step="3"><b>nixenv allow myapp registry.npmjs.org</b><span>Opens one more host. Everything else stays denied — watch it with <code>nixenv egress myapp</code>.</span></li>
           <li data-step="4"><b>ssh myapp</b><span>A persistent terminal session. Close the laptop, reconnect, and it's still there.</span></li>
         </ol>
@@ -617,7 +617,7 @@ footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: spac
       <div>
         <p class="first" id="tplFirst" aria-live="polite"><b>On first start</b> wp-cli downloads WordPress core, creates the MariaDB database, installs the site and its plugins. nginx and php-fpm run as services; outbound requests go through the exit proxy, which the template has already allowed WordPress's hosts on.</p>
         <div class="codeblock"><button class="copy" data-copy="c-tpl">copy</button><pre id="c-tpl">nixenv init myblog --template=wordpress   <span class="c"># asks before building</span>
-nixenv run myblog                         <span class="c"># → https://myblog-8080.nixenv.localhost/</span></pre></div>
+nixenv start myblog                         <span class="c"># → https://myblog-8080.nixenv.localhost/</span></pre></div>
       </div>
       <ul class="req">
         <li><span><b>Allowlist included.</b> A template declares the hosts its setup needs, so a restricted project can install itself on day one.</span></li>
@@ -830,7 +830,7 @@ nixenv build</pre></div></div>
       ["", "Git name for this project: Ada Lovelace"],
       ["g", "✓ allowed host: github.com"],
       ["g", "✓ Cloned into volume nixenv_myapp_app"] ] },
-    { cmd: "nixenv run myapp", out: [
+    { cmd: "nixenv start myapp", out: [
       ["c", "==> Starting the egress proxy first (restricted project needs it to reach the network)"],
       ["g", "✓ Started 'nixenv-myapp'"],
       ["", "   ssh:    nixenv ssh myapp"],
@@ -906,7 +906,7 @@ nixenv build</pre></div></div>
       sheets.forEach(function (c) { c.setAttribute("aria-pressed", c === card ? "true" : "false"); });
       var p = card.getAttribute("data-project");
       var init = "nixenv init " + p + " --template=" + card.getAttribute("data-tpl");
-      var run = "nixenv run " + p;
+      var run = "nixenv start " + p;
       var w = Math.max(init.length, run.length) + 3;
       tplCode.innerHTML =
         esc(pad(init, w)) + '<span class="c"># asks before building</span>\n' +

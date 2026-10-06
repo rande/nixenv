@@ -149,6 +149,23 @@ for bad in db_volume claude_profile_dir CLAUDE_DIR ENTRYPOINT_FILE:/ extra-param
 done
 assert_contains "$src" "trap " "removed on exit"
 
+# ── deploy state volume (DEP-05): created on first deploy, mounted at /deploy ─
+assert_eq "$(deploy_volume alpha)" "nxt_alpha_deploy" "deploy state volume name"
+assert_contains "$src" 'ensure_deploy_volume "$name"' "deploy creates/reuses its state volume"
+assert_contains "$src" '-v "$deployv":/deploy ' "state volume mounted at /deploy"
+assert_contains "$src" 'NIXENV_DEPLOY_STATE=/deploy' "state path passed to the container"
+ev="$(declare -f ensure_deploy_volume | code_only)"
+assert_contains "$ev" 'vol_exists "$vol"' "an existing volume is reused, not recreated"
+assert_contains "$ev" '/deploy/.keep' "non-empty so Docker Desktop keeps the ownership"
+assert_contains "$ev" 'chown -R' "chowned to our uid"
+# Lazy: only deploy creates it — never the dev container's volume setup or run.
+for fn in ensure_volumes cmd_run cmd_init; do
+  assert_not_contains "$(declare -f "$fn" | code_only)" "deploy_volume" "$fn does not touch the deploy volume"
+done
+valid_app_mount /deploy 2>/dev/null && fail "/deploy is reserved for the deploy state volume"
+valid_app_mount /deploy/x 2>/dev/null && fail "/deploy/* is reserved"
+assert_contains "$(declare -f cmd_delete | code_only)" 'deploy_volume "$name"' "delete removes the state volume"
+
 # Deploy settings travel; import re-validates the hosts and gates the configs
 # (unit 27 covers the import side).
 for f in deploy_hosts deploy_ssh_config deploy_gitconfig deploy_known_hosts; do

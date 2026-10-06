@@ -18,6 +18,8 @@
 #   volume <prefix>_<name>_app       → /app or <project>/app_mount (code; WORKDIR)
 #   volume <prefix>_<name>_home      → /home/app (dotfiles, nvim, shell history)
 #   volume <prefix>_<name>_databases → /databases (persistent DB data)
+#   volume <prefix>_<name>_deploy    → /deploy, in the 'deploy' container only
+#                                      (created by the first 'deploy')
 #
 # Copyright (C) 2026 Thomas Rabaix and nixenv contributors
 # Licensed under the GNU General Public License v3.0 or later — see LICENSE.
@@ -81,6 +83,7 @@ EGRESS_NAME="${CONTAINER_PREFIX}__egress"            # egress container: squid (
 EGRESS_NET="${EGRESS_NET:-${PROXY_NET}-egress}"      # its own outbound network; only it + Caddy join it
 EGRESS_LINK="${CONTAINER_PREFIX}__egress-link"       # its alias on EGRESS_NET ('__': no project can own it)
 EGRESS_DATA_DIR="${EGRESS_DATA_DIR:-$PROXY_DIR/egress-data}"  # squid log, captures, mitmproxy CA
+DASHBOARD_DIR="$PROXY_DIR/www"                       # the dashboard Caddy serves at https://$PROXY_DOMAIN/ ('ps')
 CAPTURE_WEB_IN_PORT=8081                             # mitmweb UI port inside the egress container (reached via Caddy: <p>-mitm.<domain>)
 CAPTURE_EGRESS_BASE=8100                             # + n: project n's egress listener (loopback, squid's peer)
 CAPTURE_INGRESS_BASE=8200                            # + n: project n's ingress listener (Caddy only)
@@ -107,8 +110,10 @@ TEMPLATE_CACHE="$HOME/.nixenv/templates"             # fetched templates are cac
 
 # ── Pretty output ────────────────────────────────────────────────────────────
 c_blue='\033[1;34m'; c_green='\033[1;32m'; c_yellow='\033[1;33m'; c_red='\033[1;31m'; c_reset='\033[0m'
-log()  { printf "${c_blue}==>${c_reset} %s\n" "$*"; }
-ok()   { printf "${c_green}✓${c_reset} %s\n" "$*"; }
+# NIXENV_QUIET=1 silences progress (log/ok) — 'start' without -v sets it for
+# everything it calls. warn and die always print.
+log()  { if [ "${NIXENV_QUIET:-0}" = 1 ]; then return 0; fi; printf "${c_blue}==>${c_reset} %s\n" "$*"; }
+ok()   { if [ "${NIXENV_QUIET:-0}" = 1 ]; then return 0; fi; printf "${c_green}✓${c_reset} %s\n" "$*"; }
 warn() { printf "${c_yellow}!${c_reset} %s\n" "$*"; }
 die()  { printf "${c_red}✗ %s${c_reset}\n" "$*" >&2; exit 1; }
 
@@ -790,6 +795,7 @@ export NIXENV_PROJECT="${NIXENV_PROJECT:-}"
 export NIXENV_APP_MOUNT="$APP_MOUNT"
 export NIXENV_EXTRA_PROFILE="${NIXENV_EXTRA_PROFILE:-}"
 export NIXENV_DEPLOY=1
+export NIXENV_DEPLOY_STATE="${NIXENV_DEPLOY_STATE:-/deploy}"
 export PATH="\$HOME/.local/bin:$_extra$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export ZSH="$PROFILE/share/oh-my-zsh"
 export ZSH_CACHE_DIR="\$HOME/.cache/omz"
@@ -1416,7 +1422,7 @@ container_needs_recreate() {
     stale=1
   fi
   [ -n "$stale" ] || return 0
-  echo "    apply it with: $0 stop $name && $0 run $name"
+  echo "    apply it with: $0 stop $name && $0 start $name"
   return 1
 }
 
@@ -1434,6 +1440,35 @@ ensure_proxy_running() {
     PROXY_MKCERT_INSTALL="${PROXY_MKCERT_INSTALL:-0}"
     cmd_proxy up
   ) || warn "proxy auto-start failed — start it with '$0 proxy up' (needs caddy: '$0 build')"
+}
+
+# Checksum of what the proxy container fixes at CREATION — start.sh (relays),
+# its published ports and the cert mount — stored as a label so a restricted
+# 'run' can hot-reload a proxy that already has them instead of recreating it
+# (a recreate cuts every relayed ssh/zmx session). Run write_egress_configs first.
+PROXY_SUM_LABEL="nixenv.proxy-start"
+proxy_start_sum() {
+  { cat "$PROXY_DIR/egress/start.sh" 2>/dev/null
+    printf '%s\n' "cert=$1" "http=$PROXY_HTTP_PORT https=$PROXY_HTTPS_PORT" ${EGRESS_PUB[@]+"${EGRESS_PUB[@]}"}
+  } | cksum | awk '{print $1 "-" $2}'
+}
+
+# After a restricted project starts: make the proxy carry its ACL and relays.
+# Hot reload when the running proxy was created with the same relays/ports/cert
+# (the usual restart of a known project); 'proxy up' (recreate) otherwise.
+proxy_refresh_for_run() {
+  if container_running "$PROXY_NAME" && proxy_serves_dashboard; then
+    local cert=0
+    [ -f "$PROXY_DIR/certs/wildcard.pem" ] && cert=1
+    write_egress_configs
+    local CAPTURE_PENDING="$CAPTURE_CHANGED"   # the pass below must still restart mitmproxy
+    if [ "$(proxy_start_sum "$cert")" = \
+         "$("$ENGINE" inspect -f "{{index .Config.Labels \"$PROXY_SUM_LABEL\"}}" "$PROXY_NAME" 2>/dev/null)" ]; then
+      ( cmd_proxy reload ) && return 0
+      warn "hot reload failed — recreating the proxy"
+    fi
+  fi
+  ( PROXY_MKCERT_INSTALL="${PROXY_MKCERT_INSTALL:-0}"; cmd_proxy up )
 }
 
 # --privileged for the nix builder so source builds using bwrap/user namespaces
@@ -1675,6 +1710,7 @@ project_dir()     { printf '%s/%s' "$PROJECTS_DIR" "$1"; }
 app_volume()      { printf '%s_%s_app'  "$CONTAINER_PREFIX" "$1"; }   # e.g. nixenv_myapp_app       → /app
 home_volume()     { printf '%s_%s_home' "$CONTAINER_PREFIX" "$1"; }   # e.g. nixenv_myapp_home      → /home/app
 db_volume()       { printf '%s_%s_databases' "$CONTAINER_PREFIX" "$1"; } # e.g. nixenv_myapp_databases → /databases
+deploy_volume()   { printf '%s_%s_deploy' "$CONTAINER_PREFIX" "$1"; }    # e.g. nixenv_myapp_deploy    → /deploy (deploy container only)
 project_profile() { printf '/nix/var/nix/profiles/proj-%s' "$1"; }   # per-project extra tooling
 # Where the app (code) volume is mounted INSIDE the container. Chosen at init
 # time, stored in <project>/app_mount; defaults to /app. Only the runtime
@@ -1693,7 +1729,7 @@ valid_app_mount() {
     *[!a-zA-Z0-9._/-]*|*/../*|*/..|*//*) warn "the app path may only contain letters, digits, '._-/' (got '$1')"; return 1;;
   esac
   case "$1" in
-    /|/home|/home/*|/databases|/databases/*|/nix|/nix/*|/etc|/etc/*|/tmp|/tmp/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/root/*|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/run|/run/*)
+    /|/home|/home/*|/databases|/databases/*|/deploy|/deploy/*|/nix|/nix/*|/etc|/etc/*|/tmp|/tmp/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/root|/root/*|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/run|/run/*)
       warn "the app path '$1' collides with a reserved or system path — pick another"; return 1;;
   esac
   return 0
@@ -1756,7 +1792,7 @@ write_extra_parameters() {
   cat > "$f" <<'EOF'
 # nixenv: extra parameters for this project's container (auto-created, empty).
 # Whitespace-separated flags, appended verbatim to the engine's `run`.
-# Applied at container creation — re-run `nixenv run <project>` after editing.
+# Applied at container creation — re-run `nixenv start <project>` after editing.
 #
 # Example — run podman/docker INSIDE the container:
 #   --security-opt seccomp=unconfined
@@ -1784,6 +1820,26 @@ deploy_net()            { printf '%s__%s-deploy' "$CONTAINER_PREFIX" "$1"; }
 ensure_deploy_net()     {
   "$ENGINE" network inspect "$(deploy_net "$1")" >/dev/null 2>&1 || \
     "$ENGINE" network create --internal "$(deploy_net "$1")" >/dev/null
+}
+# The deploy STATE volume (deploy_volume, mounted at /deploy): what must outlive
+# a throwaway session — terraform/ansible state, release bookkeeping. Created by
+# the first 'deploy', reused after; never mounted in the dev container, so dev
+# code can't read or plant what deploy keeps there. Same ownership dance as
+# ensure_volumes: a new volume is root-owned, and Docker Desktop resets an EMPTY
+# one back to root, hence the .keep.
+ensure_deploy_volume() {
+  local vol; vol="$(deploy_volume "$1")"
+  if ! vol_exists "$vol"; then
+    "$ENGINE" volume create "$vol" >/dev/null || return 1
+    log "Created deploy state volume '$vol' (→ /deploy)"
+  fi
+  "$ENGINE" run --rm -u 0 -v "$vol":/deploy \
+    -e NIXUID="$(id -u)" -e NIXGID="$(id -g)" \
+    "$(img "$RUNTIME_IMAGE")" sh -c '
+      [ -z "$(ls -A /deploy 2>/dev/null)" ] && : > /deploy/.keep 2>/dev/null || true
+      cur=$(stat -c %u /deploy 2>/dev/null || echo -1)
+      [ "$cur" = "$NIXUID" ] || chown -R "$NIXUID:$NIXGID" /deploy
+    ' >/dev/null 2>&1 || { warn "deploy volume init/ownership helper failed for '$1'"; return 1; }
 }
 # Hosts in <project>/deploy_hosts, normalised, one per line (empty if none).
 deploy_hosts() {
@@ -2402,7 +2458,7 @@ cmd_init() {
   local pdir; pdir="$(project_dir "$name")"
   if [ "$force" != 1 ] && [ -d "$pdir" ] && { [ -d "$pdir/home" ] || [ -f "$pdir/port" ]; }; then
     warn "project '$name' already exists ($pdir)"
-    echo "   start it:      $0 run $name"
+    echo "   start it:      $0 start $name"
     echo "   remove it:     $0 delete $name     (deletes its volumes — asks first)"
     echo "   re-scaffold:   $0 init $name --force   (keeps volumes; re-prompts git identity)"
     die "refusing to re-initialise '$name'"
@@ -2510,7 +2566,7 @@ cmd_init() {
   if [ -n "$tfile" ]; then
     echo
     ok "Template ready — start it with:"
-    echo "    $0 run $name"
+    echo "    $0 start $name"
     [ -n "$tport" ] && echo "    then open https://$name-$tport.$PROXY_DOMAIN/"
     log "first start runs the template's setup hook (installs the app); watch it with: $0 logs $name"
   fi
@@ -2627,7 +2683,7 @@ cmd_build_project() {
   pdir="$(project_dir "$name")"
   prof="$(project_profile "$name")"
   fdir="$pdir/flake"
-  vol_exists "$appv" || die "no app volume for '$name' — run '$0 init'/'$0 run' first"
+  vol_exists "$appv" || die "no app volume for '$name' — run '$0 init'/'$0 start' first"
 
   # Extract the flake from the app VOLUME into a host build dir (flake files, or
   # a whole subfolder for --dir).
@@ -2672,19 +2728,30 @@ cmd_build_project() {
     ' || die "building '$name''s flake failed"
 
   ok "Project '$name' extra tooling built → $prof"
-  log "It loads ahead of the base toolchain on the next 'run'/'ssh'/'shell' of '$name'"
+  log "It loads ahead of the base toolchain on the next 'start'/'ssh'/'shell' of '$name'"
 }
 
 # =============================================================================
-# run — start the project's background service (sshd under runit)
-#   usage: run <project>
+# start (alias: run) — start the project's background service (sshd under runit)
+#   usage: start <project>
 # =============================================================================
 cmd_run() {
   require_engine
-  local name="${1:-}"
-  [ -n "$name" ] || die "usage: $0 run <project>"
-  shift
+  local name="" verbose=0 _a
+  for _a in "$@"; do
+    case "$_a" in
+      -v|--verbose) verbose=1;;
+      -*) die "unknown option '$_a' — usage: $0 start <project> [-v]";;
+      *) [ -z "$name" ] || die "start takes no command — use '$0 shell $name' or '$0 ssh $name'"
+         name="$_a";;
+    esac
+  done
+  [ -n "$name" ] || die "usage: $0 start <project> [-v]"
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
+  # Without -v: progress (log/ok) is silenced here and in everything called
+  # below (proxy, egress, volumes); warnings still print, then a short summary.
+  local NIXENV_QUIET=1
+  if [ "$verbose" = 1 ]; then NIXENV_QUIET=0; fi
 
   volume_exists || die "volume '$NIX_VOLUME' missing — run '$0 build' first"
   store_is_populated || die "shared profile not found in volume — run '$0 build' first"
@@ -2695,7 +2762,6 @@ cmd_run() {
   appv="$(app_volume "$name")"; homev="$(home_volume "$name")"; dbv="$(db_volume "$name")"
   appmnt="$(project_app_mount "$name")"
   [ -f "$ENTRYPOINT_FILE" ] || die "missing entrypoint at $ENTRYPOINT_FILE"
-  [ "$#" -eq 0 ] || die "run takes no command — use '$0 shell $name' or '$0 ssh $name'"
   # Defence in depth: these files shape the container's creation, and a
   # symlink among them could make the engine bind-mount (or read) a host file
   # outside the project dir — e.g. hosts.extra -> ~/.ssh/id_ed25519.
@@ -2790,24 +2856,26 @@ cmd_run() {
   local capca="$EGRESS_DATA_DIR/mitmproxy/mitmproxy-ca-cert.pem"
   if [ "$restricted" = 1 ] && capture_ca_trusted "$name"; then
     if project_captures "$name" egress; then
-      capture_wait_ca || warn "capture CA not ready yet — HTTPS from '$name' will fail until '$0 stop $name && $0 run $name'"
+      capture_wait_ca || warn "capture CA not ready yet — HTTPS from '$name' will fail until '$0 stop $name && $0 start $name'"
     fi
     [ -f "$capca" ] && hostsmount+=(-v "$capca:/etc/nixenv-capture-ca.crt:ro")
   fi
 
+  local state="Started"
   if container_running "$cname"; then
-    ok "Project '$name' already running as '$cname'"
+    state="Already running:"
+    log "Project '$name' already running as '$cname'"
     # A container created before key auth still runs the old, open sshd
     # — the fix only applies at creation. Say so, since nothing else would.
     if ! "$ENGINE" inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$cname" 2>/dev/null \
          | grep -q '/etc/nixenv/authorized_keys'; then
       warn "'$name' was started before key-only ssh — it still accepts password-less logins"
-      echo "    apply it with: $0 stop $name && $0 run $name"
+      echo "    apply it with: $0 stop $name && $0 start $name"
     fi
     if ! "$ENGINE" inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$cname" 2>/dev/null \
          | grep -q '/etc/nixenv/ssh_host_ed25519_key'; then
       warn "'$name' was started before host-key pinning — 'ssh $name' will report a changed host key"
-      echo "    apply it with: $0 stop $name && $0 run $name"
+      echo "    apply it with: $0 stop $name && $0 start $name"
     fi
     container_needs_recreate "$name" "$restricted" || true
   else
@@ -2865,16 +2933,22 @@ cmd_run() {
       -e NIXENV_EXTRA_PROFILE="$(project_profile "$name")" \
       "$(img "$RUNTIME_IMAGE")" \
       sh /usr/local/bin/nixenv-entrypoint >/dev/null
-    ok "Started '$cname'"
+    log "Started '$cname'"
   fi
   if [ "$restricted" = 1 ]; then
     # Refresh so the proxy picks up this project's ACL + ssh/port relays (the
     # relays need the container to exist, hence after the start above).
     log "Refreshing proxy (egress allowlist + ssh relay for '$name')"
-    ( PROXY_MKCERT_INSTALL="${PROXY_MKCERT_INSTALL:-0}"; cmd_proxy up ) \
+    ( DASHBOARD_REFRESH=0; proxy_refresh_for_run ) \
       || warn "proxy refresh failed — '$0 proxy up' manually (ssh relies on its relay)"
   else
-    ensure_proxy_running   # bring the shared proxy up on first project start
+    DASHBOARD_REFRESH=0 ensure_proxy_running   # bring the shared proxy up on first project start
+  fi
+  dashboard_refresh
+  dashboard_refresh_later   # again once its services had time to listen
+  if [ "$verbose" = 0 ]; then
+    run_summary "$name" "$state" "$restricted"
+    return 0
   fi
   echo "   ssh:    $0 ssh $name   (or: ssh -p $port -i $pdir/ssh/id_ed25519 $APP_USER@127.0.0.1)"
   echo "   shell:  $0 shell $name   ($ENGINE exec, no key needed)"
@@ -2895,6 +2969,37 @@ cmd_run() {
     echo "   hosts:  merged /etc/hosts.extra ($(grep -vc '^[[:space:]]*#' "$pdir/hosts.extra") entries)"
   fi
   echo "   stop:   $0 stop $name"
+  if container_running "$PROXY_NAME" && ! proxy_serves_dashboard; then
+    # 'run' leaves a running proxy alone (recreating it cuts relayed sessions),
+    # so one from before the dashboard keeps serving a blank page: say so.
+    echo "   ports:  $0 ps   ($(dashboard_page_url) needs a proxy restart: $0 proxy up)"
+  else
+    echo "   ports:  $0 ps   (or $(dashboard_project_url "$name"))"
+  fi
+}
+
+# The short output of 'start' (no -v): one status line, how to get in, where it
+# is served, and the egress state. 'start -v' prints the full details.
+run_summary() {
+  local name="$1" state="$2" restricted="$3" pdir n
+  pdir="$(project_dir "$name")"
+  NIXENV_QUIET=0 ok "$state '$(container_name "$name")'"
+  echo "   ssh:    $0 ssh $name   shell: $0 shell $name"
+  if [ "$PROXY_AUTOSTART" = 1 ] && container_running "$PROXY_NAME"; then
+    echo "   web:    https://$name-<port>.$PROXY_DOMAIN/"
+    echo "   status: $(dashboard_project_url "$name")"
+  fi
+  if [ "$restricted" = 1 ]; then
+    n="$(grep -c '[^[:space:]]' "$pdir/allowed_hosts" 2>/dev/null || true)"
+    echo "   egress: restricted, ${n:-0} host(s) allowed   watch: $0 egress $name"
+    if [ -f "$pdir/capture" ]; then
+      echo "   capture: ON ($(capture_directions "$name")) — $0 capture $name web"
+    fi
+  fi
+  if container_running "$PROXY_NAME" && ! proxy_serves_dashboard; then
+    warn "$(dashboard_page_url) needs a proxy restart: $0 proxy up"
+  fi
+  echo "   details: $0 start $name -v"
 }
 
 # =============================================================================
@@ -2930,7 +3035,7 @@ cmd_expose() {
     cmd_stop "$name" >/dev/null 2>&1 || true
     cmd_run "$name"
   else
-    log "ports saved — they apply on the next '$0 run $name'"
+    log "ports saved — they apply on the next '$0 start $name'"
   fi
 }
 
@@ -2980,7 +3085,7 @@ cmd_host() {
     cmd_stop "$name" >/dev/null 2>&1 || true
     cmd_run "$name"
   else
-    log "hosts saved — they apply on the next '$0 run $name'"
+    log "hosts saved — they apply on the next '$0 start $name'"
   fi
 }
 
@@ -3017,7 +3122,7 @@ cmd_restrict() {
     cmd_stop "$name" >/dev/null 2>&1 || true
     cmd_run "$name"
   else
-    log "applies on the next '$0 run $name'"
+    log "applies on the next '$0 start $name'"
   fi
 }
 
@@ -3059,7 +3164,7 @@ cmd_allow() {
       ( PROXY_MKCERT_INSTALL="${PROXY_MKCERT_INSTALL:-0}"; cmd_proxy up )
     fi
   else
-    log "applies when the proxy starts ('$0 proxy up' or next '$0 run $name')"
+    log "applies when the proxy starts ('$0 proxy up' or next '$0 start $name')"
   fi
 }
 
@@ -3190,7 +3295,7 @@ ingress";;
         if confirm_tty "Restart '$name' now?"; then
           cmd_stop "$name" && cmd_run "$name"
         else
-          echo "    apply it with: $0 stop $name && $0 run $name"
+          echo "    apply it with: $0 stop $name && $0 start $name"
         fi
       fi
       echo "   UI:   $0 capture $name web      live log: $0 capture $name log -f"
@@ -3211,7 +3316,7 @@ ingress";;
       rm -f "$pdir/capture-trust"
       ok "'$name' no longer trusts the capture CA after its next restart"
       if container_running "$(container_name "$name")" 2>/dev/null; then
-        echo "    apply it with: $0 stop $name && $0 run $name"
+        echo "    apply it with: $0 stop $name && $0 start $name"
       fi
       ;;
     status)
@@ -3276,9 +3381,9 @@ ingress";;
 # Caddy reloads its ingress routes. Nothing is recreated unless the capture UI
 # port must appear or disappear. Without a running proxy it applies at next run.
 capture_apply() {
-  resolve_engine 2>/dev/null || { log "applies at the next '$0 run $1'"; return 0; }
+  resolve_engine 2>/dev/null || { log "applies at the next '$0 start $1'"; return 0; }
   if ! container_running "$PROXY_NAME"; then
-    log "applies when the proxy starts ('$0 proxy up' or next '$0 run $1')"
+    log "applies when the proxy starts ('$0 proxy up' or next '$0 start $1')"
     return 0
   fi
   ( PROXY_MKCERT_INSTALL="${PROXY_MKCERT_INSTALL:-0}"; cmd_proxy reload ) \
@@ -3379,7 +3484,8 @@ write_egress_configs() {
   # Overwriting files in place keeps the mount coherent.
   mkdir -p "$edir"
   EGRESS_PUB=(); EGRESS_PROJECTS=""; EGRESS_SUBNETS=""; EGRESS_DEPLOYS=""
-  CAPTURE_PROJECTS=""; CAPTURE_INGRESS=""; CAPTURE_CHANGED=0
+  # CAPTURE_PENDING=1: an earlier pass already rewrote capture.conf (proxy_refresh_for_run).
+  CAPTURE_PROJECTS=""; CAPTURE_INGRESS=""; CAPTURE_CHANGED="${CAPTURE_PENDING:-0}"
   local relays="" acls="" gates="" sshgates="" allows="" all_srcs="" sshdoms d pdir name subnet aclname doms ips sshport _line _spec hp cp
   local peers="" capconf="" capn=0
 
@@ -3463,8 +3569,8 @@ http_access deny p_$aclname CONNECT ssh_port"
 
     # Capture: this project's traffic goes through ITS OWN mitmproxy listener
     # (the port tells the addon which project a flow belongs to), AFTER squid
-    # has applied every rule above. Ports 22/9418 (ssh, git://) are not HTTP —
-    # they stay direct. never_direct makes it fail CLOSED: if mitmproxy is down
+    # has applied every rule above. Port 22 (ssh) is not HTTP — it stays
+    # direct. never_direct makes it fail CLOSED: if mitmproxy is down
     # the request fails instead of silently going out unrecorded.
     if [ -f "$pdir/capture" ] && [ "$capn" -lt 99 ]; then
       capn=$((capn + 1))
@@ -3495,7 +3601,7 @@ never_direct allow p_$aclname !nocapture_ports"
     if container_running "$(container_name "$name")" && \
        "$ENGINE" port "$(container_name "$name")" 2>/dev/null | grep -q .; then
       warn "'$name' is running WITHOUT restriction (old container publishes its own ports)"
-      warn "  apply it with:  $0 stop $name && $0 run $name   (skipping its relays for now)"
+      warn "  apply it with:  $0 stop $name && $0 start $name   (skipping its relays for now)"
       continue
     fi
 
@@ -3567,10 +3673,11 @@ cache deny all
 via off
 forwarded_for delete
 
-# Only tunnel to sane ports (https, ssh, http, git).
-acl Connect_ports port 443 22 80 9418
+# Only tunnel to sane ports (https, ssh, http). git:// (9418) is not
+# offered: git never sends it through an HTTP proxy, so it could only be a tunnel.
+acl Connect_ports port 443 22 80
 acl ssh_port port 22
-acl nocapture_ports port 22 9418
+acl nocapture_ports port 22
 acl CONNECT method CONNECT
 
 # Loopback, private/container networks and link-local (169.254.169.254 is the
@@ -4052,7 +4159,7 @@ EOF
 # Call write_egress_configs FIRST: the cross-project guard needs EGRESS_SUBNETS,
 # and ingress capture needs CAPTURE_INGRESS.
 write_caddyfile() {
-  local tls_line dom_re rules guards denies caps capmatch caproutes
+  local tls_line dom_re rules guards denies caps capmatch caproutes dash_deny="" rsubnets
   mkdir -p "$PROXY_DIR"
   dom_re="$(printf '%s' "$PROXY_DOMAIN" | sed 's/\./\\./g')"
   if [ "${1:-0}" = 1 ]; then
@@ -4066,6 +4173,16 @@ write_caddyfile() {
   caps="$(caddy_capture_routes "$dom_re")"
   capmatch="$(printf '%s\n' "$caps" | sed '/^--$/,$d')"
   caproutes="$(printf '%s\n' "$caps" | sed '1,/^--$/d')"
+  # The dashboard (NET-05) lists every project: not for restricted ones, which
+  # may only see themselves (NET-04). Same source subnets as the guard above.
+  rsubnets="$(printf '%s\n' "${EGRESS_SUBNETS:-}" | awk 'NF == 2 && $2 ~ /^[0-9a-fA-F.:]+\/[0-9]+$/ {printf " %s", $2}')"
+  if [ -n "$rsubnets" ]; then
+    dash_deny="
+	@restricted remote_ip$rsubnets
+	route {
+		respond @restricted \"nixenv proxy: the dashboard is not available to restricted projects\" 403
+	}"
+  fi
   # Unquoted heredoc: $vars expand; Caddy's {re.route.N}/{host} have no $ so stay
   # literal; \. and \$ are preserved/reduced to regex-correct forms.
   cat > "$PROXY_DIR/Caddyfile" <<CADDY
@@ -4101,8 +4218,23 @@ $denies$caproutes
 			# SSE, chunked output, dev-server live reload. WebSockets need nothing.
 			flush_interval -1
 		}
-		respond "nixenv proxy: no route for {host} — use <project>-<port>.$PROXY_DOMAIN" 502
+		respond "nixenv proxy: no route for {host} — use <project>-<port>.$PROXY_DOMAIN (projects: https://$PROXY_DOMAIN/)" 502
 	}
+}
+
+# The dashboard: static files written by 'nixenv ps' (and run/stop/proxy up)
+# into $DASHBOARD_DIR, mounted read-only at /www. No directory listing, no
+# inline script, nothing cached.
+$PROXY_DOMAIN {
+	$tls_line
+	header {
+		Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		Cache-Control no-store
+	}$dash_deny
+	root * /www
+	file_server
 }
 CADDY
 }
@@ -4116,7 +4248,7 @@ cmd_proxy() {
       remove_legacy_helper proxy   # it holds the ports the new one publishes
       ensure_proxy_net
       ensure_egress_net
-      mkdir -p "$PROXY_DIR/data"
+      mkdir -p "$PROXY_DIR/data" "$DASHBOARD_DIR"
       local cert=0; proxy_make_cert && cert=1 || cert=0
       write_egress_configs   # squid ACLs + relays + start.sh (fills EGRESS_PUB/PROJECTS/SUBNETS)
       write_caddyfile "$cert"   # after: its cross-project guard needs EGRESS_SUBNETS
@@ -4129,6 +4261,7 @@ cmd_proxy() {
       log "Starting proxy '$PROXY_NAME' — *.$PROXY_DOMAIN on 127.0.0.1:$PROXY_HTTP_PORT/$PROXY_HTTPS_PORT"
       "$ENGINE" run -d \
         --name "$PROXY_NAME" \
+        --label "$PROXY_SUM_LABEL=$(proxy_start_sum "$cert")" \
         --network "$PROXY_NET" \
         --user "$(id -u):$(id -g)" \
         $(engine_userns) \
@@ -4140,6 +4273,7 @@ cmd_proxy() {
         -v "$NIX_VOLUME":/nix:ro \
         -v "$PROXY_DIR/Caddyfile":/etc/caddy/Caddyfile:ro \
         -v "$PROXY_DIR/egress":/etc/egress:ro \
+        -v "$DASHBOARD_DIR":/www:ro \
         ${certmount[@]+"${certmount[@]}"} \
         -v "$PROXY_DIR/data":/data \
         -e HOME=/data -e XDG_DATA_HOME=/data -e XDG_CONFIG_HOME=/data/config \
@@ -4168,11 +4302,14 @@ cmd_proxy() {
       # Caddy writes its internal CA on first start; give it a moment, then
       # publish it so containers can trust the certs it serves.
       sleep 2; export_caddy_ca || true
+      dashboard_refresh
       ok "proxy running as '$PROXY_NAME'"
+      [ "${NIXENV_QUIET:-0}" = 1 ] && return 0   # 'start' without -v: no info block
       echo "   scheme: https://<project>-<port>.$PROXY_DOMAIN/   (e.g. https://myapp-3000.$PROXY_DOMAIN/)"
       if [ "$cert" = 1 ]; then echo "   tls:    trusted wildcard cert via mkcert"
       else echo "   tls:    Caddy internal CA (browser warning until you install/trust mkcert)"; fi
-      echo "   net:    $PROXY_NET  (projects auto-join on '$0 run')"
+      echo "   net:    $PROXY_NET  (projects auto-join on '$0 start')"
+      echo "   projects: $(dashboard_page_url)   (what runs where: '$0 ps')"
       [ -n "$EGRESS_PROJECTS" ] && echo "   egress: squid allowlist in '$EGRESS_NAME' :$EGRESS_PORT for:$EGRESS_PROJECTS  (log: $0 egress <project>)"
       [ -n "$CAPTURE_PROJECTS" ] && echo "   capture:$CAPTURE_PROJECTS  (UI: $0 capture <project> web)"
       echo "   note:   *.localhost auto-resolves to 127.0.0.1 in Chrome/Firefox (Safari needs an /etc/hosts line)"
@@ -4200,7 +4337,11 @@ cmd_proxy() {
       rout="$("$ENGINE" exec "$PROXY_NAME" "$PROFILE/bin/caddy" reload \
           --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1)" \
         || { printf '%s\n' "$rout" >&2; die "caddy rejected the new config (the old one stays active) — see '$0 proxy logs'"; }
+      dashboard_refresh
       ok "proxy config reloaded (no restart)"
+      # The dashboard mount is fixed at creation: an older proxy can't serve it.
+      proxy_serves_dashboard \
+        || warn "this proxy predates the dashboard ($(dashboard_page_url)) — serve it with: $0 proxy up"
       ;;
     stop|down)
       remove_legacy_helper proxy; remove_legacy_helper egress
@@ -4306,6 +4447,1439 @@ cmd_projects() {
 }
 
 # =============================================================================
+# ps — what runs where and how to reach it. The same scan feeds the dashboard
+# Caddy serves at https://$PROXY_DOMAIN/ (files in $DASHBOARD_DIR, NET-05).
+# =============================================================================
+# Probed from the HOST with one '$ENGINE exec' per running container: nixenv
+# never knows which ports a dev server opened, only what <project>/ports
+# declares. Base-Debian tools only (RUN-13). Everything it prints comes from
+# untrusted project code (process names, service dirs, even ls output), so the
+# parser keeps only sanitised fields and caps their number.
+DASHBOARD_PROBE='echo "##nixenv tcp"; cat /proc/net/tcp /proc/net/tcp6 2>/dev/null
+echo "##nixenv fd"; ls -lq /proc/[0-9]*/fd 2>/dev/null
+echo "##nixenv comm"; head -n1 /proc/[0-9]*/comm 2>/dev/null
+echo "##nixenv sv"
+for d in /home/app/.nixenv-sv/*; do
+  [ -f "$d/supervise/stat" ] && echo "${d##*/} $(cat "$d/supervise/stat" 2>/dev/null)"
+done
+true'
+
+# Parse probe output (stdin) into
+#   L <port> <any|loopback|a.b.c.d|ipv6> <proc[,proc…]|->   listening TCP sockets
+#   S <service> <run|down|finish|…>                         runit services
+# The in-container sshd and the loopback proxy relays (NET-03) are nixenv's own
+# and left out, as are root-owned sockets. POSIX awk (BSD awk on macOS): no strtonum, hex decoded by hand.
+dashboard_parse_probe() {
+  awk -v sshd="$SSHD_PORT" '
+    function hex(s,  i, n, c) {
+      n = 0; s = tolower(s)
+      for (i = 1; i <= length(s); i++) {
+        c = index("0123456789abcdef", substr(s, i, 1)); if (!c) return -1
+        n = n * 16 + c - 1
+      }
+      return n
+    }
+    # /proc/net/tcp addresses are little-endian 32-bit words.
+    function v4(h) {
+      if (h == "00000000") return "any"
+      if (substr(h, 7, 2) == "7F") return "loopback"
+      return hex(substr(h, 7, 2)) "." hex(substr(h, 5, 2)) "." hex(substr(h, 3, 2)) "." hex(substr(h, 1, 2))
+    }
+    function bindof(a) {
+      a = toupper(a)
+      if (a !~ /^[0-9A-F]+$/) return ""
+      if (length(a) == 8) return v4(a)
+      if (length(a) != 32) return ""
+      if (a == "00000000000000000000000000000000") return "any"
+      if (a == "00000000000000000000000001000000") return "loopback"
+      if (substr(a, 1, 24) == "0000000000000000FFFF0000") return v4(substr(a, 25, 8))
+      return "ipv6"
+    }
+    function clean(s, max) { gsub(/[^A-Za-z0-9._+-]/, "_", s); return substr(s, 1, max) }
+    # A comm line comes right after its header: read it before anything else,
+    # so a process NAMED like a section marker cannot switch sections.
+    wantcomm { comm[cpid] = clean($0, 24); wantcomm = 0; next }
+    /^##nixenv [a-z]+$/ { sec = $2; next }
+    # uid 0 belongs to the engine (the Docker embedded DNS on 127.0.0.11): project
+    # containers run no root process (RUN-01).
+    sec == "tcp" && $4 == "0A" && $8 != "0" {
+      if (split($2, la, ":") != 2 || length(la[2]) != 4) next
+      p = hex(la[2]); b = bindof(la[1])
+      if (p < 1 || b == "") next
+      if (!(p in bind)) { if (np >= 64) next; order[++np] = p; bind[p] = b }
+      else if (b == "any" || bind[p] == "loopback") bind[p] = b
+      if ($10 ~ /^[0-9]+$/) inodes[p] = inodes[p] " " $10
+      next
+    }
+    sec == "fd" && /^\/proc\/[0-9]+\/fd:$/ { pid = $0; gsub(/[^0-9]/, "", pid); next }
+    sec == "fd" && match($0, /socket:\[[0-9]+\]$/) { owner[substr($0, RSTART + 8, RLENGTH - 9)] = pid; next }
+    sec == "comm" && /^==> \/proc\/[0-9]+\/comm <==$/ { cpid = $2; gsub(/[^0-9]/, "", cpid); wantcomm = 1; next }
+    sec == "sv" && NF >= 2 && ns < 64 {
+      st = $2; gsub(/[^a-z]/, "", st)
+      ns++; print "S", clean($1, 48), (st == "" ? "unknown" : st); next
+    }
+    END {
+      for (i = 1; i <= np; i++) {
+        p = order[i]
+        if (p == sshd) continue
+        if (bind[p] == "loopback" && (p == 80 || p == 443)) continue
+        procs = ""; split("", seen)
+        n = split(inodes[p], ino, " ")
+        for (j = 1; j <= n; j++) {
+          c = comm[owner[ino[j]]]
+          if (c != "" && !(c in seen)) { seen[c] = 1; procs = procs (procs == "" ? "" : ",") c }
+        }
+        print "L", p, bind[p], (procs == "" ? "-" : procs)
+      }
+    }'
+}
+
+dashboard_probe() {
+  "$ENGINE" exec "$1" sh -c "$DASHBOARD_PROBE" 2>/dev/null | dashboard_parse_probe
+}
+
+# Egress hits of one restricted project, from the tail of the squid log:
+#   <A|D> <host> <count>   (A = allowed, D = denied; top 10 of each)
+# Matched on the client address against the project's subnet (exactly, not by
+# text prefix). Hosts are whatever the project requested: sanitised.
+dashboard_egress_hits() {
+  local logf="$EGRESS_DATA_DIR/egress.log"
+  [ -n "$1" ] && [ -f "$logf" ] || return 0
+  tail -n 5000 "$logf" 2>/dev/null | awk -v cidr="$1" '
+    function n(s,  a) { if (split(s, a, ".") != 4) return -1; return ((a[1] * 256 + a[2]) * 256 + a[3]) * 256 + a[4] }
+    BEGIN { split(cidr, c, "/"); size = 2 ^ (32 - c[2]); net = int(n(c[1]) / size) }
+    {
+      ip = n($3); if (ip < 0 || int(ip / size) != net) next
+      h = $7; sub(/^[a-z]*:\/\//, "", h); sub(/\/.*$/, "", h); sub(/:[0-9]*$/, "", h)
+      gsub(/[^A-Za-z0-9._:-]/, "", h); h = substr(h, 1, 120)
+      if (h != "") cnt[($4 ~ /DENIED/ ? "D" : "A") " " h]++
+    }
+    END { for (k in cnt) print cnt[k], k }' \
+    | sort -rn | awk '{ if (seen[$2]++ < 10) print $2, $3, $1 }'
+}
+
+# One JSON string literal (control characters dropped).
+json_s() {
+  printf '"%s"' "$(printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+# JSON array of the non-empty lines on stdin.
+json_list() {
+  local out="" v
+  while IFS= read -r v || [ -n "$v" ]; do
+    [ -n "$v" ] || continue
+    out="$out${out:+,}$(json_s "$v")"
+  done
+  printf '[%s]' "$out"
+}
+# Entries of a project settings file, for display: '#' comments, blanks and odd
+# characters dropped, symlinks ignored (EXP-04).
+dashboard_lines() {
+  [ -f "$1" ] && [ ! -L "$1" ] || return 0
+  sed 's/#.*//' "$1" | tr ' \t' '\n\n' | tr -cd 'A-Za-z0-9._*:/@+\n-' | grep -v '^$' | head -n 200 || true
+}
+
+# <project>/extra-parameters for display, one flag per line. The page is
+# readable by unrestricted projects, and this file is where '-e TOKEN=…' ends
+# up: environment VALUES are redacted ('-e NAME=…'), names kept.
+dashboard_extra_params() {
+  local f; f="$(project_dir "$1")/extra-parameters"
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  project_extra_args "$1" | awk '{
+    for (i = 1; i <= NF && i <= 200; i++) {
+      t = $i
+      if (env) { sub(/=.*/, "=…", t); env = 0 }
+      else if (t == "-e" || t == "--env") env = 1
+      else if (substr(t, 1, 6) == "--env=") { r = substr(t, 7); sub(/=.*/, "=…", r); t = "--env=" r }
+      else if (substr(t, 1, 2) == "-e" && substr(t, 3, 1) != "") { r = substr(t, 3); sub(/=.*/, "=…", r); t = "-e" r }
+      print t
+    }
+  }'
+}
+
+# The proxy URL of <project> <port>, as seen from the host.
+dashboard_url() {
+  local sfx=""
+  [ "$PROXY_HTTPS_PORT" = 443 ] || sfx=":$PROXY_HTTPS_PORT"
+  printf 'https://%s-%s.%s%s/' "$1" "$2" "$PROXY_DOMAIN" "$sfx"
+}
+
+# Scan every project: sets DASH_JSON (status.json) and DASH_TABLE (for 'ps').
+# Nothing here is secret on purpose — the page is readable by the host and by
+# unrestricted projects (NET-05): no tokens, no credentials, no deploy hosts.
+dashboard_scan() {
+  local running all now proxy_up=false proxy_www=false egress_up=false tls=internal
+  local d name pdir cname state started restricted sshp subnet
+  local probe svcs hits _k lp lb lproc url warns w projs="" table="" gwarns="" table_ports esc
+  local allowed sshh accept capdirs declared ndeploy listen_json svc_json d_json extra
+  esc="$(printf '\033')"
+  running="$("$ENGINE" ps --format '{{.Names}}' 2>/dev/null || true)"
+  all="$("$ENGINE" ps -a --format '{{.Names}}' 2>/dev/null || true)"
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if printf '%s\n' "$running" | grep -qx "$PROXY_NAME"; then
+    proxy_up=true
+    proxy_serves_dashboard && proxy_www=true
+  else
+    gwarns="${gwarns}proxy not running — start it with: @NIXENV@ proxy up
+"
+  fi
+  [ "$proxy_up" = true ] && [ "$proxy_www" = false ] && gwarns="${gwarns}the proxy predates the dashboard — serve this page with: @NIXENV@ proxy up
+"
+  printf '%s\n' "$running" | grep -qx "$EGRESS_NAME" && egress_up=true
+  [ -f "$PROXY_DIR/certs/wildcard.pem" ] && tls=mkcert
+
+  for d in "$PROJECTS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    case "$name" in -*|*[!a-zA-Z0-9_-]*) continue;; esac
+    pdir="$(project_dir "$name")"; cname="$(container_name "$name")"
+    state=absent; started=""
+    printf '%s\n' "$all" | grep -qx "$cname" && state=stopped
+    if printf '%s\n' "$running" | grep -qx "$cname"; then
+      state=running
+      started="$("$ENGINE" inspect -f '{{.State.StartedAt}}' "$cname" 2>/dev/null | cut -c1-19 || true)"
+    fi
+    restricted=false; is_restricted "$name" && restricted=true
+    sshp=""; [ -f "$pdir/port" ] && sshp="$(tr -cd '0-9' < "$pdir/port")"
+    extra="$(dashboard_extra_params "$name")"
+    allowed="$(dashboard_lines "$pdir/allowed_hosts")"
+    accept="$(project_accept_from "$name" 2>/dev/null || true)"
+    declared="$(dashboard_lines "$pdir/ports")"
+    capdirs=""; [ -f "$pdir/capture" ] && [ "$restricted" = true ] && capdirs="$(capture_directions "$name")"
+    ndeploy="$(dashboard_lines "$pdir/deploy_hosts" | wc -l | tr -d ' ')"
+    if [ -f "$pdir/ssh_hosts" ]; then sshh="$(dashboard_lines "$pdir/ssh_hosts" | json_list)"; else sshh=null; fi
+
+    warns=""; probe=""; hits=""
+    if [ "$state" = running ]; then
+      probe="$(dashboard_probe "$cname" || true)"
+      # Settings fixed at creation that the running container predates (RUN-15).
+      w="$(container_needs_recreate "$name" "$([ "$restricted" = true ] && echo 1 || echo 0)" 2>&1 \
+            | sed "s/$esc\[[0-9;]*m//g" | sed -n 's/^! //p' || true)"
+      [ -n "$w" ] && warns="$warns$w
+"
+      if [ "$restricted" = true ] && [ "$egress_up" = false ]; then
+        warns="${warns}egress proxy not running: this project has no network — @NIXENV@ proxy up
+"
+      fi
+    fi
+    if [ "$restricted" = true ]; then
+      subnet="$(net_subnet "$(internal_net "$name")" 2>/dev/null || true)"
+      hits="$(dashboard_egress_hits "$subnet" || true)"
+    fi
+
+    listen_json=""; table_ports=""
+    while read -r _k lp lb lproc; do
+      [ "$_k" = L ] || continue
+      # Loopback-only is often deliberate (a database): shown, not warned about.
+      if [ "$lb" = loopback ]; then
+        url=""
+        table_ports="$table_ports
+      $lp  $lproc  (127.0.0.1 only — not reachable through the proxy)"
+      else
+        url="$(dashboard_url "$name" "$lp")"
+        table_ports="$table_ports
+      $lp  $lproc  $url"
+      fi
+      listen_json="$listen_json${listen_json:+,}{\"port\":$lp,\"bind\":$(json_s "$lb"),\"proc\":$(json_s "$lproc"),\"url\":$(json_s "$url")}"
+    done <<EOF
+$probe
+EOF
+    svc_json=""; svcs=""
+    while read -r _k lp lb; do
+      [ "$_k" = S ] || continue
+      svc_json="$svc_json${svc_json:+,}{\"name\":$(json_s "$lp"),\"state\":$(json_s "$lb")}"
+      case "$lp" in sshd|proxy-relay-*) continue;; esac
+      svcs="$svcs $lp:$lb"
+      [ "$lb" = run ] || warns="${warns}service '$lp' is $lb — check: @NIXENV@ logs $name
+"
+    done <<EOF
+$probe
+EOF
+    d_json=""
+    while read -r _k lp lb; do
+      if [ "$_k" = D ]; then d_json="$d_json${d_json:+,}{\"host\":$(json_s "$lp"),\"count\":$lb}"; fi
+    done <<EOF
+$hits
+EOF
+
+    projs="$projs${projs:+,}
+{\"name\":$(json_s "$name"),\"state\":$(json_s "$state"),\"started\":$(json_s "$started"),\
+\"restricted\":$restricted,\"ssh_port\":$(json_s "$sshp"),\
+\"extra_parameters\":$(printf '%s\n' "$extra" | json_list),\
+\"allowed_hosts\":$(printf '%s\n' "$allowed" | json_list),\"ssh_hosts\":$sshh,\
+\"accept_from\":$(printf '%s\n' "$accept" | json_list),\"capture\":$(json_s "$capdirs"),\
+\"declared_ports\":$(printf '%s\n' "$declared" | json_list),\"deploy_hosts\":${ndeploy:-0},\
+\"listening\":[$listen_json],\"services\":[$svc_json],\
+\"egress_denied\":[$d_json],\
+\"warnings\":$(printf '%s' "${warns//@NIXENV@/nixenv}" | json_list)}"
+
+    table="$table
+$(printf '%-22s %-8s %-11s ssh %s' "$name" "$state" "$([ "$restricted" = true ] && echo restricted || echo open)" "${sshp:-—}")"
+    if [ "$state" = running ]; then
+      [ -n "$table_ports" ] && table="$table$table_ports" || table="$table
+      (no port listening yet — a service still starting shows up on the next 'ps')"
+      [ -n "$svcs" ] && table="$table
+      services:$svcs"
+    fi
+    if [ -n "$d_json" ]; then
+      table="$table
+      denied: $(printf '%s\n' "$hits" | awk '$1 == "D" {printf "%s%s×%s", (n++ ? " " : ""), $2, $3}')   (allow: $0 allow $name <host>)"
+    fi
+    # Commands in warnings: '$0' in the terminal, plain 'nixenv' on the page.
+    while IFS= read -r w; do
+      [ -n "$w" ] && table="$table
+      ! ${w//@NIXENV@/$0}"
+    done <<EOF
+$warns
+EOF
+  done
+
+  DASH_JSON="{\"schema\":1,\"generated\":$(json_s "$now"),\"version\":$(json_s "$NIXENV_VERSION"),\
+\"prefix\":$(json_s "$CONTAINER_PREFIX"),\"domain\":$(json_s "$PROXY_DOMAIN"),\"https_port\":$(json_s "$PROXY_HTTPS_PORT"),\
+\"engine\":$(json_s "$(basename "$ENGINE")"),\"proxy\":{\"running\":$proxy_up,\"serves_dashboard\":$proxy_www,\"tls\":$(json_s "$tls")},\
+\"egress\":{\"running\":$egress_up},\"warnings\":$(printf '%s' "${gwarns//@NIXENV@/nixenv}" | json_list),\"projects\":[$projs
+]}"
+  DASH_TABLE="${table#
+}"
+  DASH_GWARNS="$gwarns"
+}
+
+# Write the dashboard files: the static page (index.html, app.js, style.css)
+# and status.json, each via a temp file + mv so Caddy never serves half a file.
+# The directory itself is bind-mounted into the proxy: never replace it.
+write_dashboard() {
+  dashboard_scan
+  mkdir -p "$DASHBOARD_DIR"
+  dashboard_html  > "$DASHBOARD_DIR/.index.html.tmp"  && mv -f "$DASHBOARD_DIR/.index.html.tmp"  "$DASHBOARD_DIR/index.html"
+  dashboard_css   > "$DASHBOARD_DIR/.style.css.tmp"   && mv -f "$DASHBOARD_DIR/.style.css.tmp"   "$DASHBOARD_DIR/style.css"
+  dashboard_js    > "$DASHBOARD_DIR/.app.js.tmp"      && mv -f "$DASHBOARD_DIR/.app.js.tmp"      "$DASHBOARD_DIR/app.js"
+  printf '%s\n' "$DASH_JSON" > "$DASHBOARD_DIR/.status.json.tmp" \
+    && mv -f "$DASHBOARD_DIR/.status.json.tmp" "$DASHBOARD_DIR/status.json"
+}
+
+# Refresh after a lifecycle command. Best effort and silent: the page must
+# never make 'run'/'stop'/'proxy up' fail. DASHBOARD_REFRESH=0 skips it (set
+# by callers that refresh once themselves afterwards).
+dashboard_refresh() {
+  [ "${DASHBOARD_REFRESH:-1}" = 1 ] || return 0
+  ( write_dashboard ) >/dev/null 2>&1 || true
+}
+
+# A container that just started is not serving yet: setup hooks (composer,
+# npm, a first database init) and runit services take seconds to minutes to
+# listen. So 'run' also leaves ONE detached refresher behind that rescans at
+# each delay of NIXENV_DASHBOARD_DELAYS (seconds since start; empty = off)
+# and then exits. A newer one supersedes it through a token file — no kill,
+# so a recycled pid can never be hit.
+DASHBOARD_DELAYS="${NIXENV_DASHBOARD_DELAYS-10 30 90}"
+dashboard_refresh_later() {
+  [ "${DASHBOARD_REFRESH:-1}" = 1 ] && [ -n "$DASHBOARD_DELAYS" ] || return 0
+  local tokf="$PROXY_DIR/.dashboard-refresh" token
+  mkdir -p "$PROXY_DIR" || return 0
+  token="$$-$RANDOM-$(date +%s)"
+  printf '%s\n' "$token" > "$tokf" 2>/dev/null || return 0
+  (
+    trap '' HUP          # outlive the terminal 'run' was typed in
+    prev=0
+    for t in $DASHBOARD_DELAYS; do
+      case "$t" in ""|*[!0-9]*) continue;; esac
+      [ "$t" -gt "$prev" ] || continue
+      sleep $((t - prev)); prev=$t
+      [ "$(cat "$tokf" 2>/dev/null)" = "$token" ] || exit 0   # superseded
+      ( write_dashboard ) || true
+    done
+    [ "$(cat "$tokf" 2>/dev/null)" = "$token" ] && rm -f "$tokf"
+    exit 0
+  ) </dev/null >/dev/null 2>&1 &
+}
+
+# Does the running proxy serve the dashboard? Only one created with the /www
+# mount does (fixed at creation). An older one answers the bare domain with an
+# EMPTY 200 (no matching site), which looks like a blank page.
+proxy_serves_dashboard() {
+  "$ENGINE" inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$PROXY_NAME" 2>/dev/null \
+    | tr ' ' '\n' | grep -qx /www
+}
+
+dashboard_page_url() {
+  local sfx=""
+  [ "$PROXY_HTTPS_PORT" = 443 ] || sfx=":$PROXY_HTTPS_PORT"
+  printf 'https://%s%s/' "$PROXY_DOMAIN" "$sfx"
+}
+
+# The dashboard scrolled to (and highlighting) one project's card.
+dashboard_project_url() { printf '%s#project-%s' "$(dashboard_page_url)" "$1"; }
+
+cmd_ps() {
+  require_engine
+  local mode=table every=5
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) mode=json;;
+      --watch) mode=watch
+        case "${2:-}" in ""|-*) ;; *) every="$2"; shift;; esac;;
+      --watch=*) mode=watch; every="${1#--watch=}";;
+      *) die "usage: $0 ps [--json] [--watch [seconds]]";;
+    esac
+    shift
+  done
+  case "$every" in ""|*[!0-9]*|0) die "--watch needs a whole number of seconds (got '$every')";; esac
+
+  case "$mode" in
+    json)
+      write_dashboard
+      printf '%s\n' "$DASH_JSON"
+      ;;
+    table)
+      write_dashboard
+      dashboard_print
+      ;;
+    watch)
+      while :; do
+        write_dashboard
+        [ -t 1 ] && printf '\033[H\033[2J'
+        dashboard_print
+        echo "   refreshing every ${every}s — Ctrl-C to stop"
+        sleep "$every"
+      done
+      ;;
+  esac
+}
+
+dashboard_print() {
+  if [ -n "$DASH_TABLE" ]; then
+    printf '%s\n' "$DASH_TABLE"
+  else
+    warn "No projects yet — create one with '$0 init <project>'"
+  fi
+  local w
+  while IFS= read -r w; do [ -n "$w" ] && warn "${w//@NIXENV@/$0}"; done <<EOF
+$DASH_GWARNS
+EOF
+  echo "   dashboard: $(dashboard_page_url)   (refreshed by ps, run, stop, proxy up/reload)"
+}
+
+# The dashboard page: static files, the same design as docs/index.html (paper
+# by day, blueprint by night). All data comes from status.json and is rendered
+# with textContent only — never innerHTML — under a CSP that allows no inline
+# script (Caddy sets it). Read-only on purpose: no buttons that DO anything,
+# since any web page you visit can send requests to $PROXY_DOMAIN.
+# Escape text for an HTML element body (& first).
+html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+# The model project flake the dashboard's "New project" section shows. A COPY
+# of templates/flake.nix (nixenv.sh is self-contained, CORE-01). TPL-14: the two
+# MUST stay identical — edit both in the same commit; a unit test enforces it.
+dashboard_model_flake() {
+  cat <<'NIXENV_MODEL_FLAKE'
+# =============================================================================
+# Per-project flake template (for use INSIDE a project's git repository)
+# =============================================================================
+# WHAT THIS FILE IS
+# -----------------
+# Copy this file to the root of a project repo as `flake.nix`. It declares the
+# EXTRA tooling that THIS project needs, on top of a shared base toolchain.
+#
+# It is consumed by `nixenv` (the local container dev-environment tool):
+#
+#   nixenv build <project>          # builds this flake into the project's profile
+#   nixenv init <project> <url> --build
+#
+# HOW NIXENV USES IT (important context for an LLM editing this file)
+# ------------------------------------------------------------------
+#   * Every project container already has a SHARED base toolchain on PATH
+#     (git, zsh, ripgrep, fd, jq, tmux, zellij, Node, Go, Rust, PHP, Python, uv,
+#     the Claude CLI, …). Do NOT re-declare those here — only add what's missing.
+#   * `nixenv build <project>` extracts THIS `flake.nix` (and `flake.lock`) from
+#     the project's code volume, then runs roughly:
+#         nix profile install path:/flake#default \
+#           --profile /nix/var/nix/profiles/proj-<project>
+#     i.e. it installs the output attribute `packages.<system>.default`.
+#   * That per-project profile is mounted read-only and put on PATH *ahead of*
+#     the base profile, so the container sees: base tools ∪ these extras, and an
+#     entry here can SHADOW a base tool (e.g. pin a different Node version).
+#   * Everything is built into ONE shared Nix store, so any package that already
+#     exists (from the base or another project) is reused, not rebuilt.
+#
+# RULES / CONSTRAINTS (an LLM must respect these)
+# -----------------------------------------------
+#   1. The default output MUST be `packages.<system>.default` and MUST be a
+#      single derivation that yields a `bin/` (a `pkgs.buildEnv` is ideal).
+#      (The attribute name can be changed via the env var PROJECT_ATTR, but
+#      `default` is the convention — keep it unless told otherwise.)
+#   2. Pin `nixpkgs` to the SAME channel the base uses (currently
+#      `nixos-26.05`). Matching it means packages are shared in the store and
+#      versions stay consistent. A different pin still works but downloads a
+#      second nixpkgs and dedupes less.
+#   3. Only the flake files (`flake.nix` + `flake.lock`) are extracted from the
+#      repo at build time. Therefore this flake MUST be self-contained: do NOT
+#      reference other local files in the repo (no `./overlays/x.nix`, no
+#      `src = ./.`, no building the project itself). Declare DEPENDENCIES only.
+#   4. Target Linux systems only — the build runs inside a Linux container.
+#   5. Commit `flake.lock` for reproducible builds (run `nix flake lock`).
+#
+# This flake is also a normal flake: developers can use it directly on a host
+# with Nix via `nix build` / `nix develop` (see the devShell at the bottom).
+# =============================================================================
+
+{
+  description = "Project-specific dev dependencies (layered on the nixenv base toolchain)";
+
+  inputs = {
+    # Keep this pin equal to the nixenv base toolchain (nixos-26.05) so the
+    # shared Nix store is reused and tool versions line up.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+
+    # OPTIONAL: a second input for bleeding-edge tools not yet in the stable
+    # channel. Uncomment and use `unstable.<pkg>` in `paths` below if needed.
+    # nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
+  };
+
+  outputs = { self, nixpkgs, ... }:
+    let
+      # Containers run on Linux; cover both common CPU arches so the flake
+      # builds whether the host is x86_64 or Apple-silicon/ARM.
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      forAllSystems = nixpkgs.lib.genAttrs systems;
+
+      # Per-system nixpkgs instance. `allowUnfree = true` mirrors the base so
+      # unfree packages (if you need any) evaluate; drop it if you prefer.
+      pkgsFor = system: import nixpkgs {
+        inherit system;
+        config.allowUnfree = true;
+      };
+    in
+    {
+      # -----------------------------------------------------------------------
+      # packages.<system>.default — THIS is what `nixenv build <project>`
+      # installs into the project's profile. It must produce a `bin/`.
+      #
+      # `buildEnv` merges several packages into a single environment whose `bin`
+      # is what ends up on PATH. Add the project's extra tools to `paths`.
+      # Remember: base tools are already available — list only what's missing or
+      # what you want to pin to a specific version.
+      # -----------------------------------------------------------------------
+      packages = forAllSystems (system:
+        let
+          pkgs = pkgsFor system;
+
+          # --- Custom /etc/hosts entries (optional) ---------------------------
+          # nixenv merges a file shipped by this profile at etc/hosts.extra into
+          # the container's /etc/hosts on every start. Declare the entries here in
+          # native /etc/hosts format ("<ip><TAB or spaces><name>"), one per line.
+          # `writeTextDir` produces a derivation containing exactly
+          # $out/etc/hosts.extra, which buildEnv (below) merges into the profile.
+          # Leave the list empty (or drop `hostsExtra` from `paths`) for none.
+          hostsExtra = pkgs.writeTextDir "etc/hosts.extra" ''
+            10.0.0.5      db
+            10.0.0.6      cache.internal
+            127.0.0.1     api.local
+          '';
+
+          # --- Startup hook (optional) ----------------------------------------
+          # DECLARED here at build time, EXECUTED at container start: nixenv
+          # SOURCES etc/nixenv-hooks.sh from this profile before any service
+          # (incl. sshd) starts. This is the only way to run project code at
+          # startup — a Nix build is sandboxed to its own $out and can never
+          # write $HOME. The hook runs in the real container, as the app user,
+          # with this profile already first on PATH.
+          # Handy variables: $SVROOT ($HOME/.nixenv-sv), $NIXENV_APP_MOUNT,
+          # $NIXENV_PROJECT, $NIXENV_EXTRA_PROFILE.
+          # Anything it writes into $SVROOT/<name>/run is supervised THIS boot.
+          #
+          # Simplest form — the file is sourced, so top-level code just runs.
+          # A <project>-setup script shipped by this same flake is on PATH:
+          startupHook = pkgs.writeTextDir "etc/nixenv-hooks.sh" ''
+            myproject-setup
+          '';
+          # Equivalent using the optional hook FUNCTION instead. Use this form if
+          # you want a repo/home hook to be able to override it (last definition
+          # wins), or if the body needs `return` — never `exit` at top level,
+          # which would terminate the entrypoint:
+          #
+          #   startupHook = pkgs.writeTextDir "etc/nixenv-hooks.sh" '''
+          #     nixenv_pre_ssh_start() {
+          #       mkdir -p "$SVROOT/supervisord"
+          #       install -Dm755 ${"\${supervisordRun}"}/bin/run "$SVROOT/supervisord/run"
+          #     }
+          #   ''';
+        in {
+          default = pkgs.buildEnv {
+            name = "project-deps";
+
+            # Pull in man pages too (skip "doc" — some packages fail to build it).
+            extraOutputsToInstall = [ "man" ];
+
+            # >>> EDIT THIS LIST <<<  — the project's extra dependencies.
+            # These are EXAMPLES; replace with what your project actually needs.
+            paths = with pkgs; [
+              # --- Example: pin a specific language runtime (shadows the base) ---
+              # nodejs_22            # base already provides Node 22; override here if needed
+
+              # --- Example: databases / infra clients ---
+              # postgresql_16        # provides psql, pg_dump, …
+              # redis                # redis-cli
+              # awscli2
+              # terraform
+              # kubectl
+
+              # --- Example: project build tools / linters ---
+              # gnumake
+              # shellcheck
+              # hadolint
+
+              # --- Example: a process supervisor to run at container startup ---
+              # python3Packages.supervisor   # provides `supervisord` / `supervisorctl`
+              #   (see "RUNNING SERVICES AT STARTUP" at the bottom of this file)
+
+              # A harmless placeholder so the env is non-empty and builds even
+              # before you add anything. Remove once you add real deps.
+              pkgs.hello
+
+              # --- Custom /etc/hosts entries (see `hostsExtra` above) ---
+              # Ships etc/hosts.extra in the profile; nixenv merges it into the
+              # container's /etc/hosts at start. Remove this line to disable.
+              hostsExtra
+
+              # --- Startup hook (see `startupHook` above) ---
+              # Ships etc/nixenv-hooks.sh; nixenv sources it and calls
+              # nixenv_pre_ssh_start before services start. Remove to disable.
+              startupHook
+
+              # --- Example using the optional unstable input (see inputs above) ---
+              # unstable.some-bleeding-edge-tool
+            ];
+          };
+        });
+
+      # -----------------------------------------------------------------------
+      # devShells.default — OPTIONAL, for developers running this flake directly
+      # on a host with Nix (`nix develop`). nixenv does NOT use this; it only
+      # installs `packages.<system>.default`. Kept in sync for convenience.
+      # -----------------------------------------------------------------------
+      devShells = forAllSystems (system:
+        let pkgs = pkgsFor system;
+        in {
+          default = pkgs.mkShell {
+            packages = [ self.packages.${system}.default ];
+          };
+        });
+    };
+}
+
+# =============================================================================
+# RUNNING SERVICES AT STARTUP (runit) — e.g. supervisord
+# =============================================================================
+# This flake only puts tools on PATH. To actually RUN a process when the project
+# container starts, add a runit service to your repo. nixenv supervises sshd via
+# `runit`, and at boot it picks up any service you define at:
+#
+#     <repo>/.nixenv/sv/<name>/run        (an executable shell script)
+#
+# Each `run` must exec a FOREGROUND (non-daemonising) process — runit restarts it
+# if it exits. The service runs as your container user, with this flake's tools
+# (and the base toolchain) on PATH.
+#
+# ── Example: run supervisord ────────────────────────────────────────────────
+# 1. Add the package above:   python3Packages.supervisor
+# 2. Create an executable run script in the repo:
+#
+#      mkdir -p .nixenv/sv/supervisord
+#      cat > .nixenv/sv/supervisord/run <<'SH'
+#      #!/bin/sh
+#      exec supervisord -n -c /app/supervisord.conf
+#      SH
+#      chmod +x .nixenv/sv/supervisord/run
+#
+#    (`-n` keeps supervisord in the foreground so runit can supervise it.)
+# 3. Commit your supervisord.conf at the repo root (it's mounted at /app).
+# 4. Build + (re)start the project:
+#
+#      nixenv build <project>      # so `supervisord` is on PATH
+#      nixenv stop <project> && nixenv run <project>
+#
+# Then `supervisorctl` (also on PATH) manages your supervisord-defined processes.
+# Add more services the same way: one <repo>/.nixenv/sv/<name>/run per service.
+#
+# ── Alternative: declare the service from THIS flake ────────────────────────
+# A flake build is sandboxed — it can only write to its own $out in the store,
+# so it can NEVER create files in $HOME (e.g. ~/.nixenv-sv/<name>/run) or in the
+# app volume. To ship a service with the toolchain instead of the repo, use the
+# STARTUP HOOK (`startupHook` above): the flake declares etc/nixenv-hooks.sh at
+# build time, and nixenv calls `nixenv_pre_ssh_start` at container start — in
+# the real container, where writing to $HOME works. Services it creates in
+# $SVROOT are supervised in the same boot.
+# =============================================================================
+
+# =============================================================================
+# PER-PROJECT HOME OVERRIDES (<repo>/.nixenv/home/)
+# =============================================================================
+# The container's home (dotfiles: nvim, zsh, git, tmux, ssh config) comes from a
+# shared skeleton baked into nixenv. To customise it FOR THIS PROJECT, commit
+# files under <repo>/.nixenv/home/ mirroring their path in $HOME, e.g.:
+#
+#     .nixenv/home/.config/nvim/lua/plugins/extra.lua
+#     .nixenv/home/.zshrc                    # replaces the shared .zshrc
+#
+# Apply them into the project's home volume with:
+#
+#     nixenv sync-home <project>
+#
+# sync-home lays down the shared skeleton first, then these overrides on top
+# (yours win). It backs up any file it overwrites to
+# ~/.nixenv/home-backups/<timestamp> in the volume, and never touches installed
+# nvim plugins, shell history, or your git credentials. Re-run it whenever you
+# change these files or nixenv ships new defaults.
+# =============================================================================
+
+# =============================================================================
+# CUSTOM /etc/hosts ENTRIES (declared in this flake — see `hostsExtra` above)
+# =============================================================================
+# The container's /etc/hosts is non-root and engine-managed, so you can't edit it
+# in place. Instead nixenv rebuilds it at every container start from base entries
+# plus a file this flake ships in its profile: etc/hosts.extra.
+#
+# Declare the entries with `pkgs.writeTextDir "etc/hosts.extra" ''…''` (native
+# /etc/hosts format) and add the result to `buildEnv.paths` — both already shown
+# above. Then build + restart to apply:
+#
+#     nixenv build <project>
+#     nixenv stop <project> && nixenv run <project>
+#     getent hosts db          # -> 10.0.0.5  db
+#
+# Precedence: base localhost lines + "127.0.1.1 <hostname>", then this flake's
+# etc/hosts.extra, then the host-side ~/.nixenv/projects/<project>/hosts.extra
+# (a local-only override you can also manage with `nixenv host <project> …`).
+# Committing the entries here keeps them versioned and shared with your team.
+# =============================================================================
+NIXENV_MODEL_FLAKE
+}
+
+dashboard_html() {
+  cat <<'NIXENV_DASHBOARD_HTML'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nixenv projects</title>
+<meta name="description" content="Running nixenv projects, their open ports and egress settings.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='3' width='26' height='26' fill='none' stroke='%231d4ed8' stroke-width='3'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%231d4ed8'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="frame">
+  <div class="sheet">
+    <div class="cell brand"><span>project</span><b>nixenv</b></div>
+    <div class="cell"><span>rev</span><b id="rev">—</b></div>
+    <div class="cell"><span>engine</span><b id="engine">—</b></div>
+    <div class="cell"><span>surveyed</span><b id="generated">—</b></div>
+    <nav>
+      <a href="#projects">Projects</a>
+      <a href="#commands">Commands</a>
+      <a href="#new-project">New project</a>
+      <input id="filter" type="search" placeholder="filter projects" aria-label="Filter projects" autocomplete="off">
+      <button class="toggle" id="sheetToggle" type="button" aria-label="Switch between paper and blueprint">Blueprint</button>
+    </nav>
+  </div>
+</header>
+
+<main class="sheet">
+  <div class="hero">
+    <span class="eyebrow">nixenv · local dashboard</span>
+    <h1>What runs <em>where</em>.</h1>
+    <p class="lede">Every project on this machine: whether it is running, the ports
+      its services <strong>really listen on</strong> (with their
+      <code>https://&lt;project&gt;-&lt;port&gt;</code> links), and the hosts it is
+      allowed to reach. Updated when you start or stop a project, or run
+      <code>nixenv ps</code>. Read-only: nothing on this page can change your projects.</p>
+  </div>
+
+  <div class="strip" id="strip" aria-live="polite"></div>
+  <div id="globalNotes"></div>
+
+  <section id="projects">
+    <div class="sec-head">
+      <div class="sec-no">01 · Rooms</div>
+      <div>
+        <h2>Projects</h2>
+        <p>Running projects first. Each card's <b>survey</b> lists its allowlist,
+          peers, capture, ssh port and extra engine parameters.</p>
+      </div>
+    </div>
+    <div class="rooms" id="rooms"><p class="empty">Loading status.json…</p></div>
+  </section>
+
+  <section id="commands">
+    <div class="sec-head">
+      <div class="sec-no">02 · Commands</div>
+      <div>
+        <h2>Command reference</h2>
+        <p>Run them on the host, as <code>nixenv &lt;command&gt;</code> (from a clone:
+          <code>./nixenv.sh</code>). Most changes apply when a project is next
+          started; <code>nixenv --help</code> has the full reference.</p>
+      </div>
+    </div>
+    <div class="ref-group">
+      <h3>Projects</h3>
+      <table class="ref">
+        <thead><tr><th>command</th><th>what it does</th><th>example</th></tr></thead>
+        <tbody>
+          <tr><td>init &lt;project&gt; [git-url]<span class="opt">--branch=&lt;name&gt;  --template=&lt;name|url|path&gt;  --build  --unrestricted  --allow=host,…  --app-path=/path  --yes  --force</span></td><td>Create a project. Clones git-url if given; its forge host is allowed automatically.</td><td><pre class="ex">nixenv init shop git@github.com:me/shop.git
+nixenv init blog --template=wordpress --yes</pre></td></tr>
+          <tr><td>start &lt;project&gt;<span class="opt">alias: run</span></td><td>Start the project as a background service; prints its ssh port.</td><td><pre class="ex">nixenv start shop</pre></td></tr>
+          <tr><td>up &lt;project&gt;</td><td>Build the project&#x27;s flake if needed, then start it.</td><td><pre class="ex">nixenv up shop</pre></td></tr>
+          <tr><td>ssh &lt;project&gt;<span class="opt">with ssh-config: ssh &lt;project&gt;.&lt;session&gt; re-attaches a zmx session</span></td><td>SSH into the running project (starts it if needed).</td><td><pre class="ex">nixenv ssh shop
+ssh shop.api</pre></td></tr>
+          <tr><td>shell &lt;project&gt;</td><td>Interactive zsh through the engine&#x27;s exec — no ssh key needed.</td><td><pre class="ex">nixenv shell shop</pre></td></tr>
+          <tr><td>ps<span class="opt">--json  --watch [N]</span></td><td>What runs where: listening ports, proxy URLs, services, egress. Rewrites this page.</td><td><pre class="ex">nixenv ps
+nixenv ps --watch 30</pre></td></tr>
+          <tr><td>projects</td><td>List projects with their ssh port and state.</td><td><pre class="ex">nixenv projects</pre></td></tr>
+          <tr><td>logs &lt;project&gt;</td><td>Follow the project container&#x27;s logs.</td><td><pre class="ex">nixenv logs shop</pre></td></tr>
+          <tr><td>stop [&lt;project&gt;]</td><td>Stop and remove the container. No argument: every nixenv container. Volumes are kept.</td><td><pre class="ex">nixenv stop shop
+nixenv stop</pre></td></tr>
+          <tr><td>sync-home &lt;project&gt;</td><td>Refresh dotfiles in the existing home volume (backs up what it replaces).</td><td><pre class="ex">nixenv sync-home shop</pre></td></tr>
+          <tr><td>delete &lt;project&gt;<span class="opt">alias: rm</span></td><td>Permanently remove a project: container, volumes, settings. Shows the commands and asks first.</td><td><pre class="ex">nixenv delete shop</pre></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="ref-group">
+      <h3>Ports, proxy and egress</h3>
+      <table class="ref">
+        <thead><tr><th>command</th><th>what it does</th><th>example</th></tr></thead>
+        <tbody>
+          <tr><td>expose &lt;project&gt; &lt;port&gt;…<span class="opt">N  or  host:container</span></td><td>Publish extra ports on 127.0.0.1 (stored in &lt;project&gt;/ports); restarts the project.</td><td><pre class="ex">nixenv expose shop 8080 3000:3000</pre></td></tr>
+          <tr><td>host &lt;project&gt; &lt;name:ip&gt;…</td><td>Add /etc/hosts entries (stored in &lt;project&gt;/hosts.extra).</td><td><pre class="ex">nixenv host shop shop-8000.nixenv.localhost:127.0.0.1</pre></td></tr>
+          <tr><td>proxy [action]<span class="opt">up  reload  stop  status  logs [egress]  renew  remove-cert</span></td><td>The shared HTTPS proxy: https://&lt;project&gt;-&lt;port&gt;.nixenv.localhost/ and this page.</td><td><pre class="ex">nixenv proxy up
+nixenv proxy reload</pre></td></tr>
+          <tr><td>restrict &lt;project&gt; [on|off]</td><td>Egress restriction — on by default: only hosts in allowed_hosts are reachable.</td><td><pre class="ex">nixenv restrict shop off</pre></td></tr>
+          <tr><td>allow &lt;project&gt; &lt;host&gt;…<span class="opt">*.example.com = its subdomains; a bare name is exact</span></td><td>Allow egress host(s); reloads squid without a restart.</td><td><pre class="ex">nixenv allow shop registry.npmjs.org</pre></td></tr>
+          <tr><td>egress &lt;project&gt; [-f]<span class="opt">-f  follow live</span></td><td>Allowed vs denied egress hosts from the squid log.</td><td><pre class="ex">nixenv egress shop -f</pre></td></tr>
+          <tr><td>capture &lt;project&gt; [action]<span class="opt">on [egress|ingress]  off  untrust  status  web  log [-f]  tui  har &lt;file&gt;  clear</span></td><td>Record a restricted project&#x27;s HTTP(S) traffic with mitmproxy, behind squid.</td><td><pre class="ex">nixenv capture shop on
+nixenv capture shop web</pre></td></tr>
+          <tr><td>ssh-config [--install]<span class="opt">--install</span></td><td>Add the Include that makes ssh &lt;project&gt; work from your shell.</td><td><pre class="ex">nixenv ssh-config --install</pre></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="ref-group">
+      <h3>Deploy and data</h3>
+      <table class="ref">
+        <thead><tr><th>command</th><th>what it does</th><th>example</th></tr></thead>
+        <tbody>
+          <tr><td>deploy &lt;project&gt; [-- &lt;command&gt;…]<span class="opt">--agent=&lt;socket&gt;  --no-agent  ·  allow &lt;host&gt;…  hosts  log [-f]  stop</span></td><td>A throwaway container with your ssh agent forwarded (never into the dev container).</td><td><pre class="ex">nixenv deploy shop
+nixenv deploy shop -- ansible-playbook site.yml</pre></td></tr>
+          <tr><td>export &lt;project&gt; [file]<span class="opt">--with-home  --force</span></td><td>Archive the project: code, databases and settings (not the Nix store).</td><td><pre class="ex">nixenv export shop shop.tar</pre></td></tr>
+          <tr><td>import &lt;file&gt; [new-name]<span class="opt">--force  --yes</span></td><td>Restore an archive; settings that change how it runs ask first.</td><td><pre class="ex">nixenv import shop.tar shop2</pre></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="ref-group">
+      <h3>Toolchain and housekeeping</h3>
+      <table class="ref">
+        <thead><tr><th>command</th><th>what it does</th><th>example</th></tr></thead>
+        <tbody>
+          <tr><td>build [&lt;project&gt;]<span class="opt">--dir=&lt;path&gt;  (remembered; --dir= clears it)</span></td><td>No project: build the shared toolchain. With one: build its own flake on top.</td><td><pre class="ex">nixenv build
+nixenv build shop --dir=nix</pre></td></tr>
+          <tr><td>update</td><td>Refresh flake.lock, then rebuild the shared toolchain.</td><td><pre class="ex">nixenv update</pre></td></tr>
+          <tr><td>gc [--dry-run]<span class="opt">--dry-run</span></td><td>Garbage-collect the store: old generations and unreachable paths.</td><td><pre class="ex">nixenv gc --dry-run</pre></td></tr>
+          <tr><td>status</td><td>Context, store volume and profile state.</td><td><pre class="ex">nixenv status</pre></td></tr>
+          <tr><td>github-token<span class="opt">--status  --clear</span></td><td>Optional token so Nix avoids GitHub&#x27;s anonymous rate limit.</td><td><pre class="ex">nixenv github-token --status</pre></td></tr>
+          <tr><td>clean</td><td>Delete the store volume (every shared package).</td><td><pre class="ex">nixenv clean</pre></td></tr>
+          <tr><td>install · uninstall</td><td>Copy this script onto your PATH as nixenv, or remove it.</td><td><pre class="ex">./nixenv.sh install</pre></td></tr>
+          <tr><td>--help · --version</td><td>Full reference in the terminal, and the version.</td><td><pre class="ex">nixenv --help</pre></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="ref-group">
+      <h3>Project settings — ~/.nixenv/projects/&lt;project&gt;/</h3>
+      <table class="ref files">
+        <thead><tr><th>file</th><th>what it holds</th></tr></thead>
+        <tbody>
+          <tr><td>allowed_hosts</td><td>egress hosts, one per line (allow appends)</td></tr>
+          <tr><td>ssh_hosts</td><td>hosts reachable on port 22; empty = none</td></tr>
+          <tr><td>accept-from</td><td>projects allowed to reach this one through the proxy; * = all</td></tr>
+          <tr><td>unrestricted</td><td>present = egress restriction off (restrict … off)</td></tr>
+          <tr><td>ports</td><td>extra published ports (expose appends)</td></tr>
+          <tr><td>hosts.extra</td><td>extra /etc/hosts lines (host appends)</td></tr>
+          <tr><td>extra-parameters</td><td>engine flags passed verbatim to the container&#x27;s run</td></tr>
+          <tr><td>deploy_hosts</td><td>extra egress hosts for deploy only</td></tr>
+          <tr><td>capture</td><td>capture directions (capture … on writes it)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="new-project">
+    <div class="sec-head">
+      <div class="sec-no">03 · New project</div>
+      <div>
+        <h2>Bring an existing project in</h2>
+        <p>The shared toolbox has no language runtimes: each project brings its
+          own with a <code>flake.nix</code>, built into its own profile.</p>
+      </div>
+    </div>
+    <p class="honest"><b>Build on the host</b> A project container cannot build
+      its flake: the Nix store is mounted <b>read-only</b> and no container gets the
+      engine socket. Edit <code>flake.nix</code> anywhere (inside the container
+      too, it lives in the app volume), then run <code>nixenv build &lt;project&gt;</code>
+      in a terminal on the host. A throwaway builder container does the work and
+      the project picks the new profile up on its next start.</p>
+    <p class="honest"><b>No root, ever</b> Everything in the container runs as the
+      <code>app</code> user, with your host uid: no <code>sudo</code>, no root
+      password, every capability dropped, no privilege escalation. So
+      <code>apt-get install</code> cannot work. Tools come from the flake; quick
+      personal installs go to <code>~/.local/bin</code> (<code>pip --user</code>,
+      <code>pipx</code>, a downloaded binary), first on PATH. Services listen on
+      any port, 80 included, without root.</p>
+    <ol class="steps">
+      <li><b>Create the project from its repository.</b> The code is cloned into the
+        project's app volume, and the forge host is allowed out.
+        <pre class="ex">nixenv init shop git@github.com:me/shop.git</pre></li>
+      <li><b>Add a <code>flake.nix</code> at the repo root</b>: the runtime and its
+        language server, services as <code>sv/&lt;name&gt;/run</code> files, and a
+        startup hook for first-run setup. Start from this model and commit it,
+        so the whole team shares the toolchain.
+        <details class="model">
+          <summary><code>flake.nix</code> · the model (same as <code>templates/flake.nix</code>)</summary>
+          <button class="copy" type="button" data-copy="model-flake" hidden>Copy</button>
+          <pre id="model-flake">
+NIXENV_DASHBOARD_HTML
+  dashboard_model_flake | html_escape
+  cat <<'NIXENV_DASHBOARD_HTML_2'
+</pre>
+        </details></li>
+      <li><b>Build it, from the host.</b> Only <code>flake.nix</code> and <code>flake.lock</code>
+        are copied. If the flake lives in a folder or references local files, pass
+        <code>--dir</code> once (it is remembered).
+        <pre class="ex">nixenv build shop
+nixenv build shop --dir=nix</pre></li>
+      <li><b>Allow what setup downloads.</b> Egress is restricted by default; a
+        refused host shows up as <code>TCP_DENIED</code> in <code>egress</code>.
+        <pre class="ex">nixenv allow shop registry.npmjs.org
+nixenv egress shop</pre></li>
+      <li><b>Start it and get in.</b> The service answers on
+        <code>https://shop-3000.nixenv.localhost/</code>; its card above shows the
+        ports actually listening.
+        <pre class="ex">nixenv start shop
+nixenv ssh shop</pre></li>
+      <li><b>Iterate.</b> After editing the flake, <code>build</code> again, then
+        <code>stop</code> and <code>start</code>. Without touching the flake, the repo can
+        also declare <code>.nixenv/sv/&lt;name&gt;/run</code> (services),
+        <code>.nixenv/hooks.sh</code> (startup hook) and <code>.nixenv/home/</code>
+        (dotfiles, applied by <code>sync-home</code>).</li>
+    </ol>
+  </section>
+
+  <noscript><p class="honest"><b>No script</b> This page renders status.json with
+    JavaScript. In a terminal: <code>nixenv ps</code>.</p></noscript>
+</main>
+
+<footer>
+  <div class="sheet">
+    <span>nixenv · refreshed by <code>ps</code>, <code>run</code>, <code>stop</code>, <code>proxy up</code></span>
+    <span><code>nixenv ps --watch</code> keeps this page live</span>
+    <span id="age">Drawn to no particular scale.</span>
+  </div>
+</footer>
+</body>
+</html>
+NIXENV_DASHBOARD_HTML_2
+}
+
+dashboard_css() {
+  cat <<'NIXENV_DASHBOARD_CSS'
+/* Two sheets, as in docs/index.html: drafting paper (light) and blueprint (dark). */
+:root {
+  --paper: #f4f1e8; --paper-2: #ebe6d6; --ink: #1b2a4a; --ink-soft: #4a5873;
+  --line: #1d4ed8; --line-soft: rgba(29, 78, 216, .16); --grid: rgba(29, 78, 216, .07);
+  --accent: #d9480f; --ok: #2b8a3e; --code-bg: #1b2a4a; --code-ink: #e9eef9;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  color-scheme: light;
+}
+:root[data-sheet="blueprint"] {
+  --paper: #0f2f5c; --paper-2: #0c2750; --ink: #e6efff; --ink-soft: #a9bfe3;
+  --line: #9cc3ff; --line-soft: rgba(156, 195, 255, .22); --grid: rgba(156, 195, 255, .09);
+  --accent: #ffb86b; --ok: #8ce99a; --code-bg: #081d3d; --code-ink: #e6efff;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background-color: var(--paper); color: var(--ink); font: 16px/1.55 var(--sans);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+    linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 120px 120px, 120px 120px, 24px 24px, 24px 24px;
+  transition: background-color .5s, color .5s;
+}
+a { color: var(--line); text-underline-offset: 3px; }
+a:hover { color: var(--accent); }
+code, kbd, pre { font-family: var(--mono); font-size: .88em; }
+:not(pre) > code { background: var(--line-soft); padding: .1em .35em; border-radius: 3px; overflow-wrap: anywhere; }
+.sheet { max-width: 1160px; margin: 0 auto; padding: 0 16px; }
+
+/* Title block */
+.frame {
+  position: sticky; top: 0; z-index: 10; backdrop-filter: blur(6px);
+  background: color-mix(in srgb, var(--paper) 88%, transparent); border-bottom: 1.5px solid var(--ink);
+}
+.frame .sheet { display: flex; align-items: stretch; }
+.frame .cell {
+  padding: 10px 16px; border-right: 1px solid var(--line-soft);
+  font: 11px/1.3 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-soft);
+}
+.frame .cell b { display: block; color: var(--ink); font-size: 13px; letter-spacing: .04em; }
+.frame .brand b { font-size: 16px; text-transform: none; letter-spacing: 0; }
+.frame nav { margin-left: auto; display: flex; align-items: center; gap: 8px; padding-left: 12px; }
+.frame nav a { font: 12px var(--mono); text-decoration: none; color: var(--ink-soft); padding: 6px 8px; border-radius: 4px; }
+.frame nav a:hover { color: var(--ink); background: var(--line-soft); }
+html { scroll-behavior: smooth; scroll-padding-top: 64px; }
+#filter {
+  font: 12px var(--mono); color: var(--ink); background: var(--paper); width: 12em;
+  border: 1px solid var(--line-soft); border-radius: 4px; padding: 6px 8px;
+}
+#filter:focus { outline: 2px solid var(--accent); outline-offset: 0; }
+.toggle {
+  font: 11px var(--mono); text-transform: uppercase; letter-spacing: .08em; cursor: pointer;
+  background: none; border: 1px solid var(--ink); color: var(--ink); padding: 6px 10px; border-radius: 999px;
+}
+.toggle:hover { background: var(--ink); color: var(--paper); }
+@media (max-width: 820px) {
+  .frame .cell:not(.brand) { display: none; }
+  #filter { width: 8em; }
+}
+
+/* Hero */
+.hero { padding: 48px 0 28px; }
+.eyebrow {
+  font: 12px var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--accent);
+  display: inline-flex; align-items: center; gap: 10px;
+}
+.eyebrow::before { content: ""; width: 28px; height: 1.5px; background: currentColor; }
+h1 { font: 400 clamp(34px, 5vw, 56px)/1.05 var(--serif); letter-spacing: -.02em; margin: 14px 0 14px; }
+h1 em { font-style: italic; color: var(--line); }
+.lede { font-size: 18px; color: var(--ink-soft); max-width: 40em; margin: 0; }
+.lede strong { color: var(--ink); }
+
+/* Status strip: the drawing's legend */
+.strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); border: 1.5px solid var(--ink); background: var(--paper); margin: 8px 0 18px; }
+.strip > div { padding: 12px 16px; border-right: 1px solid var(--line-soft); }
+.strip > div:last-child { border-right: 0; }
+.strip span { display: block; font: 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-soft); }
+.strip b { font: 600 15px var(--mono); }
+.good { color: var(--ok); } .bad { color: var(--accent); }
+
+/* Sections */
+section { padding: 36px 0 56px; border-top: 1.5px solid var(--ink); }
+.sec-head { display: grid; grid-template-columns: 120px 1fr; gap: 24px; margin-bottom: 26px; }
+@media (max-width: 720px) { .sec-head { grid-template-columns: 1fr; gap: 6px; } }
+.sec-no { font: 12px var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--accent); padding-top: 10px; }
+h2 { font: 400 clamp(28px, 4vw, 38px)/1.1 var(--serif); margin: 0 0 8px; }
+.sec-head p { margin: 0; color: var(--ink-soft); max-width: 44em; }
+
+/* Project cards: pinned sheets */
+/* One project per line; inside, ports + services + notes | the survey. */
+.rooms { display: grid; grid-template-columns: 1fr; gap: 24px; }
+.pin .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 0 32px; }
+.pin .cols > * { min-width: 0; }
+@media (max-width: 760px) { .pin .cols { grid-template-columns: 1fr; } }
+.pin .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; margin-bottom: 4px; }
+.pin .head .sub { margin-bottom: 0; }
+.pin {
+  border: 1.5px solid var(--ink); background: var(--paper); padding: 18px 18px 14px; position: relative;
+  box-shadow: 5px 5px 0 var(--line-soft); min-width: 0;
+}
+.pin.off { opacity: .72; box-shadow: none; border-style: dashed; }
+.pin { scroll-margin-top: 16px; }
+.pin.focus { border-color: var(--accent); box-shadow: 5px 5px 0 var(--accent); opacity: 1; }
+.pin .permalink { color: inherit; text-decoration: none; }
+.pin .permalink:hover { text-decoration: underline; }
+.pin::after {
+  content: attr(data-tag); position: absolute; top: -11px; right: 14px; background: var(--paper);
+  border: 1.5px solid var(--accent); color: var(--accent); font: 10px var(--mono); letter-spacing: .1em;
+  text-transform: uppercase; padding: 2px 8px; border-radius: 999px;
+}
+.pin.running::after { border-color: var(--ok); color: var(--ok); }
+.pin h3 { margin: 0 0 2px; font: 600 17px var(--mono); overflow-wrap: anywhere; }
+.pin .sub { font: 11px var(--mono); letter-spacing: .06em; color: var(--ink-soft); text-transform: uppercase; }
+.label { font: 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-soft); margin: 12px 0 4px; }
+.doors { list-style: none; margin: 0; padding: 0; }
+.doors li { display: flex; gap: 10px; align-items: baseline; padding: 6px 0; border-bottom: 1px dashed var(--line-soft); min-width: 0; }
+.doors .port { font: 600 14px var(--mono); min-width: 4.2em; }
+.doors .proc { font: 12px var(--mono); color: var(--ink-soft); min-width: 0; overflow-wrap: anywhere; }
+.doors a { margin-left: auto; font: 12px var(--mono); white-space: nowrap; }
+.doors .lo { margin-left: auto; font: 11px var(--mono); color: var(--ink-soft); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font: 12px var(--mono); border: 1px solid var(--line-soft); border-radius: 999px; padding: 2px 9px; }
+.chip::before { content: "●"; margin-right: 6px; color: var(--ok); }
+.chip.down::before { color: var(--accent); }
+.none { font: 12px var(--mono); color: var(--ink-soft); }
+.notes { margin: 12px 0 0; padding: 0; list-style: none; }
+.notes li { border-left: 3px solid var(--accent); padding: 3px 0 3px 10px; margin: 6px 0; font-size: 14px; color: var(--ink-soft); overflow-wrap: anywhere; }
+.honest { margin: 0 0 16px; padding: 12px 16px; border: 1.5px dashed var(--accent); font-size: 15px; color: var(--ink-soft); }
+.honest b { color: var(--accent); font: 12px var(--mono); letter-spacing: .1em; text-transform: uppercase; margin-right: 8px; }
+.empty { color: var(--ink-soft); font: 14px var(--mono); }
+
+/* The survey (debug details): a room schedule, always shown */
+.schedule { width: 100%; border-collapse: collapse; margin-top: 2px; font-size: 13px; table-layout: fixed; }
+.schedule th, .schedule td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+.schedule th { font: 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-soft); width: 34%; font-weight: 400; }
+.schedule td { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.schedule td .n { color: var(--ink-soft); }
+
+/* New project: numbered steps + the collapsed model flake */
+.steps { margin: 0 0 24px; padding-left: 1.4em; max-width: 52em; }
+.steps li { margin: 0 0 14px; color: var(--ink-soft); }
+.steps li b { color: var(--ink); }
+.steps pre.ex, .model pre {
+  margin: 6px 0 0; background: var(--code-bg); color: var(--code-ink); padding: 6px 8px;
+  font: 12px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.model { border: 1.5px solid var(--ink); background: var(--paper); }
+.model summary { cursor: pointer; padding: 10px 12px; font: 13px var(--mono); }
+.model[open] summary { border-bottom: 1px solid var(--line-soft); }
+.model { margin-top: 10px; position: relative; }
+.model pre { margin: 0; padding: 12px; white-space: pre; overflow-x: auto; max-height: 70vh; overflow-y: auto; }
+.model .copy {
+  position: absolute; top: 6px; right: 8px; font: 12px var(--mono); cursor: pointer;
+  border: 1px solid var(--ink); background: var(--paper); color: var(--ink); padding: 4px 10px;
+}
+.model .copy:hover { background: var(--line-soft); }
+
+/* Commands: the command reference, a schedule per group */
+.ref-group { margin: 0 0 30px; }
+.ref-group h3 { font: 600 12px var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin: 0 0 10px; }
+.ref { width: 100%; border-collapse: collapse; border: 1.5px solid var(--ink); background: var(--paper); table-layout: fixed; }
+.ref th, .ref td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+.ref thead th {
+  font: 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-soft);
+  background: var(--paper-2); border-bottom: 1.5px solid var(--ink); font-weight: 400;
+}
+.ref td:first-child { font: 600 13px var(--mono); width: 34%; overflow-wrap: anywhere; }
+.ref td:nth-child(2) { font-size: 14px; color: var(--ink-soft); }
+.ref td:nth-child(3) { width: 34%; }
+.ref.files td:first-child { width: 30%; }
+.ref .opt { display: block; margin-top: 4px; font: 12px/1.5 var(--mono); color: var(--ink-soft); font-weight: 400; }
+.ref pre.ex {
+  margin: 0; background: var(--code-bg); color: var(--code-ink); padding: 6px 8px;
+  font: 12px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.ref tbody tr:hover td { background: var(--line-soft); }
+@media (max-width: 760px) {
+  .ref thead { display: none; }
+  .ref, .ref tbody, .ref tr, .ref td { display: block; width: auto !important; }
+  .ref tr { border-bottom: 1px solid var(--line-soft); padding: 6px 0; }
+  .ref td { border: 0; padding: 4px 12px; }
+}
+
+footer { border-top: 1.5px solid var(--ink); padding: 24px 0 48px; font: 12px var(--mono); color: var(--ink-soft); }
+footer .sheet { display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; }
+  html { scroll-behavior: auto; }
+}
+NIXENV_DASHBOARD_CSS
+}
+
+dashboard_js() {
+  cat <<'NIXENV_DASHBOARD_JS'
+(function () {
+  "use strict";
+  var root = document.documentElement;
+  var NAME = /^[a-zA-Z0-9_-]+$/, HOST = /^[a-zA-Z0-9.-]+$/, PORT = /^[0-9]{1,5}$/;
+  var data = null, filter = "";
+
+  /* ── Paper / blueprint (remembered per browser, best effort) ─────────── */
+  var toggle = document.getElementById("sheetToggle");
+  function setSheet(s) {
+    if (s === "blueprint") root.setAttribute("data-sheet", "blueprint");
+    else root.removeAttribute("data-sheet");
+    toggle.textContent = s === "blueprint" ? "Paper" : "Blueprint";
+  }
+  var saved = null;
+  try { saved = window.localStorage.getItem("nixenv-sheet"); } catch (e) { saved = null; }
+  var dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  setSheet(saved || (dark ? "blueprint" : "paper"));
+  toggle.addEventListener("click", function () {
+    var s = root.getAttribute("data-sheet") === "blueprint" ? "paper" : "blueprint";
+    setSheet(s);
+    try { window.localStorage.setItem("nixenv-sheet", s); } catch (e) { /* private window */ }
+  });
+
+  /* ── DOM helpers: text only, never markup ─────────────────────────────── */
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    return e;
+  }
+  function add(parent) {
+    for (var i = 1; i < arguments.length; i++) if (arguments[i]) parent.appendChild(arguments[i]);
+    return parent;
+  }
+  function clear(e) { while (e.firstChild) e.removeChild(e.firstChild); }
+  function list(a) { return Array.isArray(a) ? a : []; }
+
+  // Proxy URL of <project>-<port>, rebuilt from validated parts only.
+  function portUrl(name, port) {
+    if (!data || !NAME.test(name) || !PORT.test(String(port)) || !HOST.test(String(data.domain))) return null;
+    var sfx = String(data.https_port) === "443" || !PORT.test(String(data.https_port)) ? "" : ":" + data.https_port;
+    return "https://" + name + "-" + port + "." + data.domain + sfx + "/";
+  }
+
+  // The mitmweb UI of a captured project, pre-filtered to it. Never with the
+  // token: it is the UI password and status.json is not secret (NET-05).
+  function captureUrl(name) {
+    if (!data || !NAME.test(name) || !HOST.test(String(data.domain))) return null;
+    var sfx = String(data.https_port) === "443" || !PORT.test(String(data.https_port)) ? "" : ":" + data.https_port;
+    return "https://" + name + "-mitm." + data.domain + sfx + "/#/flows?s=~comment%20" + name;
+  }
+
+  function ago(iso) {
+    var t = Date.parse(iso);
+    if (isNaN(t)) return null;
+    return Math.max(0, Math.round((Date.now() - t) / 1000));
+  }
+  function human(s) {
+    if (s === null) return "—";
+    if (s < 60) return s + "s ago";
+    if (s < 3600) return Math.round(s / 60) + " min ago";
+    return Math.round(s / 3600) + " h ago";
+  }
+
+  /* ── Rendering ─────────────────────────────────────────────────────────── */
+  function cell(label, value, cls) {
+    var d = el("div");
+    add(d, el("span", null, label), el("b", cls, value));
+    return d;
+  }
+
+  function renderStrip() {
+    var strip = document.getElementById("strip");
+    clear(strip);
+    var ps = list(data.projects), running = 0;
+    ps.forEach(function (p) { if (p.state === "running") running++; });
+    add(strip,
+      cell("projects", running + " running / " + ps.length),
+      cell("proxy", data.proxy && data.proxy.running ? "running" : "stopped", data.proxy && data.proxy.running ? "good" : "bad"),
+      cell("egress", data.egress && data.egress.running ? "running" : "stopped", data.egress && data.egress.running ? "good" : null),
+      cell("tls", data.proxy && data.proxy.tls === "mkcert" ? "mkcert" : "caddy internal"),
+      cell("domain", "*." + data.domain));
+    var g = document.getElementById("globalNotes");
+    clear(g);
+    list(data.warnings).forEach(function (w) {
+      var p = el("p", "honest");
+      add(p, el("b", null, "Note"), document.createTextNode(w));
+      g.appendChild(p);
+    });
+  }
+
+  function row(tbody, label, value) {
+    var tr = el("tr");
+    var td = el("td");
+    if (value === null || value === undefined || value === "" || (Array.isArray(value) && !value.length)) {
+      add(td, el("span", "n", "—"));
+    } else if (Array.isArray(value)) {
+      td.textContent = value.join(" ");
+    } else if (value.nodeType) {
+      td.appendChild(value);
+    } else {
+      td.textContent = String(value);
+    }
+    add(tr, el("th", null, label), td);
+    tbody.appendChild(tr);
+  }
+
+  function card(p) {
+    var on = p.state === "running";
+    var c = el("article", "pin" + (on ? " running" : " off"));
+    // #project-<name> links here (name already checked against NAME).
+    c.id = "project-" + p.name;
+    if (location.hash === "#" + c.id) c.className += " focus";
+    c.setAttribute("data-tag", p.state + (p.restricted ? " · restricted" : " · open"));
+    var link = el("a", "permalink", p.name);
+    link.setAttribute("href", "#" + c.id);
+    add(c, add(el("div", "head"), add(el("h3"), link),
+      el("div", "sub", (p.restricted ? "egress restricted" : "unrestricted") +
+        (p.ssh_port ? " · ssh " + p.ssh_port : "") + (p.capture ? " · capturing " + p.capture : ""))));
+    // Left: open doors, services, notes. Right: the survey. Stacked on a phone.
+    var left = el("div"), right = el("div");
+    add(c, add(el("div", "cols"), left, right));
+
+    if (on) {
+      add(left, el("div", "label", "Open doors"));
+      var doors = list(p.listening);
+      if (!doors.length) {
+        // status.json times are UTC; 'started' carries no zone of its own.
+        var up = p.started ? ago(p.started + "Z") : null;
+        add(left, el("div", "none", up !== null && up < 180
+          ? "starting (" + human(up).replace(" ago", "") + ") — services may not listen yet; re-checked shortly"
+          : "no port listening"));
+      }
+      else {
+        var ul = el("ul", "doors");
+        doors.forEach(function (d) {
+          var li = el("li");
+          add(li, el("span", "port", ":" + d.port), el("span", "proc", d.proc === "-" ? "" : d.proc));
+          var url = d.bind === "loopback" ? null : portUrl(p.name, d.port);
+          if (url) {
+            var a = el("a", null, p.name + "-" + d.port + " ↗");
+            a.href = url; a.rel = "noopener noreferrer"; a.target = "_blank";
+            li.appendChild(a);
+          } else {
+            li.appendChild(el("span", "lo", "127.0.0.1 only"));
+          }
+          ul.appendChild(li);
+        });
+        left.appendChild(ul);
+      }
+      var svcs = list(p.services).filter(function (s) { return s.name !== "sshd" && s.name.indexOf("proxy-relay-") !== 0; });
+      if (svcs.length) {
+        add(left, el("div", "label", "Services"));
+        var chips = el("div", "chips");
+        svcs.forEach(function (s) {
+          chips.appendChild(el("span", "chip" + (s.state === "run" ? "" : " down"), s.name + (s.state === "run" ? "" : " · " + s.state)));
+        });
+        left.appendChild(chips);
+      }
+    } else {
+      add(left, el("div", "none", "not running — nixenv start " + p.name));
+    }
+
+    var cap = p.restricted && p.capture ? captureUrl(p.name) : null;
+    if (cap) {
+      add(left, el("div", "label", "Capture · " + p.capture));
+      var cl = el("ul", "doors"), li = el("li");
+      add(li, el("span", "port", "mitm"), el("span", "proc", "needs the token from: nixenv capture " + p.name + " web"));
+      var ca = el("a", null, p.name + "-mitm ↗");
+      ca.href = cap; ca.rel = "noopener noreferrer"; ca.target = "_blank";
+      add(cl, add(li, ca));
+      left.appendChild(cl);
+    }
+
+    var notes = list(p.warnings);
+    if (notes.length) {
+      var nl = el("ul", "notes");
+      notes.forEach(function (n) { nl.appendChild(el("li", null, n)); });
+      left.appendChild(nl);
+    }
+
+    add(right, el("div", "label", "Survey"));
+    var t = el("table", "schedule"), tb = el("tbody");
+    row(tb, "state", p.state + (p.started ? " since " + p.started.replace("T", " ") + " UTC" : ""));
+    row(tb, "egress", p.restricted ? "restricted (squid allowlist)" : "unrestricted — direct internet");
+    if (p.restricted) {
+      row(tb, "allowed_hosts", list(p.allowed_hosts));
+      row(tb, "ssh_hosts", p.ssh_hosts === null ? "every allowed host" : (list(p.ssh_hosts).length ? p.ssh_hosts : "none (port 22 closed)"));
+    }
+    row(tb, "accept-from", list(p.accept_from).length ? p.accept_from : "itself only");
+    row(tb, "capture", p.capture || "off");
+    row(tb, "declared ports", list(p.declared_ports));
+    row(tb, "deploy_hosts", p.deploy_hosts ? p.deploy_hosts + " host(s) — not listed here" : "");
+    row(tb, "ssh port", p.ssh_port ? "127.0.0.1:" + p.ssh_port : "");
+    row(tb, "extra parameters", list(p.extra_parameters));
+    add(t, tb); right.appendChild(t);
+    return c;
+  }
+
+  function renderRooms() {
+    var rooms = document.getElementById("rooms");
+    clear(rooms);
+    var ps = list(data.projects).filter(function (p) {
+      return typeof p.name === "string" && NAME.test(p.name) && (!filter || p.name.toLowerCase().indexOf(filter) !== -1);
+    });
+    ps.sort(function (a, b) {
+      var ra = a.state === "running" ? 0 : 1, rb = b.state === "running" ? 0 : 1;
+      return ra - rb || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    });
+    if (!ps.length) {
+      rooms.appendChild(el("p", "empty", filter ? "No project matches “" + filter + "”." : "No projects yet — nixenv init <project>"));
+      return;
+    }
+    ps.forEach(function (p) { rooms.appendChild(card(p)); });
+    if (pendingScroll) focusHash();
+  }
+
+  // #project-<name>: scroll to that card once per navigation (not on every
+  // 5 s re-render, which would yank the page back while reading).
+  var pendingScroll = true;
+  function focusHash() {
+    var m = /^#project-([a-zA-Z0-9_-]+)$/.exec(location.hash);
+    var t = m && document.getElementById("project-" + m[1]);
+    if (!m) { pendingScroll = false; return; }
+    if (!t) return;   // not in this survey (yet): try again on the next render
+    pendingScroll = false;
+    t.scrollIntoView({ block: "start" });
+  }
+  window.addEventListener("hashchange", function () {
+    pendingScroll = true;
+    if (data) renderRooms();
+  });
+
+  function renderAge() {
+    if (!data) return;
+    var s = ago(data.generated);
+    document.getElementById("generated").textContent = human(s);
+    document.getElementById("age").textContent = s !== null && s > 120
+      ? "Stale survey — run nixenv ps (or ps --watch) to refresh."
+      : "Drawn to no particular scale.";
+  }
+
+  function render() {
+    document.getElementById("rev").textContent = data.version || "—";
+    document.getElementById("engine").textContent = data.engine || "—";
+    renderStrip(); renderRooms(); renderAge();
+  }
+
+  var last = "";
+  function load() {
+    fetch("status.json", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); })
+      .then(function (txt) {
+        if (txt !== last) { last = txt; data = JSON.parse(txt); render(); }
+        else renderAge();
+      })
+      .catch(function (e) {
+        if (data) return renderAge();
+        var rooms = document.getElementById("rooms");
+        clear(rooms);
+        rooms.appendChild(el("p", "empty", "status.json could not be read (" + e.message + ") — run nixenv ps."));
+      });
+  }
+
+  document.getElementById("filter").addEventListener("input", function (e) {
+    filter = String(e.target.value || "").trim().toLowerCase();
+    if (data) renderRooms();
+  });
+  // Copy buttons: hidden without JS; copy the text of the element they name.
+  Array.prototype.forEach.call(document.querySelectorAll("button.copy"), function (b) {
+    var src = document.getElementById(b.getAttribute("data-copy"));
+    if (!src) return;
+    b.hidden = false;
+    b.addEventListener("click", function () {
+      var done = function (msg) {
+        b.textContent = msg;
+        setTimeout(function () { b.textContent = "Copy"; }, 1500);
+      };
+      var selectIt = function () {
+        var r = document.createRange(); r.selectNodeContents(src);
+        var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+        done("Selected — press Ctrl/Cmd-C");
+      };
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(src.textContent).then(function () { done("Copied"); }, selectIt);
+      } else selectIt();
+    });
+  });
+
+  load();
+  setInterval(load, 5000);
+})();
+NIXENV_DASHBOARD_JS
+}
+
+# =============================================================================
 # up — build (if needed) then run a project
 #   usage: up <project>
 # =============================================================================
@@ -4336,9 +5910,12 @@ cmd_shell() {
   # No -u: the container already runs as our uid, so exec inherits it. (Passing
   # -u app would need 'app' resolvable in the daemon's view of /etc/passwd, which
   # a bind-mounted passwd isn't, reliably.)
-  exec "$ENGINE" exec -it -w "$appmnt" \
+  local rc=0
+  "$ENGINE" exec -it -w "$appmnt" \
     -e HOME="/home/$APP_USER" -e TERM="${TERM:-xterm-256color}" \
-    "$cname" "$PROFILE/bin/zsh" -l
+    "$cname" "$PROFILE/bin/zsh" -l || rc=$?
+  terminal_reset   # the session may have died mid-app (see terminal_reset)
+  return "$rc"
 }
 
 # =============================================================================
@@ -4357,10 +5934,26 @@ cmd_ssh() {
   log "Connecting to '$name' on port $port"
   local pdir; pdir="$(project_dir "$name")"
   ensure_project_ssh_key "$pdir"
-  exec ssh -p "$port" -i "$pdir/ssh/id_ed25519" -o IdentitiesOnly=yes \
+  # Not exec: when the session dies mid-app (proxy recreated, container
+  # stopped), whatever ran inside never switches its terminal modes back off.
+  local rc=0
+  ssh -p "$port" -i "$pdir/ssh/id_ed25519" -o IdentitiesOnly=yes \
     -o StrictHostKeyChecking=yes -o HostKeyAlias="$(ssh_host_alias "$name")" \
     -o UserKnownHostsFile="$pdir/ssh/known_hosts" \
-    "$APP_USER@127.0.0.1"
+    "$APP_USER@127.0.0.1" || rc=$?
+  terminal_reset
+  return "$rc"
+}
+
+# Undo the terminal modes a full-screen app (zmx, nvim, Claude Code) turns on
+# and only turns off when it exits cleanly: mouse reporting (else every scroll
+# prints "64;65;57M" in the host shell), bracketed paste, the alternate screen,
+# a hidden cursor. Harmless when they are already off. TTY only.
+terminal_reset() {
+  if [ -t 1 ]; then
+    printf '\033[?1000l\033[?1002l\033[?1003l\033[?1005l\033[?1006l\033[?1015l\033[?2004l\033[?1049l\033[?25h'
+  fi
+  if [ -t 0 ]; then stty sane 2>/dev/null || true; fi
 }
 
 # =============================================================================
@@ -4374,11 +5967,13 @@ cmd_ssh() {
 # The dev container is where untrusted code (and Claude) runs, so the agent is
 # never forwarded there. The deploy container:
 #   * mounts the app volume read-write (a release edits, commits and pushes
-#     there) and nothing else of the project's state: no home volume, no
+#     there) and nothing else of the dev container's state: no home volume, no
 #     Claude profile. Same tools as the dev container. From the HOST side it
 #     adds your git identity + https credentials (the home seed), and
 #     deploy_gitconfig / deploy_ssh_config / deploy_known_hosts (rw);
-#   * has a tmpfs HOME, so nothing else survives the session;
+#   * has a tmpfs HOME; what must survive a session goes in /deploy, the
+#     project's deploy STATE volume (deploy_volume), created by the first
+#     deploy and reused after — never mounted in the dev container;
 #   * sits on its own --internal network, whose only exit is squid with the
 #     project's allowed_hosts + <project>/deploy_hosts — production goes in
 #     the second, so the dev container can't reach it;
@@ -4524,13 +6119,15 @@ deploy_open() {
     [ ! -L "$pdir/$_mf" ] || die "$pdir/$_mf is a symlink — refusing to use it (replace it with a regular file)"
   done
   valid_app_mount "$appmnt" || die "invalid app path in $pdir/app_mount"
-  vol_exists "$appv" || die "no app volume '$appv' — '$0 run $name' creates it"
+  vol_exists "$appv" || die "no app volume '$appv' — '$0 start $name' creates it"
   if container_exists "$cname"; then
     die "a deploy session for '$name' is already open — close it, or remove a leftover one: $0 deploy $name stop"
   fi
 
   write_passwd_files "$pdir"
   ensure_project_ssh_key "$pdir"   # same key + pinned host key as 'ssh <project>'
+  local deployv; deployv="$(deploy_volume "$name")"
+  ensure_deploy_volume "$name" || die "could not prepare the deploy state volume '$deployv'"
 
   ensure_deploy_net "$name"
   local egress_env; egress_env=()
@@ -4571,7 +6168,7 @@ deploy_open() {
     extra+=(-v "$pdir/home/.git-credentials:/home/$APP_USER/.git-credentials")
   fi
   local harden uid gid; harden=($(container_hardening_args)); uid="$(id -u)"; gid="$(id -g)"
-  log "Starting '$cname' — $appv → $appmnt, home on tmpfs"
+  log "Starting '$cname' — $appv → $appmnt, $deployv → /deploy, home on tmpfs"
   "$ENGINE" run -d --rm \
     --name "$cname" \
     --hostname "$name-deploy" \
@@ -4584,6 +6181,7 @@ deploy_open() {
     ${extra[@]+"${extra[@]}"} \
     -v "$NIX_VOLUME":/nix:ro \
     -v "$appv":"$appmnt" \
+    -v "$deployv":/deploy \
     -v "$HOME_SKEL":/etc/nixenv/home-skel:ro \
     -v "$pdir/passwd":/etc/passwd:ro \
     -v "$pdir/group":/etc/group:ro \
@@ -4598,6 +6196,7 @@ deploy_open() {
     -e SSHD_PORT="$SSHD_PORT" \
     -e NIXENV_PROJECT="$name" \
     -e NIXENV_APP_MOUNT="$appmnt" \
+    -e NIXENV_DEPLOY_STATE=/deploy \
     -e NIXENV_EXTRA_PROFILE="$(project_profile "$name")" \
     "$(img "$RUNTIME_IMAGE")" \
     sh /usr/local/bin/nixenv-deploy-entrypoint >/dev/null \
@@ -4653,8 +6252,9 @@ cmd_stop() {
     printf '   %s\n' $all
     # shellcheck disable=SC2086
     "$ENGINE" rm -f $all >/dev/null 2>&1 || true
+    dashboard_refresh
     ok "Stopped $(printf '%s\n' $all | wc -l | tr -d ' ') container(s)"
-    log "volumes and projects are untouched — '$0 run <project>' starts one again"
+    log "volumes and projects are untouched — '$0 start <project>' starts one again"
     return 0
   fi
 
@@ -4664,7 +6264,10 @@ cmd_stop() {
     "$ENGINE" rm -f "$dname" >/dev/null && ok "Removed deploy container '$dname'"
   fi
   container_exists "$cname" || { warn "no container '$cname' (already stopped)"; return 0; }
-  "$ENGINE" rm -f "$cname" >/dev/null && ok "Stopped '$cname'"
+  local rc=0
+  "$ENGINE" rm -f "$cname" >/dev/null && ok "Stopped '$cname'" || rc=$?
+  dashboard_refresh
+  return "$rc"
 }
 
 # =============================================================================
@@ -4677,15 +6280,17 @@ cmd_delete() {
   case "$name" in */*|.|..) die "invalid project name: $name";; esac
   resolve_engine || true   # host files can be removed even without an engine
 
-  local pdir cname prof appv homev dbv vols=""
+  local pdir cname prof appv homev dbv deployv vols=""
   pdir="$(project_dir "$name")"
   cname="$(container_name "$name")"
   prof="$(project_profile "$name")"
   appv="$(app_volume "$name")"; homev="$(home_volume "$name")"; dbv="$(db_volume "$name")"
+  deployv="$(deploy_volume "$name")"
   if [ -n "$ENGINE" ]; then
-    vol_exists "$appv"  && vols="$vols $appv"
-    vol_exists "$homev" && vols="$vols $homev"
-    vol_exists "$dbv"   && vols="$vols $dbv"
+    vol_exists "$appv"    && vols="$vols $appv"
+    vol_exists "$homev"   && vols="$vols $homev"
+    vol_exists "$dbv"     && vols="$vols $dbv"
+    vol_exists "$deployv" && vols="$vols $deployv"
   fi
 
   [ -d "$pdir" ] || warn "no project dir at $pdir (will still try its container/volumes)"
@@ -4693,7 +6298,7 @@ cmd_delete() {
   log "This will PERMANENTLY delete project '$name' by running:"
   if [ -n "$ENGINE" ]; then
     echo "    $ENGINE rm -f $cname $(deploy_container_name "$name")"
-    [ -n "$vols" ] && echo "    $ENGINE volume rm$vols   (app + home + databases volumes)"
+    [ -n "$vols" ] && echo "    $ENGINE volume rm$vols   (app + home + databases [+ deploy state] volumes)"
     echo "    rm -f $prof*   (its extra-tooling profile, inside the store)"
   else
     warn "no container engine detected — its container/volumes won't be removed"
@@ -4740,7 +6345,8 @@ cmd_delete() {
 # =============================================================================
 # export / import — move a whole project between machines, or back it up
 # =============================================================================
-# An archive holds the THREE volumes (app, home, databases) plus the portable
+# An archive holds the volumes (app, databases; home with --with-home; the
+# deploy state volume when 'deploy' has created one) plus the portable
 # host-side state. It deliberately does NOT hold:
 #   * the shared Nix store — gigabytes, and fully reproducible from the project's
 #     flake + flake.lock by 'build';
@@ -4921,6 +6527,15 @@ cmd_export() {
     fi
     warn "'$name' is RUNNING — this snapshot is crash-consistent at best"
   fi
+  # Same for the deploy state volume while a deploy session may be writing it.
+  local dname; dname="$(deploy_container_name "$name")"
+  if container_running "$dname"; then
+    if [ "$force" != 1 ]; then
+      die "a deploy session for '$name' is open — close it (or '$0 deploy $name stop') before exporting,
+     or --force to snapshot its state volume live"
+    fi
+    warn "a deploy session for '$name' is open — its state is snapshotted live"
+  fi
 
   # The app volume is in EVERY archive, so a token embedded in .git/config leaks
   # even without --with-home. Refuse rather than scrub: the remote URL is the
@@ -4958,6 +6573,12 @@ EOF
   # from the skeleton, which is what most of that volume is anyway.
   local vols="app databases"
   [ "$with_home" = 1 ] && vols="app home databases"
+  # The deploy state volume exists only once 'deploy' has run; carry it when it
+  # does. It may hold deployment state (terraform, ansible…) — said below.
+  local with_deploy=0
+  if vol_exists "$(deploy_volume "$name")"; then
+    vols="$vols deploy"; with_deploy=1
+  fi
 
   local v vol
   for v in $vols; do
@@ -4965,6 +6586,7 @@ EOF
       app)       vol="$(app_volume "$name")";;
       home)      vol="$(home_volume "$name")";;
       databases) vol="$(db_volume "$name")";;
+      deploy)    vol="$(deploy_volume "$name")";;
     esac
     if ! vol_exists "$vol"; then
       warn "volume '$vol' does not exist — skipping"
@@ -4990,6 +6612,7 @@ EOF
     echo "source_uid=$(id -u)"
     echo "engine=$ENGINE"
     echo "home=$with_home"
+    echo "deploy=$with_deploy"
   } > "$stage/nixenv-export/manifest"
 
   log "Writing $out"
@@ -5000,6 +6623,9 @@ EOF
   echo "   size:   $(human_size "$out")"
   echo "   holds:  $(printf '%s' "$vols" | tr ' ' '+') volumes, and $nmeta files from $pdir"
   echo "   import: $0 import $out [new-name]"
+  if [ "$with_deploy" = 1 ]; then
+    warn "the deploy state volume ($(deploy_volume "$name")) is included — if your deploy tools keep secrets there (terraform state…), treat the archive as a SECRET"
+  fi
   if [ "$with_home" = 1 ]; then
     warn "--with-home: this archive contains ~/.ssh and git credentials (volume + seed) — treat it as a SECRET"
   else
@@ -5228,6 +6854,7 @@ cmd_import() {
     warn "'$name' already exists — --force will REPLACE its app/databases volumes"
     echo "    existing data in $(app_volume "$name") and $(db_volume "$name") is lost"
     echo "    (the home volume is $( [ -f "$root/volumes/home.tar.gz" ] && echo "replaced too" || echo "left alone"))"
+    echo "    (the deploy state volume is $( [ -f "$root/volumes/deploy.tar.gz" ] && echo "replaced too" || echo "left alone"))"
     if [ "$assume_yes" != 1 ]; then
       printf 'Proceed? [y/N] '
       local ans=""; read -r ans || true
@@ -5265,12 +6892,16 @@ cmd_import() {
   ensure_volumes "$name"
 
   local v vol
-  for v in app home databases; do
+  for v in app home databases deploy; do
     [ -f "$root/volumes/$v.tar.gz" ] || continue
     case "$v" in
       app)       vol="$(app_volume "$name")";;
       home)      vol="$(home_volume "$name")";;
       databases) vol="$(db_volume "$name")";;
+      # Not made by ensure_volumes (only 'deploy' creates it) — create it here.
+      deploy)    vol="$(deploy_volume "$name")"
+                 vol_exists "$vol" || "$ENGINE" volume create "$vol" >/dev/null \
+                   || die "could not create $vol";;
     esac
     log "Restoring $vol"
     # -u 0 then chown: the archive's files carry the EXPORTING machine's uid, and
@@ -5313,6 +6944,9 @@ cmd_import() {
   ok "Imported as '$name'"
   echo "   ssh:    host port $port  (freshly assigned — the exported one is not reused)"
   echo "   repo → $(project_app_mount "$name")"
+  if [ -f "$root/volumes/deploy.tar.gz" ]; then
+    echo "   deploy state → /deploy in '$0 deploy $name'  (volume $(deploy_volume "$name"))"
+  fi
   if is_restricted "$name"; then
     echo "   egress→ RESTRICTED (allowed: $(tr '\n' ' ' < "$pdir/allowed_hosts" 2>/dev/null))"
   fi
@@ -5328,7 +6962,7 @@ cmd_import() {
   echo
   log "next: $0 build            # once per machine, if the shared store is missing"
   log "      $0 build $name      # the project's own flake"
-  log "      $0 run $name"
+  log "      $0 start $name"
 }
 
 # =============================================================================
@@ -5366,37 +7000,49 @@ cmd_sync_home() {
 
   ensure_volumes "$name"   # create + seed if the volume is new/empty
 
-  # 2. Layer skeleton then repo overrides into the volume via a ROOT helper:
-  #    back up each file we're about to overwrite (original version, once), copy
-  #    each source in order, then chown the written paths (and backup) to our uid.
-  #    The app volume is mounted read-only so /app/.nixenv/home/ can override.
+  # 2. Layer skeleton then repo overrides into the volume AS THE APP USER (your
+  #    uid, like the project container): every file written is yours, with no
+  #    chown step to forget. Back up each file about to be overwritten (original
+  #    version, once), then copy each source in order. The app volume is mounted
+  #    read-only so /app/.nixenv/home/ can override.
   local uid gid ts; uid="$(id -u)"; gid="$(id -g)"; ts="$(date +%Y%m%d-%H%M%S)"
+  # Repair first: an older sync copied as root and could leave root-owned files,
+  # which the app user cannot overwrite. Re-own ONLY what isn't ours; nothing is
+  # copied as root. Same userns as the project container, so on rootless podman
+  # "our uid" means the same thing inside and out.
   "$ENGINE" rm -f "${CONTAINER_PREFIX}__synchome-$name" >/dev/null 2>&1 || true
-  "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__synchome-$name" -u 0 \
-    -v "$homev":/home -v "$HOME_SKEL":/seed:ro -v "$appv":/app:ro \
-    -e NIXUID="$uid" -e NIXGID="$gid" -e TS="$ts" \
+  "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__synchome-$name" -u 0 $(engine_userns) \
+    -v "$homev":/home/"$APP_USER" -e NIXUID="$uid" -e NIXGID="$gid" \
+    "$(img "$RUNTIME_IMAGE")" sh -c '
+      find "/home/'"$APP_USER"'" \( ! -user "$NIXUID" -o ! -group "$NIXGID" \) \
+        -exec chown -h "$NIXUID:$NIXGID" {} + 2>/dev/null || true
+    ' >/dev/null 2>&1 || warn "could not check ownership in '$homev' — files owned by root will be skipped"
+  local harden; harden=($(container_hardening_args))
+  "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__synchome-$name" \
+    --user "$uid:$gid" $(engine_userns) ${harden[@]+"${harden[@]}"} \
+    -v "$homev":/home/"$APP_USER" -v "$HOME_SKEL":/seed:ro -v "$appv":/app:ro \
+    -e H=/home/"$APP_USER" -e TS="$ts" \
     "$(img "$RUNTIME_IMAGE")" sh -c '
       set -e
-      bk="/home/.nixenv/home-backups/$TS"
+      bk="$H/.nixenv/home-backups/$TS"
       for src in /seed /app/.nixenv/home; do
         [ -d "$src" ] || continue
         ( cd "$src" && find . -type f ) | while IFS= read -r f; do
           rel=${f#./}
           # Back up the ORIGINAL file once (skip if an earlier layer already did).
-          if [ -e "/home/$rel" ] && [ ! -e "$bk/$rel" ]; then
+          if [ -e "$H/$rel" ] && [ ! -e "$bk/$rel" ]; then
             mkdir -p "$bk/$(dirname "$rel")"
-            cp -a "/home/$rel" "$bk/$rel" 2>/dev/null || true
+            cp -p "$H/$rel" "$bk/$rel"
           fi
         done
-        cp -a "$src"/. /home/
-        find "$src" -mindepth 1 | while IFS= read -r f; do
-          rel=${f#"$src"/}
-          chown "$NIXUID:$NIXGID" "/home/$rel" 2>/dev/null || true
-        done
+        # Not cp -a: ownership is NOT preserved, files belong to whoever copies.
+        cp -R --preserve=mode,timestamps "$src"/. "$H"/
       done
-      [ -d "$bk" ] && chown -R "$NIXUID:$NIXGID" /home/.nixenv 2>/dev/null || true
-      :
-    ' >/dev/null 2>&1 || die "home sync helper failed for '$name'"
+      if [ -d "$H/.ssh" ]; then
+        chmod 700 "$H/.ssh"
+        find "$H/.ssh" -type f -exec chmod 600 {} +
+      fi
+    ' >/dev/null || die "home sync failed for '$name' (see the error above)"
 
   ok "Home config refreshed for '$name'"
   echo "   backup of overwritten files → ~/.nixenv/home-backups/$ts  (in the home volume)"
@@ -5645,7 +7291,7 @@ Commands:
                             --template=<t> installs a ready-to-run stack: ONE
                             file that becomes the project's flake.nix, declaring
                             the toolchain + a startup hook that installs the app
-                            on first 'run'. Short names resolve against
+                            on first 'start'. Short names resolve against
                             TEMPLATE_BASE; URLs and local paths also work.
                             Official: wordpress, cloudflare. Mutually exclusive
                             with git-url; asks to confirm unless --yes.
@@ -5656,8 +7302,9 @@ Commands:
                             --build also builds the project's flake.
                             --app-path=/path mounts the code volume there instead
                             of /app (stored in <project>/app_mount)
-  run <project>             Start the project as a background service (sshd under
-                            runit); prints the SSH port  (alias: start)
+  start <project> [-v]      Start the project as a background service (sshd under
+                            runit) and print a short summary; -v prints every
+                            step and the full details  (alias: run)
   ssh <project>             SSH into the running service (auto-starts it)
   shell <project>           Interactive zsh via the engine's 'exec' (no SSH key)
   expose <project> <port>…  Publish extra port(s) (e.g. 8080 or 3000:3000),
@@ -5670,8 +7317,8 @@ Commands:
                             Shared Caddy reverse proxy (plus, for restricted
                             projects, the '$EGRESS_NAME' container running squid). 'up' starts it and routes
                             https://<project>-<port>.$PROXY_DOMAIN → nixenv-<project>:<port>
-                            over network '$PROXY_NET' (projects auto-join on 'run').
-                            Auto-starts on the first 'run' (PROXY_AUTOSTART=0 to skip).
+                            over network '$PROXY_NET' (projects auto-join on 'start').
+                            Auto-starts on the first 'start' (PROXY_AUTOSTART=0 to skip).
                             Uses a trusted mkcert wildcard if mkcert is installed
                             (explains before 'mkcert -install'; PROXY_MKCERT_INSTALL=0
                             to skip trusting), else Caddy's internal CA.
@@ -5711,7 +7358,9 @@ Commands:
                             container). Code = the app volume (shared, rw); git
                             identity + https credentials from the home seed;
                             same tools as the dev container; tmpfs home;
-                            removed on exit. Egress: the
+                            /deploy = a persistent state volume (created by
+                            the first deploy, reused, never in the dev
+                            container); removed on exit. Egress: the
                             project's allowed_hosts + <project>/deploy_hosts.
                             Host files: deploy_ssh_config, deploy_gitconfig,
                             deploy_known_hosts.
@@ -5725,11 +7374,12 @@ Commands:
                             With NO project: stops every nixenv container,
                             including the shared proxy (volumes are untouched)
   logs <project>            Follow the service container logs
-  delete <project>          Permanently remove a project (container; app, home and
-                            databases volumes; host dir) — prints the commands and
+  delete <project>          Permanently remove a project (container; app, home,
+                            databases and deploy state volumes; host dir) — prints the commands and
                             asks to confirm
   export <project> [file] [--with-home] [--force]
-                            Archive the project (app + databases volumes and
+                            Archive the project (app + databases volumes, the
+                            deploy state volume if it exists, and
                             its whole project dir except per-machine state) into
                             one .tar for another machine or a backup. Refuses
                             while it is running (--force snapshots live).
@@ -5748,6 +7398,13 @@ Commands:
                             from <repo>/.nixenv/home/; backs up overwritten files,
                             keeps plugins/history/creds
   projects                  List projects with their SSH port and state
+  ps [--json] [--watch [N]] What runs where: each project's state, the ports
+                            its processes ACTUALLY listen on (probed via the
+                            engine) with their proxy URLs, services, egress
+                            settings and recently denied hosts. Also writes the
+                            dashboard served at https://$PROXY_DOMAIN/ (refreshed
+                            by run/stop/proxy up too); --watch rewrites it every
+                            N seconds (default 5); --json prints status.json
   update                    Refresh flake.lock, then rebuild into the volume
   github-token [--clear|--status]
                             Store a GitHub token (asked once on the first build).
@@ -5800,10 +7457,10 @@ Environment overrides:
   PROXY_DOMAIN=$PROXY_DOMAIN            (base domain for the proxy)
   PROXY_NET=$PROXY_NET                  (shared user network)
   PROXY_HTTP_PORT=$PROXY_HTTP_PORT / PROXY_HTTPS_PORT=$PROXY_HTTPS_PORT   (host ports; use 8080/8443 for podman rootless)
-  PROXY_AUTOSTART=$PROXY_AUTOSTART                     (auto-start the proxy on 'run'; 0 to disable)
+  PROXY_AUTOSTART=$PROXY_AUTOSTART                     (auto-start the proxy on 'start'; 0 to disable)
   PROXY_MKCERT_INSTALL                        (1=run 'mkcert -install' on explicit 'proxy up';
                                                0=never trust — HTTPS works with a warning.
-                                               Auto-start on 'run' defaults to 0)
+                                               Auto-start on 'start' defaults to 0)
   TEMPLATE_BASE=$TEMPLATE_BASE
                                               (where 'init --template=<name>' resolves short names)
 
@@ -5816,7 +7473,7 @@ Examples:
   $0 init web git@github.com:me/web.git --app-path=/var/www/html   # custom mount
   $0 init myblog --template=wordpress       # ready-to-run WordPress stack
   $0 init myworker --template=cloudflare    # Cloudflare Workers + wrangler
-  $0 run myapp                              # start the service (prints SSH port)
+  $0 start myapp                              # start the service (prints SSH port)
   $0 ssh myapp                              # SSH in as 'app'
   $0 shell myapp                            # interactive zsh via engine exec
   $0 proxy up                               # start the shared reverse proxy
@@ -5844,7 +7501,7 @@ main() {
   case "$cmd" in
     build)    cmd_build "$@";;
     init)     cmd_init "$@";;
-    run|start) cmd_run "$@";;
+    start|run) cmd_run "$@";;
     up)       cmd_up "$@";;
     shell)    cmd_shell "$@";;
     ssh)      cmd_ssh "$@";;
@@ -5864,6 +7521,7 @@ main() {
     export)   cmd_export "$@";;
     import)   cmd_import "$@";;
     projects) cmd_projects "$@";;
+    ps)       cmd_ps "$@";;
     update)   cmd_update "$@";;
     github-token) cmd_github_token "$@";;
     status)   cmd_status "$@";;

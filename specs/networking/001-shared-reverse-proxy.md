@@ -36,4 +36,5 @@ Stable HTTPS URLs per project/port without publishing every port.
 regenerates configs and hot-reloads caddy (`caddy reload`) and squid
 (`-k reconfigure`) without recreating containers; new relays or published
 ports still need `proxy up`. Caddy data (incl. internal CA) persists in
-`~/.nixenv/proxy/data`.
+`~/.nixenv/proxy/data`. The bare `PROXY_DOMAIN` (no project prefix) serves the
+read-only project dashboard (NET-05).

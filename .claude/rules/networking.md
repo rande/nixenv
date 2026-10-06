@@ -13,3 +13,4 @@ change alters a rule, update its spec in the same commit.
 - NET-02 TLS: mkcert only if present, never a surprise prompt: @../../specs/networking/002-proxy-tls-mkcert.md
 - NET-03 Public URLs work from inside a container: @../../specs/networking/003-public-url-from-inside.md
 - NET-04 Restricted projects cannot reach other projects through the proxy: @../../specs/networking/004-cross-project-isolation.md
+- NET-05 ps and the dashboard: probed from the host, read-only, no secrets: @../../specs/networking/005-project-dashboard.md

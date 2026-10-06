@@ -57,7 +57,8 @@ assert_contains "$conf" "cache_peer 127.0.0.1 parent $((CAPTURE_EGRESS_BASE + 1)
 assert_contains "$conf" "cache_peer_access cap_alpha allow p_alpha !nocapture_ports"
 assert_contains "$conf" "cache_peer_access cap_alpha deny all"
 assert_contains "$conf" "never_direct allow p_alpha !nocapture_ports" "fail closed: never bypass mitmproxy"
-assert_contains "$conf" "acl nocapture_ports port 22 9418" "ssh/git:// stay direct"
+printf '%s\n' "$conf" | grep -qx "acl nocapture_ports port 22" || fail "ssh stays direct (exactly port 22)"
+printf '%s\n' "$conf" | grep -qx "acl Connect_ports port 443 22 80" || fail "CONNECT only to 443/22/80 (no git:// 9418)"
 assert_not_contains "$conf" "cap_gamma" "uncaptured project goes direct"
 # Routing must not add a DNS lookup: only src (p_*) and port ACLs there.
 printf '%s\n' "$conf" | grep -E '^(cache_peer_access|never_direct)' \

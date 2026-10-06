@@ -15,8 +15,9 @@ applies-to:
   on it.
 - Projects always live in `$HOME/.nixenv/projects` — not a user setting.
   `NIXENV_PROJECTS_DIR` exists only for test isolation.
-- `delete` prints every command it will run (containers, volumes, profile, host
-  dir, captures, Claude profile) and asks before running them.
+- `delete` prints every command it will run (containers, volumes — the deploy
+  state volume included — profile, host dir, captures, Claude profile) and
+  asks before running them.
 
 ## Why
 

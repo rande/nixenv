@@ -11,7 +11,15 @@ nx run p1 >/dev/null
 dexec p1 sh -c 'echo "# LOCAL EDIT" >> /home/app/.zshrc'
 dexec p1 sh -c 'mkdir -p /app/.nixenv/home && echo OVERRIDE > /app/.nixenv/home/.custom-rc'
 
+# Emulate an older sync-home, which copied as root: a root-owned dotfile the
+# app user could not overwrite.
+involume nxt_p1_home 'chown 0:0 /v/.vimrc'
+
 printf 'y\n' | nx sync-home p1 >/dev/null
+
+# Everything in the home is the app user's (seen from the container's userns).
+notmine="$(dexec p1 find /home/app ! -user "$(id -u)" 2>/dev/null | head -5)"
+[ -z "$notmine" ] || fail "sync-home left files not owned by app: $notmine"
 
 involume nxt_p1_home 'test -f /v/.custom-rc' || fail "repo override not applied"
 assert_eq "$(involume nxt_p1_home 'cat /v/.custom-rc')" "OVERRIDE"

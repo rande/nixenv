@@ -14,7 +14,7 @@ applies-to:
 
 - Besides the unit test, a template change MUST be verified by running it in
   the dev project: `nixenv-docker init <p> --template=/app/templates/<name>.nix
-  --yes && nixenv-docker run <p>`, then `sv status ~/.nixenv-sv/*`, the
+  --yes && nixenv-docker start <p>`, then `sv status ~/.nixenv-sv/*`, the
   container log for ERROR/FATAL/WARN, an HTTP check on the declared port, and
   `nixenv-docker egress <p>`.
 

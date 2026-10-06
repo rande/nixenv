@@ -21,7 +21,7 @@ enforced-by:
 - Egress listener per captured project on **127.0.0.1**
   (`CAPTURE_EGRESS_BASE+n`), reached via squid `cache_peer … name=cap_X` with
   `cache_peer_access`/`never_direct allow p_X !nocapture_ports` — src+port ACLs
-  only (no new DNS); `never_direct` fails CLOSED; ports 22/9418 stay direct.
+  only (no new DNS); `never_direct` fails CLOSED; port 22 stays direct.
 
 ## Why
 

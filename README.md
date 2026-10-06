@@ -130,7 +130,7 @@ will be stale.
 ```sh
 nixenv build                 # download all deps into the volume (slow once)
 nixenv init myapp            # scaffold a project, prompts for git identity
-nixenv run myapp             # start the service (prints the SSH port;
+nixenv start myapp             # start the service (prints the SSH port;
                                   # also auto-starts the shared HTTPS proxy)
 nixenv ssh myapp             # SSH in as 'app'
 ```
@@ -165,11 +165,11 @@ interactive `zsh` via `docker exec` (no SSH key needed).
   optionally clone `git-url` into the app volume. `--build` also builds the
   project's flake afterwards. `--app-path=/path` mounts the code volume at a
   custom container path instead of `/app` (e.g. `/var/www/myapp`, to match
-  production); it's stored in `<project>/app_mount` and used by `run`, `shell`,
+  production); it's stored in `<project>/app_mount` and used by `start`, `shell`,
   and the login `cd`. For an `http(s)` URL it also prompts for a username +
   Personal Access Token and stores them (see
   [HTTPS credentials](#https-credentials)).
-- `run <project>` — start the project as a background service (`sshd` under
+- `start <project> [-v]` (alias `run`) — start the project as a background service (`sshd` under
   `runit`) and print its SSH port.
 - `ssh <project>` — SSH into the running service (auto-starts it). For
   persistent zmx sessions, use `ssh <project>` via your `~/.ssh/config` (see
@@ -199,11 +199,16 @@ interactive `zsh` via `docker exec` (no SSH key needed).
   and projects are untouched).
 - `logs <project>` — follow the service container logs.
 - `delete <project>` (alias `rm`) — permanently remove a project: its
-  container(s), the app/home/databases volumes, and its host dir. Prints the
+  container(s), the app/home/databases volumes (and the deploy state volume, if
+  any), and its host dir. Prints the
   exact commands it will run and asks for confirmation first.
 - `sync-home <project>` — refresh the home volume's dotfiles from the embedded
   templates + per-project overrides (see [Updating dotfiles](#updating-dotfiles-sync-home)).
 - `projects` — list projects with their SSH port and running state.
+- `ps [--json] [--watch [N]]` — what runs where: the ports each project's
+  processes actually listen on, with their proxy URLs, plus services and egress
+  settings. Also refreshes the dashboard at `https://nixenv.localhost/` (see
+  [Project dashboard](#project-dashboard-nixenv-ps)).
 - `update` — refresh `flake.lock`, then rebuild into the volume.
 - `status` — show context, volume, and shared-profile state.
 - `gc [--dry-run]` — garbage-collect the store (see
@@ -224,7 +229,7 @@ nixenv ssh myapp                       # convenience wrapper
 ssh -p <port> -i ~/.nixenv/projects/myapp/ssh/id_ed25519 app@127.0.0.1   # equivalent
 ```
 
-**Key-only login, with no setup.** The first `run` generates an ed25519 key for
+**Key-only login, with no setup.** The first `start` generates an ed25519 key for
 the project on your machine, in `~/.nixenv/projects/<name>/ssh/id_ed25519`, and
 wires it into both `nixenv ssh` and the generated `~/.ssh` config — so
 `ssh <project>`, zmx and VS Code Remote-SSH connect with no prompt, as before.
@@ -240,7 +245,7 @@ and root login is disabled.
 
 To use your own key as well (say, one already loaded in your agent), add it to
 `~/.nixenv/projects/<name>/ssh/authorized_keys.extra`, one per line. It's picked
-up on the next `run`, without a restart if the container is already up.
+up on the next `start`, without a restart if the container is already up.
 
 The key never leaves your machine: it isn't part of an `export`, so an imported
 project gets a new one.
@@ -256,7 +261,7 @@ generated config.
 
 > A container started before these changes still runs the old sshd (and, for
 > host-key pinning, the old host key, so `ssh` reports a changed key).
-> `nixenv run <name>` warns about it; `nixenv stop <name> && nixenv run <name>`
+> `nixenv start <name>` warns about it; `nixenv stop <name> && nixenv start <name>`
 > applies the fix.
 
 ## Terminal sessions (zmx) via `ssh <project>`
@@ -287,13 +292,13 @@ container's hostname is set to it), plus the zmx session when you're in one.
 
 ```sh
 nixenv init myblog   --template=wordpress    # WordPress + PHP + nginx + MariaDB
-nixenv run  myblog                           # → https://myblog-8080.nixenv.localhost/
+nixenv start  myblog                           # → https://myblog-8080.nixenv.localhost/
 
 nixenv init myworker --template=cloudflare   # Cloudflare Workers + wrangler
-nixenv run  myworker                         # → https://myworker-8787.nixenv.localhost/
+nixenv start  myworker                         # → https://myworker-8787.nixenv.localhost/
 
 nixenv init flows    --template=windmill     # Windmill self-hosted + PostgreSQL
-nixenv run  flows                            # → https://flows-8000.nixenv.localhost/
+nixenv start  flows                            # → https://flows-8000.nixenv.localhost/
 ```
 
 Shipped templates: `wordpress`, `cloudflare`, `symfony`,
@@ -422,7 +427,7 @@ nixenv expose myapp 0.0.0.0:80:80 # bind all interfaces (network-reachable)
 
 Ports are stored one-per-line in `~/.nixenv/projects/<name>/ports`, so they
 persist and you can also edit that file by hand. `expose` restarts the service
-to apply them; otherwise they take effect on the next `run`. A bare number binds
+to apply them; otherwise they take effect on the next `start`. A bare number binds
 to `127.0.0.1` (local only); pass a full `host:container` or
 `address:host:container` spec for anything else.
 
@@ -437,7 +442,7 @@ e.g. https://myapp-3000.nixenv.localhost/   →  your dev server on :3000
 ```
 
 Every project container automatically joins a shared network (`nixenv_net`) on
-`run`, and the proxy **auto-starts with the first project** (disable with
+`start`, and the proxy **auto-starts with the first project** (disable with
 `PROXY_AUTOSTART=0`), so usually there's nothing to do. Manage it explicitly
 with `nixenv proxy up | reload | stop | status | logs`. New projects need no proxy
 configuration — the routing is dynamic. Your app must listen on `0.0.0.0` (not
@@ -505,6 +510,53 @@ nixenv proxy reload
 Unrestricted projects share one flat network and can reach each other directly
 (`http://nixenv-other:8000/`), so this guard doesn't apply to them.
 
+### Project dashboard (`nixenv ps`)
+
+nixenv only knows the ports you *declare*. `nixenv ps` asks each running
+container which ports its processes **actually listen on**: it reads
+`/proc/net/tcp` through `docker exec`/`podman exec`, from the host. It prints
+them with their proxy URLs:
+
+```sh
+nixenv ps
+# shop                   running  restricted  ssh 2201
+#       8080  nginx  https://shop-8080.nixenv.localhost/
+#       5432  postgres  (127.0.0.1 only — not reachable through the proxy)
+#       services: nginx:run php-fpm:run worker:down
+#       denied: api.stripe.com×4   (allow: nixenv allow shop <host>)
+#       ! service 'worker' is down — check: nixenv logs shop
+```
+
+The same scan is published as a page at **`https://nixenv.localhost/`**, served
+by the shared proxy. Each project gets one full-width card. On the left are
+its open ports as links, its services, any warnings and, while capture is on,
+a link to its mitmweb UI. The UI still asks for its token: get the full URL
+from `nixenv capture <project> web`. On the right is the
+*Survey*, always shown: allowlist, `ssh_hosts`, `accept-from`, capture,
+declared ports, the ssh port and the extra engine parameters. Values passed
+with `-e`/`--env` are shown as `NAME=…`, never their content. Hosts squid
+refused are listed by `nixenv ps` and `nixenv egress <project>`. A *Help*
+section below the projects lists every command with its options and an
+example. The page uses the same paper/blueprint design as the project site.
+
+- **When it updates:** `ps`, `start`, `stop`, `proxy up` and `proxy reload` rewrite
+  it. Services take a while to start listening after `start`, so `start` also
+  re-checks after 10 s, 30 s and 90 s (change the delays with
+  `NIXENV_DASHBOARD_DELAYS="5 20 120"`, or turn this off with
+  `NIXENV_DASHBOARD_DELAYS=`). A project that started recently and has no open
+  port yet shows as *starting*. The page re-reads the data every 5 s, so
+  `nixenv ps --watch` (every 5 s, or `--watch 30`) keeps it live.
+  `nixenv ps --json` prints the same data for scripts.
+- **Who can see it:** your browser, and unrestricted projects (they share a
+  network anyway). Restricted projects get a `403`. The page holds no secrets:
+  no tokens, no credentials, environment values from `extra-parameters`
+  redacted, and deploy hosts only as a count. It is read-only,
+  with no buttons that change anything.
+- **An older proxy** doesn't have the page's files mounted yet. Run
+  `nixenv proxy up` once; `ps` and `proxy reload` remind you until you do.
+- **Ports bound to `127.0.0.1`** are shown but not linked: the proxy is another
+  container and can't reach them. Bind dev servers to `0.0.0.0`.
+
 ### Trusted certificates (mkcert)
 
 Out of the box the proxy uses Caddy's internal CA, so browsers show a warning.
@@ -521,7 +573,7 @@ stores and may ask for your password — the script **explains exactly what it
 does before running it**, and only runs it when the CA isn't already installed.
 Prefer manual control? Run `mkcert -install` yourself first, or skip trusting
 entirely with `PROXY_MKCERT_INSTALL=0` (HTTPS still works, with a warning). The
-auto-start on `run` never runs `mkcert -install`, so it can never surprise you
+auto-start on `start` never runs `mkcert -install`, so it can never surprise you
 with a prompt. `proxy renew` reissues the cert; `proxy remove-cert` deletes
 nixenv's cert (falling back to the internal CA) without touching mkcert's CA.
 
@@ -567,8 +619,8 @@ container. Enforcement is the missing route; squid is just policy, so nothing
 in the container can bypass the list. (squid used to run inside the proxy
 next to Caddy; it has its own container now, so restarting the reverse proxy
 no longer cuts every project off the network. A project container created
-before that still points at the old address — `run` tells you, and
-`nixenv stop <p> && nixenv run <p>` fixes it.) `HTTP(S)_PROXY` is exported automatically
+before that still points at the old address — `start` tells you, and
+`nixenv stop <p> && nixenv start <p>` fixes it.) `HTTP(S)_PROXY` is exported automatically
 (npm, pip, composer, cargo, curl, git-https, the Claude CLI all honour it), and
 ssh is routed through the proxy's CONNECT tunnel via a `ProxyCommand` added to
 the container's `~/.ssh/config` — so `git@…` remotes to **validated** forges
@@ -612,7 +664,7 @@ nixenv egress myapp -f                                 # follow live
 run the project, watch what gets blocked, `allow` what's legitimate. Limits to
 know: UDP (QUIC) isn't proxied (tools fall back to TCP); proxy-less raw-TCP
 clients can't reach external services (use ssh/CONNECT-capable paths); and the
-CONNECT ports are limited to 443/22/80/9418.
+CONNECT ports are limited to 443/22/80.
 
 **Port 22 only to your git host.** `init` writes the forge's hostname to
 `~/.nixenv/projects/<name>/ssh_hosts`, and only the hosts listed there can be
@@ -754,16 +806,24 @@ nixenv deploy myapp --agent=~/.ssh/deploy-agent.sock      # shell; exit = gone
 nixenv deploy myapp -- ./release.sh 1.2.0                 # or one command
 ```
 
-| | dev container (`run`) | deploy container (`deploy`) |
+| | dev container (`start`) | deploy container (`deploy`) |
 |---|---|---|
 | code (app volume) | read-write | read-write (the **same** volume) |
 | home | the home volume | **tmpfs**, rebuilt from the skeleton |
+| persistent state | home + databases volumes | **`/deploy`**: the deploy state volume |
 | git identity | home volume | the host seed's (written by `init`) |
 | git https credentials | home volume | **the dev container's** (its `~/.git-credentials`), seed as fallback |
 | tools | base + project profile | the same (base includes `age`, `sops`) |
 | egress | `allowed_hosts` | `allowed_hosts` **+** `deploy_hosts` |
 | your ssh agent | never | forwarded for the session |
 | lifetime | until `stop` | removed when you exit |
+
+**State.** Everything in the deploy home is gone when you exit. What must
+survive between sessions — terraform or ansible state, release bookkeeping —
+goes in `/deploy` (`$NIXENV_DEPLOY_STATE`), the volume `nixenv_<project>_deploy`.
+The first `deploy` creates it; later sessions reuse it. It is never mounted in
+the dev container, so code running there can neither read it nor plant files in
+it. `delete` removes it, and `export` includes it when it exists.
 
 **Allowlist.** The deploy container can reach everything the dev container can,
 plus `~/.nixenv/projects/<project>/deploy_hosts` (`deploy … allow`). Put
@@ -860,6 +920,8 @@ volume nixenv_<name>_app        → /app          (your code; the WORKDIR — cu
                                                  via init --app-path=/path)
 volume nixenv_<name>_home       → /home/<user>  (.ssh, .zshrc, .gitconfig, configs)
 volume nixenv_<name>_databases  → /databases    (persistent DB data: pgsql, redis, …)
+volume nixenv_<name>_deploy     → /deploy       (deploy container only; created by
+                                                 the first `deploy`)
 ```
 
 `/databases` is an empty, writable, per-project volume for database *data files*.
@@ -895,9 +957,9 @@ project's `.gitconfig` includes — so re-running `init` never duplicates the
 
 ### Extra engine parameters
 
-`init` and `run` create an empty `~/.nixenv/projects/<project>/extra-parameters`
+`init` and `start` create an empty `~/.nixenv/projects/<project>/extra-parameters`
 for you. Anything you put there is appended **verbatim** to the container's
-`run` — one flag per line, `#` comments allowed, no presets and no magic:
+`start` — one flag per line, `#` comments allowed, no presets and no magic:
 
 ```
 --memory=4g
@@ -906,7 +968,7 @@ for you. Anything you put there is appended **verbatim** to the container's
 
 There is no CLI flag for this on purpose; it's project state like `unrestricted`
 or `ports`. Parameters apply when the container is **created**, so re-run
-`nixenv run <project>` after editing. `run` echoes the active set.
+`nixenv start <project>` after editing. `start -v` echoes the active set.
 
 Every project container (and the proxy) starts hardened: `--cap-drop=ALL`,
 `--security-opt=no-new-privileges` and `--pids-limit=4096` (change it with
@@ -928,7 +990,7 @@ That's what the commented example in the scaffolded file is for — uncomment it
 --device /dev/net/tun                 # slirp4netns / pasta networking
 ```
 
-Drop any `--device` your engine host doesn't have — a missing device makes `run`
+Drop any `--device` your engine host doesn't have — a missing device makes `start`
 fail outright. Two more caveats: podman isn't in the base toolchain (add it to
 the project flake), and the container runs as your uid with no added
 capabilities and no `/etc/subuid`/`/etc/subgid`, so rootless podman inside is
@@ -1098,9 +1160,11 @@ Override via environment variables:
 - `PROXY_DOMAIN` (default `nixenv.localhost`), `PROXY_NET` (default
   `<prefix>_net`, i.e. `nixenv_net`), `PROXY_HTTP_PORT` / `PROXY_HTTPS_PORT` (default 80/443; use
   8080/8443 for rootless Podman), `PROXY_AUTOSTART` (default 1; 0 = don't start
-  the proxy on `run`), `PROXY_MKCERT_INSTALL` (0 = never run `mkcert -install`).
+  the proxy on `start`), `PROXY_MKCERT_INSTALL` (0 = never run `mkcert -install`).
 - `EGRESS_PORT` (default 3128) — squid's port inside the `nixenv__egress`
   container (not published; used by restricted projects).
+- `NIXENV_DASHBOARD_DELAYS` (default `10 30 90`) — seconds after `start` at which
+  the [dashboard](#project-dashboard-nixenv-ps) is re-checked; empty = off.
 
 Projects always live in `~/.nixenv/projects` (not configurable).
 
@@ -1113,7 +1177,7 @@ nixenv stop myapp                     # a live database tars inconsistently
 nixenv export myapp                   # → nixenv-myapp-20260927-101500.tar
 # ...copy it across...
 nixenv import nixenv-myapp-20260927-101500.tar
-nixenv build myapp && nixenv run myapp
+nixenv build myapp && nixenv start myapp
 ```
 
 `import <file> <new-name>` clones a project under a different name on the same
@@ -1121,11 +1185,14 @@ machine — handy for forking a database-heavy environment. Importing onto a nam
 that already exists needs `--force`, which **replaces that project's volumes** —
 it warns and asks first (`--yes` to skip the prompt).
 
-**What travels by default:** the `app` and `databases` volumes, plus everything
+**What travels by default:** the `app` and `databases` volumes, the `deploy`
+state volume if [`deploy`](#deploying-deploy) has created one, plus everything
 in `~/.nixenv/projects/<project>/` that isn't regenerated per machine — egress
 and deploy settings, ports, hosts, extra engine parameters, your extra
 authorized ssh keys, and the home seed with its git identity. Git credentials in
-the seed travel only with `--with-home`.
+the seed travel only with `--with-home`. If your deploy tools keep secrets in
+`/deploy` (terraform state often does), `export` warns that the archive holds
+them; `import` restores that volume only into `/deploy` of the deploy container.
 
 **An archive may be someone else's, so `import` checks what it restores.** Host
 lists and ports are re-validated (ports stay on loopback), the git identity is
@@ -1182,6 +1249,7 @@ nixenv ssh myapp && ssh-keygen -t ed25519
 `export` refuses while the project is running, because copying a live Postgres or
 MySQL data directory is crash-consistent at best. `--force` overrides it with a
 warning, which is fine for a code-only project and not fine for a database.
+It also refuses while a `deploy` session is open, for the same reason.
 
 Both commands report progress as they go, so a multi-GB volume doesn't look like a
 hang:
@@ -1210,7 +1278,7 @@ nixenv gc               # delete it, prints before → after size
 It deletes old profile generations plus every path not reachable from a live
 profile — the base (`shared`) and each `proj-<project>` — then hardlinks
 identical files. Everything your current toolchains reference is kept, so the
-next `run` needs no downloads.
+next `start` needs no downloads.
 
 Stop your projects first if you want a full sweep: a **running** container
 executes binaries from the store paths it started with, and if a rebuild has
@@ -1247,9 +1315,59 @@ prefixed before and after each test, and reuse the shared nix store volume
 disposable privileged DinD container with a named cache volume
 (`nixenv-dind-cache`) so repeat runs skip the store build.
 
+## FAQ
+
+**Which ports is my project actually serving, and at what URL?**
+Run `nixenv ps`, or open `https://nixenv.localhost/`. See
+[Project dashboard](#project-dashboard-nixenv-ps).
+
+**Can two projects talk to each other? Do I add the other one to `allowed_hosts`?**
+No: `allowed_hosts` is for the outside world. A restricted project has no route
+to other containers, and squid refuses any name that resolves to a private
+address, so `nixenv-other` in `allowed_hosts` is still denied. Instead, the
+**target** grants access in its `accept-from`, and the caller uses the target's
+public URL (`https://other-8000.nixenv.localhost/`):
+
+```sh
+echo myapp >> ~/.nixenv/projects/other/accept-from   # '*' = every project
+nixenv proxy reload                                  # no restart needed
+```
+
+The target decides, so a compromised caller can't grant itself access. Unrestricted
+projects share one network and reach each other directly (`http://nixenv-other:8000/`).
+See [Projects can't reach each other by default](#projects-cant-reach-each-other-by-default).
+
+**How do I reach a service on my host (`host.docker.internal`)? `--add-host` in `extra-parameters` does nothing.**
+`extra-parameters` is passed to the engine verbatim, but `--add-host` has no
+effect: nixenv mounts its own `/etc/hosts` and the entrypoint rebuilds it on
+every start (see [Custom /etc/hosts](#custom-etchosts)). The same applies to
+podman's automatic `host.containers.internal`.
+
+- From a **restricted** project you can't reach the host:
+  `host.docker.internal` resolves to a private address, which squid always
+  refuses. Even when the name is in `allowed_hosts`, the request shows up as
+  `TCP_DENIED` in `nixenv egress <project>`.
+- From an **unrestricted** project on Docker Desktop, it already works:
+  Docker's DNS resolves the name.
+- From an **unrestricted** project on Linux, map the name to the gateway of
+  the project network with `nixenv host`. The host service must listen on that
+  address or on `0.0.0.0`.
+
+```sh
+nixenv restrict myapp off
+gw="$(docker network inspect nixenv_net -f '{{(index .IPAM.Config 0).Gateway}}')"
+nixenv host myapp "host.docker.internal:$gw"
+nixenv stop myapp && nixenv start myapp
+```
+
+Use `extra-parameters` for flags the engine applies itself (`--memory`,
+`--ulimit`, `--device`, …). It is read only when the container is **created**,
+so after an edit run `stop` and then `start`: `start` on a running container keeps
+the old flags.
+
 ## Notes
 
-- Code, home, and databases live in named volumes and survive `stop`/`run` and
+- Code, home, and databases live in named volumes and survive `stop`/`start` and
   rebuilds; only `delete <project>` (with confirmation) and `clean` remove data.
   `~/.nixenv/projects/<name>/` on the host holds only small state (home seed,
   SSH config, git credentials, port).

@@ -42,6 +42,9 @@ export NIX_VOLUME="${NIX_VOLUME:-nixenv__nixos_store}"
 export PROXY_HTTP_PORT=18080 PROXY_HTTPS_PORT=18443
 export EGRESS_NET="nxt_net-egress"            # swept with the other nxt_* networks
 export PROXY_MKCERT_INSTALL=0                 # never touch trust stores in tests
+# No detached dashboard refresher outliving a test and writing into the next
+# one's state; tests that want it set NIXENV_DASHBOARD_DELAYS themselves.
+export NIXENV_DASHBOARD_DELAYS=""
 export GIT_USER_NAME="Nix Test" GIT_USER_EMAIL="test@nixenv.local"
 mkdir -p "$NIXTEST_HOME"
 

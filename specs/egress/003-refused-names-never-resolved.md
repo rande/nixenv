@@ -20,8 +20,9 @@ enforced-by:
   `deny all`.
 - Names and IPs share ONE `dstdomain -n` list per project; there is no
   per-project `dst` ACL.
-- CONNECT is limited to ports 443/22/80/9418; `to_localnets` denies loopback,
-  RFC1918, link-local (incl. 169.254.169.254) and IPv6 equivalents.
+- CONNECT is limited to ports 443/22/80 — NOT 9418 (git:// never goes through
+  an HTTP proxy, so a tunnel there could only be abused); `to_localnets` denies
+  loopback, RFC1918, link-local (incl. 169.254.169.254) and IPv6 equivalents.
 
 ## Why
 

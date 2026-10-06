@@ -16,9 +16,9 @@ enforced-by:
 
 - The ssh agent MUST never be forwarded into the dev container. `deploy <p>`
   runs `<prefix>__<p>-deploy` with `--rm`, `container_hardening_args`, the app
-  volume read-write at the app mount (the SAME volume), a **tmpfs** home, the
-  store, passwd files, the project's authorized_keys + host key, and the
-  `deploy-entrypoint.sh`.
+  volume read-write at the app mount (the SAME volume), its own state volume at
+  `/deploy` (DEP-05), a **tmpfs** home, the store, passwd files, the project's
+  authorized_keys + host key, and the `deploy-entrypoint.sh`.
 - It MUST NOT mount the home volume AS its home, nor the Claude profile. The
   dev home volume is mounted only at `/etc/nixenv/dev-home`, and only its
   `.git-credentials` is read (DEP-04). Tools = the dev container's (project
