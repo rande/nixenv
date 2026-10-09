@@ -62,7 +62,12 @@ assert_contains "$ep" 'etc/nixenv-hooks.sh' "flake-declared hook path"
 assert_contains "$ep" '$APP_MOUNT/.nixenv/hooks.sh' "repo hook path"
 assert_contains "$ep" '.nixenv-hooks.sh' "home hook path"
 assert_contains "$ep" 'command -v nixenv_pre_ssh_start' "hook presence check"
-assert_contains "$ep" 'nixenv_pre_ssh_start || echo' "hook failure tolerated"
+assert_contains "$ep" 'nixenv_pre_ssh_start || {' "hook failure tolerated"
+# Hooks run in their own errexit-off subshell, in the background block, so a
+# broken hook can neither kill PID 1 nor delay sshd (behaviour: 45-entrypoint-hooks).
+assert_contains "$ep" 'set +e' "hooks run with errexit off"
+hookblk_line="$(printf '%s\n' "$ep" | grep -n '^) &$' | tail -1 | cut -d: -f1)"
+sshd_line="$(printf '%s\n' "$ep" | grep -n 'exec "\$RUNSV" "\$SVROOT/sshd"' | cut -d: -f1)"
 # Ordering matters: PATH (so hooks can call project-flake binaries like a
 # <project>-setup script) → hook (so it can add services) → supervise scan.
 path_line="$(printf '%s\n' "$ep" | grep -n 'export PATH="$HOME/.local/bin:${_extra}' | cut -d: -f1)"
@@ -70,6 +75,8 @@ hook_line="$(printf '%s\n' "$ep" | grep -n 'command -v nixenv_pre_ssh_start' | c
 scan_line="$(printf '%s\n' "$ep" | grep -n 'for d in "\$SVROOT"/\*/' | cut -d: -f1)"
 [ "$path_line" -lt "$hook_line" ] || fail "PATH must be exported before hooks run"
 [ "$hook_line" -lt "$scan_line" ] || fail "hook must run before the service scan"
+[ "$scan_line" -lt "$hookblk_line" ] && [ "$hookblk_line" -lt "$sshd_line" ] \
+  || fail "hooks and services run in a background block before sshd's exec"
 
 # ssh is KEY-ONLY: sshd listens on every interface, so it is reachable
 # from other projects on nixenv_net and through the proxy relays. It must accept

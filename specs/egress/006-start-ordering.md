@@ -24,7 +24,7 @@ enforced-by:
 - A capture change detected by the pre-check pass (`CAPTURE_PENDING`) MUST
   still restart mitmproxy in the pass that follows.
 - The entrypoint waits (≤20s) for the egress proxy name to resolve before
-  running hooks.
+  running hooks (in the background block, so sshd is not delayed).
 
 ## Why
 

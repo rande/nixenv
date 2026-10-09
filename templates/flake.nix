@@ -104,8 +104,9 @@
 
           # --- Startup hook (optional) ----------------------------------------
           # DECLARED here at build time, EXECUTED at container start: nixenv
-          # SOURCES etc/nixenv-hooks.sh from this profile before any service
-          # (incl. sshd) starts. This is the only way to run project code at
+          # SOURCES etc/nixenv-hooks.sh from this profile before the project's
+          # services start (sshd is already up, so a failing hook never locks
+          # you out; see ~/.nixenv-hooks.status). This is the only way to run project code at
           # startup — a Nix build is sandboxed to its own $out and can never
           # write $HOME. The hook runs in the real container, as the app user,
           # with this profile already first on PATH.
@@ -120,8 +121,8 @@
           '';
           # Equivalent using the optional hook FUNCTION instead. Use this form if
           # you want a repo/home hook to be able to override it (last definition
-          # wins), or if the body needs `return` — never `exit` at top level,
-          # which would terminate the entrypoint:
+          # wins), or if the body needs `return` — an `exit` at top level skips
+          # every later hook and is reported as a failure:
           #
           #   startupHook = pkgs.writeTextDir "etc/nixenv-hooks.sh" '''
           #     nixenv_pre_ssh_start() {

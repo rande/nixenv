@@ -16,7 +16,10 @@ enforced-by:
   `run <project> cmd…`) and exits.
 - With no arguments it configures an unprivileged sshd on `$SSHD_PORT` (2222,
   no privsep, under `$HOME/.nixenv-sshd`) and `exec`s runit's `runsv` by
-  ABSOLUTE path as PID 1 — never `runsvdir`.
+  ABSOLUTE path as PID 1 — never `runsvdir`. The egress wait, the startup
+  hooks and the project services' `runsv`s run in a background block started
+  just before that `exec` (RUN-07); the services' `runsv`s are re-parented to,
+  and reaped by, PID 1.
 
 ## Why
 

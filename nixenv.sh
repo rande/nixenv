@@ -692,6 +692,16 @@ RELAY
   echo "nixenv: loopback relay 127.0.0.1:443/:80 → $NIXENV_PROXY_NAME (public URLs work in-container)"
 fi
 
+# sshd is started FIRST (step 3 execs its runsv as PID 1) and everything that
+# runs project code — the egress wait, the hooks, the project services — runs in
+# a background block next to it. A hook that dies, hangs or calls `exit` must
+# never take sshd down with it: under `set -e`, dash ends the WHOLE script on a
+# "command not found" at the top level of a sourced file, even in `. f || …`,
+# which killed PID 1 before sshd started and locked the user out.
+HOOK_STATUS="$HOME_DIR/.nixenv-hooks.status"   # ok | failed …, read by the host
+echo "starting" > "$HOOK_STATUS" 2>/dev/null || true
+
+(
 # 1a2. On a restricted project the proxy is the ONLY route out, and the hook
 # below may need it immediately (template first-run setup: composer/npm/wp-cli).
 # 'run' starts the proxy first, but give DNS a moment to settle rather than
@@ -714,23 +724,48 @@ fi
 # Files are SOURCED, so top-level code in them runs right away; additionally, if
 # the function `nixenv_pre_ssh_start` is defined, it is called after sourcing.
 # (Top-level = every hook file accumulates; the function = last definition wins,
-# so a repo/home hook can override the flake's. Never call `exit` at top level —
-# it would terminate the entrypoint; use `return` inside the function.)
+# so a repo/home hook can override the flake's.)
 # Hooks run AFTER PATH is set (project profile first) and the service tree is
-# refreshed, but BEFORE any service (incl. sshd) starts — so they can call
-# binaries from the project flake and create $HOME/.nixenv-sv/<name>/run entries
-# that get supervised in this same boot, seed config, wait on a dependency, etc.
-# A failing hook warns but never blocks the container from starting.
-for _hook in "${NIXENV_EXTRA_PROFILE:-}/etc/nixenv-hooks.sh" \
-             "$APP_MOUNT/.nixenv/hooks.sh" \
-             "$HOME_DIR/.nixenv-hooks.sh"; do
-  [ -f "$_hook" ] || continue
-  echo "nixenv: sourcing hooks $_hook"
-  . "$_hook" || echo "nixenv: WARNING failed to source $_hook"
-done
-if command -v nixenv_pre_ssh_start >/dev/null 2>&1; then
-  echo "nixenv: running hook nixenv_pre_ssh_start"
-  nixenv_pre_ssh_start || echo "nixenv: WARNING nixenv_pre_ssh_start returned non-zero"
+# refreshed, but BEFORE the project services start — so they can call binaries
+# from the project flake and create $HOME/.nixenv-sv/<name>/run entries that get
+# supervised in this same boot, seed config, wait on a dependency, etc. sshd is
+# already up, so you can log in while they run.
+# They run in their OWN subshell with errexit off: a failing command, a missing
+# binary or an `exit` ends only that subshell. Variables they set or export do
+# NOT reach the services — set those in the sv/<name>/run script. A failing hook
+# warns, is recorded in $HOOK_STATUS, and never blocks the services.
+if (
+  set +e
+  _bad=""
+  for _hook in "${NIXENV_EXTRA_PROFILE:-}/etc/nixenv-hooks.sh" \
+               "$APP_MOUNT/.nixenv/hooks.sh" \
+               "$HOME_DIR/.nixenv-hooks.sh"; do
+    [ -f "$_hook" ] || continue
+    echo "nixenv: sourcing hooks $_hook"
+    echo "running $_hook" > "$HOOK_STATUS" 2>/dev/null
+    . "$_hook" || { echo "nixenv: WARNING hook $_hook returned non-zero"; _bad="$_bad $_hook"; }
+  done
+  if command -v nixenv_pre_ssh_start >/dev/null 2>&1; then
+    echo "nixenv: running hook nixenv_pre_ssh_start"
+    echo "running nixenv_pre_ssh_start" > "$HOOK_STATUS" 2>/dev/null
+    nixenv_pre_ssh_start || { echo "nixenv: WARNING nixenv_pre_ssh_start returned non-zero"; _bad="$_bad nixenv_pre_ssh_start"; }
+  fi
+  if [ -n "$_bad" ]; then
+    echo "failed:$_bad" > "$HOOK_STATUS" 2>/dev/null
+    exit 1
+  fi
+  echo "ok" > "$HOOK_STATUS" 2>/dev/null
+  exit 0
+); then
+  :
+else
+  _rc=$?
+  # Still "running <hook>" = the hook aborted the subshell (exit, fatal error).
+  _st="$(cat "$HOOK_STATUS" 2>/dev/null || true)"
+  case "$_st" in
+    running\ *) echo "failed: ${_st#running } aborted (exit $_rc)" > "$HOOK_STATUS" 2>/dev/null || true ;;
+  esac
+  echo "nixenv: WARNING startup hooks failed — $(cat "$HOOK_STATUS" 2>/dev/null || echo "exit $_rc"); starting services anyway"
 fi
 
 # 2. Supervise EVERY service dir now present in $SVROOT (repo-declared, created
@@ -745,16 +780,19 @@ for d in "$SVROOT"/*/; do
   [ "$sname" = "sshd" ] && continue   # sshd is PID 1's own runsv below
   project_services="$project_services $sname"
 done
-
-echo "nixenv: unprivileged sshd ready on :$SSHD_PORT as '$APP_USER' (per-project key only)"
-[ -n "$project_services" ] && echo "nixenv: project services:$project_services"
+if [ -n "$project_services" ]; then echo "nixenv: project services:$project_services"; fi
 
 # runsvdir would be the natural multi-service supervisor, but in this container
 # it can't locate its runsv children — so we start each extra service under its
-# own runsv (background) and keep sshd's runsv as PID 1.
+# own runsv (background). When this block exits they are re-parented to PID 1,
+# sshd's runsv, which reaps any child.
 for s in $project_services; do
   "$RUNSV" "$SVROOT/$s" &
 done
+) &
+
+# 3. sshd's runsv is PID 1, started right away whatever the hooks do.
+echo "nixenv: unprivileged sshd ready on :$SSHD_PORT as '$APP_USER' (per-project key only)"
 exec "$RUNSV" "$SVROOT/sshd"
 NIXENV_ENTRYPOINT
 
@@ -4982,8 +5020,9 @@ dashboard_model_flake() {
 
           # --- Startup hook (optional) ----------------------------------------
           # DECLARED here at build time, EXECUTED at container start: nixenv
-          # SOURCES etc/nixenv-hooks.sh from this profile before any service
-          # (incl. sshd) starts. This is the only way to run project code at
+          # SOURCES etc/nixenv-hooks.sh from this profile before the project's
+          # services start (sshd is already up, so a failing hook never locks
+          # you out; see ~/.nixenv-hooks.status). This is the only way to run project code at
           # startup — a Nix build is sandboxed to its own $out and can never
           # write $HOME. The hook runs in the real container, as the app user,
           # with this profile already first on PATH.
@@ -4998,8 +5037,8 @@ dashboard_model_flake() {
           '';
           # Equivalent using the optional hook FUNCTION instead. Use this form if
           # you want a repo/home hook to be able to override it (last definition
-          # wins), or if the body needs `return` — never `exit` at top level,
-          # which would terminate the entrypoint:
+          # wins), or if the body needs `return` — an `exit` at top level skips
+          # every later hook and is reported as a failure:
           #
           #   startupHook = pkgs.writeTextDir "etc/nixenv-hooks.sh" '''
           #     nixenv_pre_ssh_start() {
