@@ -13,7 +13,7 @@ enforced-by:
 ## Rule
 
 - `proxy_make_cert` uses `mkcert` ONLY if the binary is present (wildcard
-  `*.PROXY_DOMAIN` into `~/.nixenv/proxy/certs`); otherwise the Caddyfile uses
+  `*.PROXY_DOMAIN`, plus `proxy_nip_site` when on, into `~/.nixenv/proxy/certs`); otherwise the Caddyfile uses
   `tls internal`.
 - `mkcert -install` (may prompt for a password) runs only when the CA isn't
   already present, and only after printing what it does.

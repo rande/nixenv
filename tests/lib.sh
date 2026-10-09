@@ -35,6 +35,10 @@ export CONTEXT_DIR="$NIXTEST_HOME/context"
 # invisible and the suite just hung; and answering it wrote the user's real
 # ~/.nixenv/engine.
 export ENGINE_FILE="$NIXTEST_HOME/engine"
+# The global settings file: a developer's real ~/.nixenv/config (e.g. a
+# PROXY_BIND) must never leak into the suite.
+export NIXENV_CONFIG="$NIXTEST_HOME/config"
+rm -f "$NIXENV_CONFIG"
 export CONTAINER_PREFIX="nxt"                 # containers nxt-*, volumes nxt_*, nets nxt_*
 # The store volume follows the prefix too; the suite deliberately reuses the
 # already-built one instead of building nxt__nixos_store.

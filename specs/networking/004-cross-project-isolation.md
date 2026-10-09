@@ -16,7 +16,8 @@ enforced-by:
 
 - `write_egress_configs` records `EGRESS_SUBNETS`; `caddy_isolation_rules`
   emits, per restricted project, `@xproj_<id>` = `remote_ip <subnet>` AND
-  `not header_regexp Host ^(<self>|<peers>)-[0-9]+\.<domain>…$` → `respond 403`.
+  `not header_regexp Host ^(<self>|<peers>)-[0-9]+<suffix>…$`, where
+  `<suffix>` covers `.<domain>` and the nip.io form (NET-01) → `respond 403`.
 - Peers come from the TARGET's `<target>/accept-from` (names or `*`; anything
   else dropped because it lands in a regex — `project_accept_from`).
 - The denies sit inside a `route {}` block BEFORE `reverse_proxy`, so

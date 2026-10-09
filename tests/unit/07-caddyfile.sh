@@ -17,7 +17,9 @@ assert_contains "$cf" "https_port 443"
 assert_contains "$cf" "*.$PROXY_DOMAIN"
 assert_contains "$cf" "tls internal" "internal CA mode"
 # Only project-name characters, never (.+).
-assert_contains "$cf" '^([a-zA-Z0-9_-]+)-([0-9]+)\.nixenv\.localhost(:[0-9]+)?$' "route regex"
+assert_contains "$cf" '^([a-zA-Z0-9_-]+)-([0-9]+)(\.nixenv\.localhost|-127\.0\.0\.1\.nip\.io)(:[0-9]+)?$' "route regex"
+# nip.io (PROXY_NIP_DOMAIN, on by default) shares the site, so the guard covers it.
+assert_contains "$cf" "*.$PROXY_DOMAIN, *.0.0.1.nip.io {" "nip.io wildcard in the same site"
 assert_not_contains "$cf" '(.+)' "no catch-all project group"
 assert_contains "$cf" "reverse_proxy @route ${CONTAINER_PREFIX}-{re.route.1}:{re.route.2}" "dynamic upstream uses container prefix"
 assert_contains "$cf" "header_up X-Forwarded-Proto https"
@@ -45,7 +47,7 @@ printf 'x)|.*(\nmy-app\n' > "$PROJECTS_DIR/alpha/accept-from"
 
 write_caddyfile 0
 cf="$(cat "$PROXY_DIR/Caddyfile")"
-dom='\.nixenv\.localhost(:[0-9]+)?$'
+dom='(\.nixenv\.localhost|-127\.0\.0\.1\.nip\.io)(:[0-9]+)?$'
 assert_contains "$cf" "remote_ip 10.89.1.0/24" "alpha identified by its subnet"
 assert_contains "$cf" "not header_regexp Host ^(alpha|beta|gamma)-[0-9]+$dom" "alpha: self + accepting peers"
 assert_contains "$cf" "not header_regexp Host ^(beta|gamma)-[0-9]+$dom" "beta: self + gamma(*) only"
@@ -79,6 +81,36 @@ allowed beta   "my-app-80.nixenv.localhost"       && fail "beta → my-app must 
 allowed alpha  "alpha-x-3000.nixenv.localhost"    && fail "alpha → 'alpha-x' must be denied"
 allowed my_app "my-app-80.nixenv.localhost"       || fail "my-app → itself must pass"
 allowed my_app "beta-80.nixenv.localhost"         && fail "my-app → beta must be denied"
+# The same rules hold for the nip.io form.
+allowed alpha  "alpha-3000-127.0.0.1.nip.io"      || fail "alpha → itself (nip.io) must pass"
+allowed alpha  "beta-8000-127.0.0.1.nip.io:8443"  || fail "alpha → beta (nip.io, accept-from) must pass"
+allowed beta   "alpha-3000-127.0.0.1.nip.io"      && fail "beta → alpha (nip.io) must be denied"
+allowed alpha  "alpha-x-3000-127.0.0.1.nip.io"    && fail "alpha → 'alpha-x' (nip.io) must be denied"
+allowed alpha  "alpha-3000-127.0.0.2.nip.io"      && fail "only the configured nip.io address"
+
+# The route regex parses both forms to the same project and port.
+route_re="$(printf '%s\n' "$cf" | awk '/@route header_regexp route Host/ {print $5; exit}')"
+for h in myapp-3000.nixenv.localhost myapp-3000-127.0.0.1.nip.io my-app-80-127.0.0.1.nip.io:8443; do
+  printf '%s' "$h" | grep -Eq "$route_re" || fail "route must match $h"
+done
+for h in myapp.0.0.1.nip.io myapp-x-127.0.0.1.nip.io myapp-3000-127.0.0.1.nip.io.evil.com; do
+  printf '%s' "$h" | grep -Eq "$route_re" && fail "route must not match $h"
+done
+[ "$(printf 'my-app-80-127.0.0.1.nip.io' | sed -E "s/$route_re/\1 \2/")" = "my-app 80" ] \
+  || fail "nip.io host parses to project my-app, port 80"
+
+# PROXY_NIP_DOMAIN: empty = off; anything that is not a plain DNS name is ignored
+# (it lands in a regex and a site address).
+for bad in "" "127.0.0.1.nip.io|.*" "nip.io" "*.nip.io" "127.0.0.1.NIP.io" ".nip.io"; do
+  PROXY_NIP_DOMAIN="$bad" write_caddyfile 0
+  c2="$(cat "$PROXY_DIR/Caddyfile")"
+  assert_not_contains "$c2" "nip" "PROXY_NIP_DOMAIN='$bad' → no nip.io route"
+  assert_contains "$c2" '-([0-9]+)\.nixenv\.localhost(:[0-9]+)?$' "PROXY_NIP_DOMAIN='$bad' → plain route"
+done
+PROXY_NIP_DOMAIN=10.0.0.5.sslip.io write_caddyfile 0
+c2="$(cat "$PROXY_DIR/Caddyfile")"
+assert_contains "$c2" "*.$PROXY_DOMAIN, *.0.0.5.sslip.io {" "another wildcard-DNS service"
+assert_contains "$c2" '(\.nixenv\.localhost|-10\.0\.0\.5\.sslip\.io)' "its suffix in the regex"
 
 # accept-from travels with an export (project config, machine independent).
 exports_path accept-from || fail "accept-from should travel with an export"
@@ -89,10 +121,26 @@ eg_fn="$(printf '%s' "$body" | sed -n '/^write_egress_configs()/,/^}/p' | code_o
 assert_contains "$eg_fn" 'reuseaddr\${RELAY_BIND:+,bind=\$RELAY_BIND}' "relays bind to RELAY_BIND"
 assert_contains "$eg_fn" 'RELAY_BIND="\$(hostname -I' "start.sh detects the primary address"
 
+# --- PROXY_BIND: extra host addresses for 80/443 (e.g. a Tailscale IP) ---------
+binds() { PROXY_BIND="$1" proxy_bind_addrs 2>/dev/null | tr '\n' ' '; }
+assert_eq "$(binds '')" "127.0.0.1 " "loopback only by default"
+assert_eq "$(binds '100.101.102.103')" "127.0.0.1 100.101.102.103 " "loopback is always kept"
+assert_eq "$(binds '100.1.2.3, 127.0.0.1 100.1.2.3')" "127.0.0.1 100.1.2.3 " "commas, duplicates"
+assert_eq "$(binds '0.0.0.0 100.1.2.3')" "0.0.0.0 " "0.0.0.0 replaces the rest (port clash)"
+for bad in 1.2.3 300.1.1.1 a.b.c.d -p 1.2.3.4.5 1..2.3 "1.2.3.4:80" "::1"; do
+  assert_eq "$(binds "$bad")" "127.0.0.1 " "PROXY_BIND='$bad' is ignored"
+done
+PROXY_BIND=x proxy_bind_addrs 2>&1 >/dev/null | grep -q "not an IPv4" || fail "invalid PROXY_BIND warns"
+# A change of bind address must recreate the proxy, not hot-reload it.
+s1="$(PROXY_BIND= proxy_start_sum 0)"; s2="$(PROXY_BIND=100.1.2.3 proxy_start_sum 0)"
+[ "$s1" != "$s2" ] || fail "PROXY_BIND must change the proxy-start checksum"
+
 # proxy up generates egress BEFORE the Caddyfile (EGRESS_SUBNETS dependency).
 px_fn="$(printf '%s' "$body" | sed -n '/^cmd_proxy()/,/^}/p' | code_only)"
 e_ln="$(printf '%s\n' "$px_fn" | grep -n 'write_egress_configs' | head -1 | cut -d: -f1)"
 c_ln="$(printf '%s\n' "$px_fn" | grep -n 'write_caddyfile' | head -1 | cut -d: -f1)"
 [ "$e_ln" -lt "$c_ln" ] || fail "write_egress_configs must run before write_caddyfile"
 assert_contains "$px_fn" "caddy\" reload" "proxy reload hot-reloads caddy"
+assert_contains "$px_fn" 'for bind in $(proxy_bind_addrs)' "80/443 published on every PROXY_BIND address"
+assert_not_contains "$px_fn" '-p "127.0.0.1:$PROXY_HTTP_PORT:80"' "no hard-coded loopback publish"
 true

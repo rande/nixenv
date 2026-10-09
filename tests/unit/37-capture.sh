@@ -127,7 +127,7 @@ EGRESS_SUBNETS="alpha 172.30.9.0/24
 beta 172.30.10.0/24"
 write_caddyfile 0
 cf="$(cat "$PROXY_DIR/Caddyfile")"
-assert_contains "$cf" '@cap_alpha header_regexp cap_alpha Host ^alpha-([0-9]+)\.nixenv\.localhost(:[0-9]+)?$'
+assert_contains "$cf" '@cap_alpha header_regexp cap_alpha Host ^alpha-([0-9]+)(\.nixenv\.localhost|-127\.0\.0\.1\.nip\.io)(:[0-9]+)?$'
 assert_contains "$cf" "reverse_proxy @cap_alpha nxt-alpha:{re.cap_alpha.1}"
 assert_contains "$cf" "forward_proxy_url http://$EGRESS_LINK:$((CAPTURE_INGRESS_BASE + 1))"
 assert_contains "$cf" "header_up X-Nixenv-Upstream nxt-alpha:{re.cap_alpha.1}"

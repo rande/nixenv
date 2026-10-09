@@ -47,6 +47,7 @@ enforced-by:                    # optional: tests that fail when it is broken
 - [CORE-06](core/006-prefix-naming.md) All engine-side names derive from CONTAINER_PREFIX
 - [CORE-07](core/007-early-dispatch.md) help, version, install run before materialize_context
 - [CORE-08](core/008-user-data-safety.md) Never commit or casually destroy ~/.nixenv/projects
+- [CORE-09](core/009-global-config-file.md) ~/.nixenv/config holds global settings, parsed and never sourced
 
 ### Toolchain — The shared Nix store, project flakes, PATH
 

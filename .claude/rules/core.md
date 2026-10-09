@@ -12,3 +12,4 @@ change alters a rule, update its spec in the same commit.
 - CORE-06 All engine-side names derive from CONTAINER_PREFIX: @../../specs/core/006-prefix-naming.md
 - CORE-07 help, version, install run before materialize_context: @../../specs/core/007-early-dispatch.md
 - CORE-08 Never commit or casually destroy ~/.nixenv/projects: @../../specs/core/008-user-data-safety.md
+- CORE-09 ~/.nixenv/config holds global settings, parsed and never sourced: @../../specs/core/009-global-config-file.md

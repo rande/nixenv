@@ -461,7 +461,45 @@ configuration — the routing is dynamic. Your app must listen on `0.0.0.0` (not
 `127.0.0.1`) inside its container so the proxy can reach it.
 
 `*.localhost` resolves to `127.0.0.1` automatically in Chrome and Firefox;
-Safari needs an `/etc/hosts` line. The proxy sends the standard forwarded
+Safari needs an `/etc/hosts` line — or use the **nip.io** form, a real DNS
+name that resolves to `127.0.0.1` everywhere:
+
+```
+https://<project>-<port>-127.0.0.1.nip.io/   →  same route as <project>-<port>.nixenv.localhost
+e.g. https://myapp-3000-127.0.0.1.nip.io/
+```
+
+It is on by default (`PROXY_NIP_DOMAIN=127.0.0.1.nip.io`; set it empty to turn
+it off, or to another wildcard-DNS name such as `10.0.0.5.sslip.io`). It relies
+on the public nip.io resolver: the names you open are sent to it, and some
+routers drop DNS answers that point at `127.0.0.1` (DNS rebinding protection).
+Restricted projects have no outside DNS, so from inside them use the
+`.nixenv.localhost` form. After upgrading, run `nixenv proxy up` once so an
+mkcert certificate covers the new name.
+
+#### From your other devices (Tailscale)
+
+The proxy listens on `127.0.0.1` only. To reach your projects from another
+device on your tailnet, publish it on your Tailscale address too and point
+the nip.io names at it:
+
+```sh
+# every nixenv command must see the same values: keep them in ~/.nixenv/config
+ip="$(tailscale ip -4)"                                # e.g. 100.101.102.103
+printf 'PROXY_BIND=%s\nPROXY_NIP_DOMAIN=%s.nip.io\n' "$ip" "$ip" >> ~/.nixenv/config
+nixenv proxy up        # recreates the proxy with the new address and cert
+# → https://myapp-3000-100.101.102.103.nip.io/ from any device on the tailnet
+```
+
+`PROXY_BIND` takes IPv4 addresses (several, space- or comma-separated);
+`127.0.0.1` is always kept, so the local URLs keep working. `0.0.0.0` publishes
+on every interface, your LAN included. **Everything served by the proxy is then
+reachable from that network**: every project's web ports and the dashboard.
+Project ssh ports stay on loopback. Other devices must trust the proxy's CA to avoid
+certificate warnings: install `~/.nixenv/proxy/certs/rootCA.pem` (mkcert's or
+Caddy's root) on them. If the address is missing when the proxy starts (e.g.
+Tailscale is down), the engine refuses to publish on it and the proxy doesn't
+start. The proxy sends the standard forwarded
 headers (`X-Forwarded-Proto: https`, `X-Forwarded-For/-Host/-Port`,
 `X-Real-IP`), so frameworks behind a trusted proxy generate correct `https://`
 URLs. Host ports default to 80/443 (`PROXY_HTTP_PORT`/`PROXY_HTTPS_PORT`; use
@@ -1152,7 +1190,22 @@ and are auto-pruned after ~30 days; raise `"cleanupPeriodDays"` in the project's
 
 ## Configuration
 
-Override via environment variables:
+The proxy settings (`PROXY_DOMAIN`, `PROXY_NIP_DOMAIN`, `PROXY_BIND`,
+`PROXY_HTTP_PORT`, `PROXY_HTTPS_PORT`, `PROXY_AUTOSTART`,
+`PROXY_MKCERT_INSTALL`) can be kept in **`~/.nixenv/config`**, one `KEY=VALUE`
+per line, so every command sees them without exporting anything:
+
+```sh
+# ~/.nixenv/config
+PROXY_BIND=100.101.102.103
+PROXY_NIP_DOMAIN=100.101.102.103.nip.io
+```
+
+The file is read, never executed; other keys are ignored with a warning, and
+an environment variable still overrides it for one command. `nixenv --help`
+shows the values in effect.
+
+Everything below can be overridden via environment variables:
 
 - `CONTAINER_ENGINE` (`docker` or `podman`; auto-detects, asks if both present)
 - `CONTEXT_DIR` (default `~/.nixenv/context`)
@@ -1170,7 +1223,10 @@ Override via environment variables:
   prompt (for `init` with an `http(s)` URL).
 - `APP_MOUNT` — default code-volume mount path for `init` (same as
   `--app-path`).
-- `PROXY_DOMAIN` (default `nixenv.localhost`), `PROXY_NET` (default
+- `PROXY_DOMAIN` (default `nixenv.localhost`), `PROXY_NIP_DOMAIN` (default
+  `127.0.0.1.nip.io`; empty = no `<project>-<port>-127.0.0.1.nip.io` route),
+  `PROXY_BIND` (extra host IPv4 addresses for the proxy's 80/443, e.g. your
+  Tailscale IP; `127.0.0.1` is always kept), `PROXY_NET` (default
   `<prefix>_net`, i.e. `nixenv_net`), `PROXY_HTTP_PORT` / `PROXY_HTTPS_PORT` (default 80/443; use
   8080/8443 for rootless Podman), `PROXY_AUTOSTART` (default 1; 0 = don't start
   the proxy on `start`), `PROXY_MKCERT_INSTALL` (0 = never run `mkcert -install`).

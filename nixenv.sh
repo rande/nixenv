@@ -32,6 +32,42 @@ set -euo pipefail
 # Bump on release; the Homebrew formula's `test` asserts this matches its tag.
 NIXENV_VERSION="0.5.0"
 
+# ── Global settings file ──────────────────────────────────────────────────────
+# ~/.nixenv/config holds KEY=VALUE lines for the settings in NIXENV_CONFIG_KEYS,
+# so they need not be exported in every shell (every command must see the same
+# proxy settings, or a 'start' rewrites the proxy without them). It is PARSED,
+# never sourced: no code runs, unknown keys are ignored with a warning, and a
+# variable set in the environment (even to "") still wins over the file.
+NIXENV_CONFIG="${NIXENV_CONFIG:-$HOME/.nixenv/config}"
+NIXENV_CONFIG_KEYS="PROXY_DOMAIN PROXY_NIP_DOMAIN PROXY_BIND PROXY_HTTP_PORT PROXY_HTTPS_PORT PROXY_AUTOSTART PROXY_MKCERT_INSTALL"
+load_config() {
+  local line key val q
+  [ -f "$NIXENV_CONFIG" ] && [ -r "$NIXENV_CONFIG" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"          # leading blanks
+    case "$line" in ""|\#*) continue ;; esac
+    line="${line#export }"
+    case "$line" in
+      *=*) ;;
+      *) echo "nixenv: $NIXENV_CONFIG: not KEY=VALUE, ignored: $line" >&2; continue ;;
+    esac
+    key="${line%%=*}"; key="${key%"${key##*[![:space:]]}"}"
+    val="${line#*=}"; val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+    case " $NIXENV_CONFIG_KEYS " in
+      *" $key "*) ;;
+      *) echo "nixenv: $NIXENV_CONFIG: unknown setting '$key', ignored" >&2; continue ;;
+    esac
+    # Optional matching quotes around the value.
+    case "$val" in
+      \"*\"|\'*\') q="${val%"${val#?}"}"; val="${val#"$q"}"; val="${val%"$q"}" ;;
+    esac
+    # $key is one of NIXENV_CONFIG_KEYS here, so the eval only tests a known name.
+    if eval "[ -n \"\${$key+x}\" ]"; then continue; fi   # the environment wins
+    printf -v "$key" '%s' "$val"
+  done < "$NIXENV_CONFIG"
+}
+load_config
+
 # ── Configuration (override via env) ─────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTEXT_DIR="${CONTEXT_DIR:-$HOME/.nixenv/context}"  # embedded files written here
@@ -75,8 +111,10 @@ PROXY_NET="${PROXY_NET:-${CONTAINER_PREFIX}_net}"    # shared user network all p
 PROXY_NAME="${CONTAINER_PREFIX}__proxy"              # the Caddy proxy container name
 PROXY_DIR="${PROXY_DIR:-$HOME/.nixenv/proxy}"        # Caddyfile + certs + caddy data
 PROXY_DOMAIN="${PROXY_DOMAIN:-nixenv.localhost}"     # base domain: <project>-<port>.<PROXY_DOMAIN>
+PROXY_NIP_DOMAIN="${PROXY_NIP_DOMAIN-127.0.0.1.nip.io}" # also <project>-<port>-<this> (wildcard DNS); empty = off
 PROXY_HTTP_PORT="${PROXY_HTTP_PORT:-80}"             # host port → caddy 8080 (use 8080 for podman rootless)
 PROXY_HTTPS_PORT="${PROXY_HTTPS_PORT:-443}"          # host port → caddy 8443 (use 8443 for podman rootless)
+PROXY_BIND="${PROXY_BIND:-}"                         # extra host IPs for 80/443 (e.g. a Tailscale IP); 127.0.0.1 always
 PROXY_AUTOSTART="${PROXY_AUTOSTART:-1}"              # auto-start the proxy on 'run' (0 to disable)
 EGRESS_PORT="${EGRESS_PORT:-3128}"                   # squid egress port INSIDE the egress container (not published)
 EGRESS_NAME="${CONTAINER_PREFIX}__egress"            # egress container: squid (+ mitmproxy while capturing)
@@ -1489,6 +1527,34 @@ ensure_proxy_running() {
   ) || warn "proxy auto-start failed — start it with '$0 proxy up' (needs caddy: '$0 build')"
 }
 
+# Host addresses the proxy's 80/443 are published on, one per line: 127.0.0.1
+# plus the IPv4 literals in PROXY_BIND (e.g. a Tailscale 100.x address, to
+# reach the projects from your other devices). Anything else is skipped with a
+# warning: it becomes a -p argument. 0.0.0.0 (every interface) replaces the
+# rest — the engine can't also bind 127.0.0.1 on the same port.
+proxy_bind_addrs() {
+  local a out="127.0.0.1" o1 o2 o3 o4 rest
+  for a in $(printf '%s' "$PROXY_BIND" | tr ',' ' '); do
+    IFS=. read -r o1 o2 o3 o4 rest <<EOF
+$a
+EOF
+    case "$a" in *[!0-9.]*|.*|*.|*..*) o4="";; esac
+    if [ -z "$o4" ] || [ -n "$rest" ] || [ "$o1" -gt 255 ] || [ "$o2" -gt 255 ] \
+       || [ "$o3" -gt 255 ] || [ "$o4" -gt 255 ]; then
+      warn "PROXY_BIND: '$a' is not an IPv4 address — ignored" >&2
+      continue
+    fi
+    if [ "$a" = 0.0.0.0 ]; then out="0.0.0.0"; break; fi
+    case "
+$out
+" in *"
+$a
+"*) ;; *) out="$out
+$a" ;; esac
+  done
+  printf '%s\n' "$out"
+}
+
 # Checksum of what the proxy container fixes at CREATION — start.sh (relays),
 # its published ports and the cert mount — stored as a label so a restricted
 # 'run' can hot-reload a proxy that already has them instead of recreating it
@@ -1497,6 +1563,7 @@ PROXY_SUM_LABEL="nixenv.proxy-start"
 proxy_start_sum() {
   { cat "$PROXY_DIR/egress/start.sh" 2>/dev/null
     printf '%s\n' "cert=$1" "http=$PROXY_HTTP_PORT https=$PROXY_HTTPS_PORT" ${EGRESS_PUB[@]+"${EGRESS_PUB[@]}"}
+    proxy_bind_addrs 2>/dev/null
   } | cksum | awk '{print $1 "-" $2}'
 }
 
@@ -3453,6 +3520,41 @@ capture_apply() {
 # (non-root); the host publish maps PROXY_HTTP_PORT/PROXY_HTTPS_PORT onto them.
 # =============================================================================
 
+# The optional wildcard-DNS form <project>-<port>-<PROXY_NIP_DOMAIN>, e.g.
+# myapp-3000-127.0.0.1.nip.io: a real DNS name that resolves to 127.0.0.1
+# everywhere (Safari, CLI tools, resolvers that ignore *.localhost). Prints the
+# domain, or returns 1 when it is off or invalid (it lands in a regex and a site
+# address, so only lowercase DNS characters and at least three labels).
+proxy_nip_domain() {
+  case "$PROXY_NIP_DOMAIN" in
+    ""|.*|*.|*..*|*[!a-z0-9.-]*) return 1 ;;
+    *.*.*) printf '%s' "$PROXY_NIP_DOMAIN" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Caddy site address / cert name covering <project>-<port>-<nip domain>: the
+# first label is "<project>-<port>-127", so the wildcard is the rest:
+# *.0.0.1.nip.io (a wildcard covers exactly one label).
+proxy_nip_site() {
+  local n; n="$(proxy_nip_domain)" || return 1
+  printf '*.%s' "${n#*.}"
+}
+
+# Regex for what follows "<project>-<port>" in a routed Host header:
+# \.<PROXY_DOMAIN>, or (\.<PROXY_DOMAIN>|-<PROXY_NIP_DOMAIN>) when nip is on.
+# The route, the cross-project guard (NET-04) and ingress capture all use it,
+# so every name form is guarded the same way.
+proxy_host_suffix_re() {
+  local d n
+  d="$(printf '%s' "$PROXY_DOMAIN" | sed 's/\./\\./g')"
+  if n="$(proxy_nip_domain)"; then
+    printf '(\\.%s|-%s)' "$d" "$(printf '%s' "$n" | sed 's/\./\\./g')"
+  else
+    printf '\\.%s' "$d"
+  fi
+}
+
 # Issue a trusted wildcard cert with mkcert if available (into $PROXY_DIR/certs).
 # Returns 0 when a cert is ready, 1 to signal "use Caddy internal CA".
 #
@@ -3492,8 +3594,10 @@ proxy_make_cert() {
     log "PROXY_MKCERT_INSTALL=0 — not installing mkcert's CA (HTTPS will be untrusted)"
   fi
 
+  local names; names=("*.$PROXY_DOMAIN" "$PROXY_DOMAIN")
+  if proxy_nip_site >/dev/null; then names+=("$(proxy_nip_site)"); fi
   if mkcert -cert-file "$PROXY_DIR/certs/wildcard.pem" -key-file "$PROXY_DIR/certs/wildcard-key.pem" \
-       "*.$PROXY_DOMAIN" "$PROXY_DOMAIN" >/dev/null 2>&1; then
+       "${names[@]}" >/dev/null 2>&1; then
     # Publish the CA so CONTAINERS can trust these certs too (the host trusts it
     # via the OS store; containers get it mounted + merged into their bundle).
     [ -f "$caroot/rootCA.pem" ] && cp "$caroot/rootCA.pem" "$PROXY_DIR/certs/rootCA.pem" 2>/dev/null || true
@@ -4126,7 +4230,7 @@ project_accepts() {
 # project's --internal subnet may only target that project, or a project whose
 # accept-from names it.
 caddy_isolation_rules() {
-  local dom_re="$1" name subnet id targets tdir t matchers="" denies=""
+  local host_re="$1" name subnet id targets tdir t matchers="" denies=""
   while read -r name subnet; do
     [ -n "$name" ] && [ -n "$subnet" ] || continue
     case "$name" in -*|*[!a-zA-Z0-9_-]*) continue;; esac
@@ -4142,7 +4246,7 @@ caddy_isolation_rules() {
     matchers="$matchers
 	@xproj_$id {
 		remote_ip $subnet
-		not header_regexp Host ^($targets)-[0-9]+\\.$dom_re(:[0-9]+)?\$
+		not header_regexp Host ^($targets)-[0-9]+$host_re(:[0-9]+)?\$
 	}"
     denies="$denies
 		respond @xproj_$id \"nixenv proxy: project '$name' may not reach {host} (add '$name' to the target's accept-from)\" 403"
@@ -4170,7 +4274,7 @@ capture_ui_url() {
 # travels in X-Nixenv-Upstream (set here, overwriting anything a client sent;
 # the addon accepts only this project's container and strips it).
 caddy_capture_routes() {
-  local dom_re="$1" name port id matchers="" routes=""
+  local host_re="$1" name port id matchers="" routes=""
   for name in ${CAPTURE_PROJECTS:-}; do
     case "$name" in -*|*[!a-zA-Z0-9_-]*) continue;; esac
     id="$(printf '%s' "$name" | tr -c 'a-zA-Z0-9' '_')"
@@ -4188,7 +4292,7 @@ caddy_capture_routes() {
     case "$port" in *[!0-9]*) continue;; esac
     id="$(printf '%s' "$name" | tr -c 'a-zA-Z0-9' '_')"
     matchers="$matchers
-	@cap_$id header_regexp cap_$id Host ^$name-([0-9]+)\\.$dom_re(:[0-9]+)?\$"
+	@cap_$id header_regexp cap_$id Host ^$name-([0-9]+)$host_re(:[0-9]+)?\$"
     routes="$routes
 		# 'nixenv capture $name': recorded by mitmproxy on the way in.
 		reverse_proxy @cap_$id $CONTAINER_PREFIX-$name:{re.cap_$id.1} {
@@ -4211,18 +4315,24 @@ EOF
 # Call write_egress_configs FIRST: the cross-project guard needs EGRESS_SUBNETS,
 # and ingress capture needs CAPTURE_INGRESS.
 write_caddyfile() {
-  local tls_line dom_re rules guards denies caps capmatch caproutes dash_deny="" rsubnets
+  local tls_line host_re nip_site="" rules guards denies caps capmatch caproutes dash_deny="" rsubnets
   mkdir -p "$PROXY_DIR"
-  dom_re="$(printf '%s' "$PROXY_DOMAIN" | sed 's/\./\\./g')"
+  host_re="$(proxy_host_suffix_re)"
+  local site_note="# <project>-<port>.$PROXY_DOMAIN"
+  if proxy_nip_site >/dev/null; then
+    nip_site=", $(proxy_nip_site)"
+    # ONE site for both forms, so the cross-project guard below covers both.
+    site_note="$site_note, and <project>-<port>-$(proxy_nip_domain) (PROXY_NIP_DOMAIN)"
+  fi
   if [ "${1:-0}" = 1 ]; then
     tls_line="tls /certs/wildcard.pem /certs/wildcard-key.pem"
   else
     tls_line="tls internal"
   fi
-  rules="$(caddy_isolation_rules "$dom_re")"
+  rules="$(caddy_isolation_rules "$host_re")"
   guards="$(printf '%s\n' "$rules" | sed '/^--$/,$d')"
   denies="$(printf '%s\n' "$rules" | sed '1,/^--$/d')"
-  caps="$(caddy_capture_routes "$dom_re")"
+  caps="$(caddy_capture_routes "$host_re")"
   capmatch="$(printf '%s\n' "$caps" | sed '/^--$/,$d')"
   caproutes="$(printf '%s\n' "$caps" | sed '1,/^--$/d')"
   # The dashboard (NET-05) lists every project: not for restricted ones, which
@@ -4247,10 +4357,11 @@ write_caddyfile() {
 	https_port 443
 }
 
-*.$PROXY_DOMAIN {
+$site_note
+*.$PROXY_DOMAIN$nip_site {
 	$tls_line
 	# Project names are [a-zA-Z0-9_-] (valid_project_name) — nothing looser.
-	@route header_regexp route Host ^([a-zA-Z0-9_-]+)-([0-9]+)\.$dom_re(:[0-9]+)?\$
+	@route header_regexp route Host ^([a-zA-Z0-9_-]+)-([0-9]+)$host_re(:[0-9]+)?\$
 $guards$capmatch
 	# 'route' keeps this order literally (Caddy would otherwise sort directives).
 	route {
@@ -4309,8 +4420,18 @@ cmd_proxy() {
       egress_up
       local certmount; certmount=()
       [ "$cert" = 1 ] && certmount=(-v "$PROXY_DIR/certs:/certs:ro")
+      # 80/443 on every PROXY_BIND address. The relays in EGRESS_PUB (restricted
+      # projects' ssh and ports) stay on loopback whatever PROXY_BIND says.
+      local bind binds="" webpub; webpub=()
+      for bind in $(proxy_bind_addrs); do
+        webpub+=(-p "$bind:$PROXY_HTTP_PORT:80" -p "$bind:$PROXY_HTTPS_PORT:443")
+        binds="$binds $bind"
+        if [ "$bind" != 127.0.0.1 ]; then
+          warn "proxy published on $bind: every project's web ports (and the dashboard) are reachable from that network"
+        fi
+      done
       "$ENGINE" rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
-      log "Starting proxy '$PROXY_NAME' — *.$PROXY_DOMAIN on 127.0.0.1:$PROXY_HTTP_PORT/$PROXY_HTTPS_PORT"
+      log "Starting proxy '$PROXY_NAME' — *.$PROXY_DOMAIN on${binds} :$PROXY_HTTP_PORT/$PROXY_HTTPS_PORT"
       "$ENGINE" run -d \
         --name "$PROXY_NAME" \
         --label "$PROXY_SUM_LABEL=$(proxy_start_sum "$cert")" \
@@ -4319,8 +4440,7 @@ cmd_proxy() {
         $(engine_userns) \
         $(container_hardening_args) \
         --sysctl net.ipv4.ip_unprivileged_port_start=0 \
-        -p "127.0.0.1:$PROXY_HTTP_PORT:80" \
-        -p "127.0.0.1:$PROXY_HTTPS_PORT:443" \
+        "${webpub[@]}" \
         ${EGRESS_PUB[@]+"${EGRESS_PUB[@]}"} \
         -v "$NIX_VOLUME":/nix:ro \
         -v "$PROXY_DIR/Caddyfile":/etc/caddy/Caddyfile:ro \
@@ -4358,6 +4478,9 @@ cmd_proxy() {
       ok "proxy running as '$PROXY_NAME'"
       [ "${NIXENV_QUIET:-0}" = 1 ] && return 0   # 'start' without -v: no info block
       echo "   scheme: https://<project>-<port>.$PROXY_DOMAIN/   (e.g. https://myapp-3000.$PROXY_DOMAIN/)"
+      if proxy_nip_domain >/dev/null; then
+        echo "           https://<project>-<port>-$(proxy_nip_domain)/   (wildcard DNS; PROXY_NIP_DOMAIN= to disable)"
+      fi
       if [ "$cert" = 1 ]; then echo "   tls:    trusted wildcard cert via mkcert"
       else echo "   tls:    Caddy internal CA (browser warning until you install/trust mkcert)"; fi
       echo "   net:    $PROXY_NET  (projects auto-join on '$0 start')"
@@ -7495,7 +7618,8 @@ nixenv generates a per-project key in <project>/ssh/ and nothing else is accepte
 (add your own keys to <project>/ssh/authorized_keys.extra). Use 'ssh-config
 --install', then 'ssh <project>' (plain shell) or 'ssh <project>.<x>' (zmx session).
 
-Environment overrides:
+Environment overrides (the PROXY_* ones can also live in $NIXENV_CONFIG,
+one KEY=VALUE per line; the environment wins):
   CONTAINER_ENGINE=${CONTAINER_ENGINE:-auto}   (docker|podman; auto-detects, asks if both)
   CONTEXT_DIR=$CONTEXT_DIR
   NIX_VOLUME=$NIX_VOLUME
@@ -7508,6 +7632,8 @@ Environment overrides:
   INSTALL_DIR=${INSTALL_DIR:-/usr/local/bin}   (install/uninstall target dir)
   INSTALL_NAME=${INSTALL_NAME:-nixenv}         (installed command name)
   PROXY_DOMAIN=$PROXY_DOMAIN            (base domain for the proxy)
+  PROXY_NIP_DOMAIN=$PROXY_NIP_DOMAIN    (also route <project>-<port>-<this>, e.g. nip.io; empty = off)
+  PROXY_BIND=$PROXY_BIND                (extra host IPs for the proxy's 80/443, e.g. your Tailscale IP)
   PROXY_NET=$PROXY_NET                  (shared user network)
   PROXY_HTTP_PORT=$PROXY_HTTP_PORT / PROXY_HTTPS_PORT=$PROXY_HTTPS_PORT   (host ports; use 8080/8443 for podman rootless)
   PROXY_AUTOSTART=$PROXY_AUTOSTART                     (auto-start the proxy on 'start'; 0 to disable)
