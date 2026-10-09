@@ -852,6 +852,15 @@ export GIT_CONFIG_KEY_1=core.hooksPath   GIT_CONFIG_VALUE_1=/dev/null
 export GIT_CONFIG_KEY_2=core.sshCommand  GIT_CONFIG_VALUE_2=ssh
 EOF
 
+# Shell history outlives the tmpfs HOME in the deploy state volume (DEP-05) —
+# never in the dev home volume: commands typed here can carry production
+# secrets. oh-my-zsh keeps HISTFILE when it is already set.
+_state="${NIXENV_DEPLOY_STATE:-/deploy}"
+if [ -d "$_state" ] && [ -w "$_state" ]; then
+  touch "$_state/.zsh_history" && chmod 600 "$_state/.zsh_history"
+  echo "export HISTFILE=\"$_state/.zsh_history\"" >> "$HOME_DIR/.zshenv"
+fi
+
 # Git identity: the seed's file, mounted by 'deploy' (the skeleton .gitconfig
 # includes it). Credentials: the dev container's ~/.git-credentials (its home
 # volume, at /etc/nixenv/dev-home) FIRST, so deploy pushes with whatever works

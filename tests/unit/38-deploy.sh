@@ -197,6 +197,10 @@ case "$cred_order" in *" "*" "*) ;; *) fail "two store helpers expected, got lin
 for bad in hooks.sh nixenv-hooks.sh "/sv/" runsv .nixenv/sv nixenv_pre_ssh_start; do
   assert_not_contains "$body" "$bad" "deploy entrypoint runs nothing from the repo: $bad"
 done
+# shell history persists in the deploy state volume, private, never the dev home
+assert_contains "$body" 'export HISTFILE=\"$_state/.zsh_history\"' "history kept in /deploy"
+assert_contains "$body" 'chmod 600 "$_state/.zsh_history"' "history file is private"
+assert_not_contains "$body" 'dev-home/.zsh_history' "history never in the dev home volume"
 # Same PATH rule as the project entrypoint: ~/.local/bin first.
 # (not `grep | while`: fail would only exit the pipeline's subshell)
 bad_path="$(grep 'export PATH=' "$dep" | grep -v 'PATH="\\$HOME/.local/bin:' || true)"

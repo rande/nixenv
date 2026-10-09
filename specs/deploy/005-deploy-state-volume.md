@@ -23,6 +23,9 @@ enforced-by:
   `init`/`run`/`ensure_volumes`, and reused by every later session. Like
   RUN-03, a root helper drops `.keep` into it when empty and chowns it only when
   the root isn't already your uid.
+- The deploy shell's history lives there: the deploy entrypoint exports
+  `HISTFILE=/deploy/.zsh_history` (mode 600) when the volume is writable. It
+  MUST NOT go to the dev home volume.
 - `/deploy` is a reserved path for `valid_app_mount`.
 - `delete` removes it. `export` includes it as `volumes/deploy.tar.gz` when it
   exists (manifest `deploy=0|1`), refuses while a deploy session is open
@@ -33,7 +36,8 @@ enforced-by:
 ## Why
 
 The deploy home is a tmpfs, so terraform/ansible state and release bookkeeping
-were lost after every session. Keeping it out of the dev container keeps
+were lost after every session — and so was the shell history, the record of
+what was run against production. Keeping it out of the dev container keeps
 production state (often holding secrets) away from untrusted dev code, which
 also cannot plant files there for a later session holding the agent. Created
 on first use so projects that never deploy get no extra volume.

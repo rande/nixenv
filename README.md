@@ -835,7 +835,8 @@ survive between sessions — terraform or ansible state, release bookkeeping —
 goes in `/deploy` (`$NIXENV_DEPLOY_STATE`), the volume `nixenv_<project>_deploy`.
 The first `deploy` creates it; later sessions reuse it. It is never mounted in
 the dev container, so code running there can neither read it nor plant files in
-it. `delete` removes it, and `export` includes it when it exists.
+it. `delete` removes it, and `export` includes it when it exists. Your deploy
+shell history is kept there too (`/deploy/.zsh_history`).
 
 **Allowlist.** The deploy container can reach everything the dev container can,
 plus `~/.nixenv/projects/<project>/deploy_hosts` (`deploy … allow`). Put
