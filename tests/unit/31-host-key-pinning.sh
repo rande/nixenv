@@ -74,4 +74,32 @@ printf '    # a hand-written line mentioning %%k stays\n' >> "$sd/config"
 write_host_ssh_config demo >/dev/null 2>&1
 assert_contains "$(cat "$sd/config")" "zmx attach %n" "configs written with %k are migrated"
 assert_contains "$(cat "$sd/config")" "mentioning %k stays" "other lines untouched"
+
+# --- 'ssh demo' is a plain shell, 'ssh demo.<x>' a zmx session ------------------
+# Shared block for both names, then a zmx-only block for the dotted ones.
+rm -f "$sd/config"; write_host_ssh_config demo >/dev/null 2>&1
+cfg="$(cat "$sd/config")"
+assert_eq "$(grep -c '^Host ' "$sd/config")" "2" "two Host blocks"
+assert_eq "$(grep '^Host ' "$sd/config" | head -1)" "Host demo demo.*" "shared block: exact names"
+assert_eq "$(grep '^Host ' "$sd/config" | tail -1)" "Host demo.*" "zmx block: dotted names only"
+assert_not_contains "$cfg" "Host demo*" "never a prefix wildcard (would catch demo-api)"
+shared="$(printf '%s\n' "$cfg" | awk '/^Host demo demo\.\*$/ {f=1; next} /^Host / {f=0} f')"
+zmx="$(printf '%s\n' "$cfg" | awk '/^Host demo\.\*$/ {f=1; next} /^Host / {f=0} f')"
+assert_not_contains "$shared" "RemoteCommand" "the shared block runs no zmx"
+assert_not_contains "$shared" "RequestTTY" "the shared block keeps the default tty"
+assert_contains "$shared" "HostKeyAlias nixenv-demo" "both names are pinned"
+assert_contains "$shared" "IdentitiesOnly yes" "both names use the project key"
+assert_contains "$zmx" "RequestTTY yes" "zmx block forces a tty"
+assert_contains "$zmx" "zmx attach %n" "zmx block attaches the session"
+# What ssh actually resolves, when a client is around.
+if command -v ssh >/dev/null 2>&1; then
+  assert_eq "$(ssh -F "$sd/config" -G demo 2>/dev/null | grep -c '^remotecommand ')" "0" "ssh demo: plain shell"
+  assert_contains "$(ssh -F "$sd/config" -G demo.api 2>/dev/null)" "remotecommand $PROFILE/bin/zmx attach demo.api" "ssh demo.api: zmx session"
+  assert_contains "$(ssh -F "$sd/config" -G demo.api 2>/dev/null)" "hostkeyalias nixenv-demo" "ssh demo.api: shared settings apply"
+  assert_eq "$(ssh -F "$sd/config" -G demo-api 2>/dev/null | grep -c '^hostkeyalias nixenv-demo')" "0" "demo-api is not demo"
+fi
+# An existing config is never rewritten into the two blocks (no migration).
+printf 'Host demo demo.*\n    RemoteCommand /p/bin/zmx attach %%n\n' > "$sd/config"
+write_host_ssh_config demo >/dev/null 2>&1
+assert_contains "$(cat "$sd/config")" "Host demo demo.*" "an existing config is left alone"
 true

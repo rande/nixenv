@@ -514,7 +514,7 @@ footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: spac
       <div class="step"><div class="n">1</div><h3>Build once</h3><p>A short-lived <code>nixos/nix</code> container realises the pinned flake into a named volume: shell, editor, git, Claude CLI, the projects gateway, the exit proxy and friends.</p></div>
       <div class="step"><div class="n">2</div><h3>Mount everywhere</h3><p>Each project is a <code>debian:stable-slim</code> container with <code>/nix</code> mounted read-only. Nix binaries carry their own libraries, so the base image barely matters.</p></div>
       <div class="step"><div class="n">3</div><h3>Add per project</h3><p>A <code>flake.nix</code> in your repo adds that project's runtimes and services into its own profile, layered ahead of the base — and shared paths aren't rebuilt.</p></div>
-      <div class="step"><div class="n">4</div><h3>Work inside</h3><p><code>ssh myapp</code> drops you into a persistent zmx session; your dev server is at <code>https://myapp-3000.nixenv.localhost</code> with a trusted cert.</p></div>
+      <div class="step"><div class="n">4</div><h3>Work inside</h3><p><code>ssh myapp.main</code> drops you into a persistent zmx session (<code>ssh myapp</code> is a plain shell); your dev server is at <code>https://myapp-3000.nixenv.localhost</code> with a trusted cert.</p></div>
     </div>
   </section>
 
@@ -559,7 +559,7 @@ footer .sheet { display: flex; flex-wrap: wrap; gap: 20px; justify-content: spac
         <tr><td>R-01</td><td>One pinned toolchain</td><td>Built once from a flake, mounted read-only into every project. Update it in one place; every container sees it on the next start.</td></tr>
         <tr><td>R-02</td><td>Per-project flakes</td><td>Node, PHP, Python, Go, databases — whatever the repo declares, in a profile of its own, ahead of the base on <code>PATH</code>.</td></tr>
         <tr><td>R-03</td><td>Docker or Podman</td><td>Auto-detected. Everything runs as your uid; nothing in a project container is root.</td></tr>
-        <tr><td>R-04</td><td>SSH + persistent sessions</td><td><code>ssh myapp</code> and <code>ssh myapp.tests</code> attach named zmx sessions. VS Code Remote-SSH works from the same config.</td></tr>
+        <tr><td>R-04</td><td>SSH + persistent sessions</td><td><code>ssh myapp.main</code> and <code>ssh myapp.tests</code> attach named zmx sessions; <code>ssh myapp</code> is a plain shell. VS Code Remote-SSH works from the same config.</td></tr>
         <tr><td>R-05</td><td>HTTPS for every port</td><td><code>https://&lt;project&gt;-&lt;port&gt;.nixenv.localhost</code>, routed by the projects gateway, trusted via mkcert — reachable from inside containers too.</td></tr>
         <tr><td>R-06</td><td>Egress allowlist by default</td><td>Projects reach only the hosts you allow. <code>nixenv egress</code> shows what was denied, so the list writes itself.</td></tr>
         <tr><td>R-07</td><td>Services under runit</td><td>Declare <code>sv/&lt;name&gt;/run</code> in the repo or flake; databases and workers start with the container and restart if they die.</td></tr>

@@ -2149,12 +2149,15 @@ write_host_ssh_config() {
     fi
     return 0
   fi
+  # ssh takes the FIRST value it finds for each option: the shared block sets
+  # no RemoteCommand, so the bare '<p>' is a plain shell and only '<p>.<x>'
+  # picks up zmx from the second block. Exact names, never '<p>*', which would
+  # also match another project such as '<p>-api' and connect it here.
   cat > "$sd/config" <<EOF
 # nixenv: ssh config for project '$name' (auto-created when missing — edit freely).
-#   ssh $name         → attaches a persistent zmx session named '$name'
-#   ssh $name.<x>      → a zmx session named '$name.<x>'
+#   ssh $name          → a plain shell (no zmx); ssh $name <cmd> runs a command
+#   ssh $name.<x>      → attaches a persistent zmx session named '$name.<x>'
 # zmx (github:neurosnap/zmx) gives re-attachable terminal sessions over ssh.
-# Replace/remove RemoteCommand for a plain shell.
 Host $name $name.*
     HostName 127.0.0.1
     Port $port
@@ -2165,11 +2168,13 @@ Host $name $name.*
     HostKeyAlias $(ssh_host_alias "$name")
     UserKnownHostsFile "$sd/known_hosts"
     LogLevel ERROR
-    RequestTTY yes
-    RemoteCommand $PROFILE/bin/zmx attach %n
     ControlMaster auto
     ControlPath ~/.ssh/cm-%r@%h:%p
     ControlPersist 10m
+
+Host $name.*
+    RequestTTY yes
+    RemoteCommand $PROFILE/bin/zmx attach %n
 EOF
   ok "wrote host ssh config: $sd/config"
 }
@@ -5229,7 +5234,7 @@ dashboard_html() {
 nixenv init blog --template=wordpress --yes</pre></td></tr>
           <tr><td>start &lt;project&gt;<span class="opt">alias: run</span></td><td>Start the project as a background service; prints its ssh port.</td><td><pre class="ex">nixenv start shop</pre></td></tr>
           <tr><td>up &lt;project&gt;</td><td>Build the project&#x27;s flake if needed, then start it.</td><td><pre class="ex">nixenv up shop</pre></td></tr>
-          <tr><td>ssh &lt;project&gt;<span class="opt">with ssh-config: ssh &lt;project&gt;.&lt;session&gt; re-attaches a zmx session</span></td><td>SSH into the running project (starts it if needed).</td><td><pre class="ex">nixenv ssh shop
+          <tr><td>ssh &lt;project&gt;<span class="opt">with ssh-config: ssh &lt;project&gt; is a plain shell, ssh &lt;project&gt;.&lt;session&gt; re-attaches a zmx session</span></td><td>SSH into the running project (starts it if needed).</td><td><pre class="ex">nixenv ssh shop
 ssh shop.api</pre></td></tr>
           <tr><td>shell &lt;project&gt;</td><td>Interactive zsh through the engine&#x27;s exec — no ssh key needed.</td><td><pre class="ex">nixenv shell shop</pre></td></tr>
           <tr><td>ps<span class="opt">--json  --watch [N]</span></td><td>What runs where: listening ports, proxy URLs, services, egress. Rewrites this page.</td><td><pre class="ex">nixenv ps
@@ -7440,7 +7445,7 @@ SSH: each project gets a random host port (stored once in <project>/port). The
 container runs an unprivileged sshd (port 2222) via runit as '$APP_USER', key-only:
 nixenv generates a per-project key in <project>/ssh/ and nothing else is accepted
 (add your own keys to <project>/ssh/authorized_keys.extra). Use 'ssh-config
---install' + 'ssh <project>' for the zmx workflow.
+--install', then 'ssh <project>' (plain shell) or 'ssh <project>.<x>' (zmx session).
 
 Environment overrides:
   CONTAINER_ENGINE=${CONTAINER_ENGINE:-auto}   (docker|podman; auto-detects, asks if both)

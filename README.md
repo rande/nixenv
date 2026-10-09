@@ -272,20 +272,32 @@ Each project gets a generated **host** ssh config at
 
 ```sh
 nixenv ssh-config --install     # adds: Include ~/.nixenv/projects/*/ssh/config
-ssh myapp                       # persistent zmx session 'myapp'
+ssh myapp                       # plain shell (ssh myapp <cmd> runs a command)
+ssh myapp.main                  # persistent zmx session 'myapp.main'
 ssh myapp.api                   # a second session 'myapp.api'
 ```
 
 The generated config uses [`zmx`](https://github.com/neurosnap/zmx) (bundled in
 the base toolchain) for re-attachable terminal sessions over ssh, with
 `ControlMaster` multiplexing — the same pattern zmx documents. The session name
-comes from the ssh host, so `ssh myapp` / `ssh myapp.api` give you distinct,
-persistent sessions you can detach from and re-attach later. Edit the per-project
-file freely (it's only created when missing); swap the `RemoteCommand` for a
-plain shell if you prefer.
+comes from the ssh host, so `ssh myapp.main` / `ssh myapp.api` give you
+distinct, persistent sessions you can detach from and re-attach later. The
+shared `Host myapp myapp.*` block sets no `RemoteCommand`, so the bare
+`ssh myapp` is a plain shell, the name to use for `ssh myapp <cmd>`, scp, rsync
+and VS Code Remote-SSH. Only the `Host myapp.*` block after it adds
+`RequestTTY yes` and the zmx `RemoteCommand` (ssh keeps the first value it finds
+for each option). Keep the names exact: `Host myapp*` would also match another
+project such as `myapp-api`. Edit the per-project file freely (it's only
+created when missing).
+
+A config written by an older nixenv (zmx inside the `Host myapp myapp.*` block)
+is not changed. Move its `RequestTTY yes` and `RemoteCommand` lines into a new
+`Host myapp.*` block at the end, or delete
+`~/.nixenv/projects/myapp/ssh/config` and `nixenv start myapp` writes the new
+one.
 
 `nixenv ssh <project>` and `nixenv shell <project>` connect directly (plain zsh,
-no zmx) — handy as an escape hatch. The prompt shows the project name (the
+no zmx), like `ssh <project>`. The prompt shows the project name (the
 container's hostname is set to it), plus the zmx session when you're in one.
 
 ## Templates — a ready-to-run stack in one command
