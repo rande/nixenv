@@ -1099,11 +1099,13 @@ its local files in a folder and point at it:
 
 ```sh
 nixenv build myapp --dir=nix        # copies the whole repo/nix/ folder
-nixenv build myapp --dir=/abs/path  # or an absolute host path
 ```
 
-`--dir` copies the entire folder into the build, so relative references inside it
-(overlays, a vendored package, `./.`-style local inputs) work.
+`--dir` is a folder **inside the repo** (the app volume), not a host path:
+absolute paths and `..` are refused. It copies the entire folder into the build,
+so relative references inside it (overlays, a vendored package, `./.`-style
+local inputs) work. Keep it small: `--dir=.` copies the whole repo
+(`node_modules`, `.git`…) into the store on every build, and nixenv warns.
 
 **Only build flakes you trust.** Building a flake runs its build code as root,
 with write access to the Nix store that *every* project shares. nixenv limits

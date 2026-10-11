@@ -2845,7 +2845,16 @@ cmd_build_project() {
   local dir="" dir_given=0 a
   for a in "$@"; do
     case "$a" in
-      --dir=*) dir="${a#--dir=}"; dir_given=1;;
+      --dir=*) dir="${a#--dir=}"; dir_given=1
+               # A path INSIDE the app volume (the repo), never a host path.
+               case "$dir" in /*) die "--dir is a path inside the repo (the app volume), not a host path: $dir";; esac
+               case "/$dir/" in */../*) die "--dir must not contain '..': $dir";; esac
+               dir="${dir%/}"; dir="${dir#./}"
+               case "$dir" in
+                 .|"") if [ -n "${a#--dir=}" ]; then
+                         warn "--dir=${a#--dir=} copies the WHOLE repo (node_modules, .git…) into the store on every build"
+                       fi;;
+               esac;;
       --dir)   die "use --dir=<path>";;
       *) die "unknown option: $a (usage: $0 build <project> [--dir=<path>])";;
     esac

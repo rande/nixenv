@@ -48,6 +48,18 @@ assert_contains "$out" "cleared the remembered flake dir" "clearing says so"
 out="$(run_build)"
 assert_not_contains "$out" "using remembered" "after clearing, back to the repo root"
 
+# --dir is a path INSIDE the repo (the app volume): never a host path or '..'.
+out="$(run_build --dir=/srv/infra || true)"
+assert_contains "$out" "not a host path" "an absolute --dir is refused"
+out="$(run_build --dir=infra/../../etc || true)"
+assert_contains "$out" "must not contain '..'" "'..' is refused"
+assert_eq "$(cat "$PROJECTS_DIR/demo/flake_dir" 2>/dev/null || true)" "" "a refused --dir is not stored"
+out="$(run_build --dir=./infra/nixos/)"
+assert_eq "$(cat "$PROJECTS_DIR/demo/flake_dir")" "infra/nixos" "./ and a trailing / are normalised"
+out="$(run_build --dir=.)"
+assert_contains "$out" "copies the WHOLE repo" "the repo root as --dir warns"
+run_build --dir= >/dev/null
+
 # A project that never used --dir must not grow the file.
 mkdir -p "$PROJECTS_DIR/plain"
 ( cmd_build_project plain ) >/dev/null 2>&1
