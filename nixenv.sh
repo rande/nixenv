@@ -185,13 +185,13 @@ materialize_context() {
       # entry: <profile>/bin.
       packages = forAllSystems (system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            config.allowUnfree = true;
-          };
+          pkgs = import nixpkgs { inherit system; };
+          # The Claude CLI is the only unfree package: allow it by NAME, so
+          # nothing else unfree can slip into every project's toolchain.
           unstable = import nixpkgs-unstable {
             inherit system;
-            config.allowUnfree = true;
+            config.allowUnfreePredicate = p:
+              builtins.elem (nixpkgs.lib.getName p) [ "claude-code" ];
           };
           # zmx: session persistence (github:neurosnap/zmx). Installed as a
           # PREBUILT static-musl binary — building from source uses zig2nix +
@@ -327,7 +327,7 @@ materialize_context() {
 
       # Optional: `nix develop` works too if you have Nix on the host.
       devShells = forAllSystems (system:
-        let pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
+        let pkgs = import nixpkgs { inherit system; };
         in {
           default = pkgs.mkShell {
             packages = [ self.packages.${system}.default ];

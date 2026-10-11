@@ -49,7 +49,7 @@
     {
       packages = forAllSystems (system:
         let
-          pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
+          pkgs = import nixpkgs { inherit system; };   # free software only
           php  = pkgs.php83.buildEnv {
             extensions = { enabled, all }: enabled ++ (with all; [
               mysqli pdo_mysql gd intl zip mbstring exif opcache curl zlib

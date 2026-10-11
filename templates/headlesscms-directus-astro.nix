@@ -51,7 +51,7 @@
     {
       packages = forAllSystems (system:
         let
-          pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
+          pkgs = import nixpkgs { inherit system; };   # free software only
 
           # --- Services -------------------------------------------------------
           # Declared as FILES in the profile at sv/<name>/run; nixenv copies them

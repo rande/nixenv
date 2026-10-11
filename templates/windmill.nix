@@ -107,7 +107,7 @@
     {
       packages = forAllSystems (system:
         let
-          pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
+          pkgs = import nixpkgs { inherit system; };   # free software only
 
           # --- Which windmill binary --------------------------------------------
           # The upstream release asset is one self-contained ELF (it embeds the

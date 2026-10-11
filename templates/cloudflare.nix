@@ -48,7 +48,7 @@
     {
       packages = forAllSystems (system:
         let
-          pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
+          pkgs = import nixpkgs { inherit system; };   # free software only
 
           # ---------------------------------------------------------------
           # Startup hook — the only place that can write to the app volume.

@@ -12,6 +12,8 @@ applies-to:
 
 - `claude-code` comes from `nixpkgs-unstable` (fast-moving); the rest of the
   toolchain from the stable channel. `update` rolls both locks forward.
+- It is the only unfree package: the unstable import allows it BY NAME
+  (`allowUnfreePredicate`); the stable import allows nothing unfree.
 
 ## Why
 

@@ -100,6 +100,10 @@ assert_template() {
   jsq="$(printf '%s' "$body" | grep -n '`\${' || true)"
   [ -z "$jsq" ] || fail "$t: unescaped \`\${ in a JS template literal (Nix interpolates it) → $jsq"
 
+  # --- free software unless named (no template needs an unfree package) -----
+  printf '%s' "$body" | sed 's/[[:space:]]*#.*//' | grep -q 'allowUnfree = true' \
+    && fail "$t: allowUnfree = true — allow an unfree package by name (allowUnfreePredicate)"
+
   # --- cheap Nix sanity: balanced brackets outside comments -----------------
   python3 - "$f" <<'PY' || fail "$t: unbalanced brackets"
 import sys, re
