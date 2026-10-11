@@ -70,7 +70,7 @@ hookblk_line="$(printf '%s\n' "$ep" | grep -n '^) &$' | tail -1 | cut -d: -f1)"
 sshd_line="$(printf '%s\n' "$ep" | grep -n 'exec "\$RUNSV" "\$SVROOT/sshd"' | cut -d: -f1)"
 # Ordering matters: PATH (so hooks can call project-flake binaries like a
 # <project>-setup script) → hook (so it can add services) → supervise scan.
-path_line="$(printf '%s\n' "$ep" | grep -n 'export PATH="$HOME/.local/bin:${_extra}' | cut -d: -f1)"
+path_line="$(printf '%s\n' "$ep" | grep -n '^export PATH="$HOME/.local/bin:${_extra}' | cut -d: -f1)"
 hook_line="$(printf '%s\n' "$ep" | grep -n 'command -v nixenv_pre_ssh_start' | cut -d: -f1)"
 scan_line="$(printf '%s\n' "$ep" | grep -n 'for d in "\$SVROOT"/\*/' | cut -d: -f1)"
 [ "$path_line" -lt "$hook_line" ] || fail "PATH must be exported before hooks run"
@@ -125,6 +125,27 @@ for line in sys.stdin:
 if bad:
     print("\n".join(bad)); sys.exit(1)
 ' || fail "PATH assignments disagree on ~/.local/bin ordering"
+# ...and they must be the SAME list (TOOL-06), the deploy entrypoint included:
+# a dir in one and not another (e.g. ~/.cargo/bin) resolves a tool in an ssh
+# shell but not in a hook or a service. .zshrc keeps the inherited $PATH tail.
+dep_ep="$(cat "$CONTEXT_DIR/deploy-entrypoint.sh")"
+printf '%s\n%s\n%s\n' "$ep" "$zshrc" "$dep_ep" | python3 -c '
+import re, sys
+seen = {}
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("export PATH=") or "PROFILE/bin" not in line:
+        continue
+    v = line[len("export PATH="):].strip().strip("\"").replace("\\", "")
+    v = re.sub(r"\$\{?_(nixenv_extra|extra|nixenv_pp)\}?", "<project>", v)
+    v = re.sub(r":\$PATH$", ":<system>", v)
+    v = v.replace(":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", ":<system>")
+    seen.setdefault(v, []).append(line)
+if len(seen) != 1:
+    for v, lines in seen.items():
+        print(v, "<-", lines[0])
+    sys.exit(1)
+' || fail "PATH assignments are not identical (TOOL-06)"
 
 # gitconfig: modern defaults present, identity/credentials via includes
 gc="$(cat "$CONTEXT_DIR/home-skel/.gitconfig")"

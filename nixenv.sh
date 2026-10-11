@@ -598,7 +598,9 @@ fi
 # Command mode: run the given command as the (already non-root) user, then exit.
 # =============================================================================
 if [ "$#" -gt 0 ]; then
-  export PATH="$HOME/.local/bin:$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  _extra=""
+  [ -n "${NIXENV_EXTRA_PROFILE:-}" ] && [ -d "$NIXENV_EXTRA_PROFILE/bin" ] && _extra="$NIXENV_EXTRA_PROFILE/bin:"
+  export PATH="$HOME/.local/bin:${_extra}$PROFILE/bin:$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   exec "$ZSH_BIN" -lc 'exec "$@"' zsh "$@"
 fi
 
@@ -703,7 +705,7 @@ done
 mkdir -p "$HOME/.local/bin"   # so `pip install --user` & friends land on PATH
 _extra=""
 [ -n "${NIXENV_EXTRA_PROFILE:-}" ] && [ -d "$NIXENV_EXTRA_PROFILE/bin" ] && _extra="$NIXENV_EXTRA_PROFILE/bin:"
-export PATH="$HOME/.local/bin:${_extra}$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="$HOME/.local/bin:${_extra}$PROFILE/bin:$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # 1a. Loopback relay to the shared proxy ------------------------------------
 # curl/libcurl implement RFC 6761 internally: they resolve `localhost` and ANY
@@ -872,7 +874,7 @@ export NIXENV_APP_MOUNT="$APP_MOUNT"
 export NIXENV_EXTRA_PROFILE="${NIXENV_EXTRA_PROFILE:-}"
 export NIXENV_DEPLOY=1
 export NIXENV_DEPLOY_STATE="${NIXENV_DEPLOY_STATE:-/deploy}"
-export PATH="\$HOME/.local/bin:$_extra$PROFILE/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="\$HOME/.local/bin:$_extra$PROFILE/bin:\$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export ZSH="$PROFILE/share/oh-my-zsh"
 export ZSH_CACHE_DIR="\$HOME/.cache/omz"
 export SSL_CERT_FILE="$CA_BUNDLE"

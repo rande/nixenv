@@ -13,7 +13,8 @@ enforced-by:
 
 ## Rule
 
-- PATH MUST be `$HOME/.local/bin` → project profile → base profile, identically
+- PATH MUST be `$HOME/.local/bin` → project profile → base profile →
+  `$HOME/.cargo/bin` → system dirs, identically
   in every place that sets it: the entrypoint's `.zshenv` (ssh/zmx logins), the
   entrypoint's own `export PATH` (hooks + runit services), the ephemeral
   `run <project> cmd` branch, `home-skel/.zshrc` (re-asserts it because
@@ -29,5 +30,8 @@ it lives in the home volume and persists.
 
 ## How
 
-The test parses every `export PATH=` line and fails if one mentions a profile
-without listing `.local/bin` first.
+The test parses every `export PATH=` line (entrypoint, `.zshrc`, deploy
+entrypoint), checks `.local/bin` comes first, and that all of them normalise
+to the SAME list (`.zshrc` keeps the inherited `$PATH` tail). `~/.cargo/bin`
+was once only in the login shells, so a `cargo install`ed tool ran in ssh but
+not in a hook or a service.
