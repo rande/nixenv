@@ -100,6 +100,60 @@ assert_template() {
   jsq="$(printf '%s' "$body" | grep -n '`\${' || true)"
   [ -z "$jsq" ] || fail "$t: unescaped \`\${ in a JS template literal (Nix interpolates it) → $jsq"
 
+  # --- heredocs inside Nix indented strings must still close (TPL-03) -------
+  # Nix strips the string's smallest indentation; a heredoc terminator must land
+  # at column 0 AFTER that, or the heredoc never closes and the hook (sourced,
+  # tolerant) silently does nothing past it. One less-indented line in the same
+  # string is enough to shift the terminator. Model the stripping and check.
+  python3 - "$f" <<'PY' || fail "$t: a heredoc in an indented string would not close (see above)"
+import re, sys
+src = open(sys.argv[1]).read()
+
+def indented_strings(s):
+    """Yield the raw bodies of Nix '' strings (escapes kept, ${} kept)."""
+    i, n = 0, len(s)
+    while i < n:
+        if s[i] == '#':                       # a comment outside any string
+            j = s.find('\n', i); i = n if j < 0 else j; continue
+        if s[i] == '"':                       # skip a "..." string
+            i += 1
+            while i < n and s[i] != '"':
+                i += 2 if s[i] == '\\' else 1
+            i += 1; continue
+        if s.startswith("''", i):
+            i += 2; start = i
+            while i < n:
+                if s.startswith("'''", i) or s.startswith("''$", i) or s.startswith("''\\", i):
+                    i += 3; continue
+                if s.startswith("''", i):
+                    yield s[start:i]; i += 2; break
+                i += 1
+            continue
+        i += 1
+
+bad = []
+for body in indented_strings(src):
+    lines = body.split('\n')
+    if lines and not lines[0].strip():
+        lines = lines[1:]
+    ind = [len(l) - len(l.lstrip(' ')) for l in lines if l.strip()]
+    if not ind:
+        continue
+    m = min(ind)
+    text = [l[m:] if l.strip() else '' for l in lines]
+    for k, l in enumerate(text):
+        for mo in re.finditer(r"<<(-?)\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?", l):
+            dash, word = mo.group(1), mo.group(2)
+            rest = text[k + 1:]
+            if any((r.lstrip('\t') if dash else r) == word for r in rest):
+                continue
+            near = [r for r in rest if r.strip() == word]
+            bad.append("<<%s: terminator %s" % (word, ("indented as %r" % near[0]) if near else "missing"))
+for b in bad:
+    print(b)
+sys.exit(1 if bad else 0)
+PY
+
   # --- free software unless named (no template needs an unfree package) -----
   printf '%s' "$body" | sed 's/[[:space:]]*#.*//' | grep -q 'allowUnfree = true' \
     && fail "$t: allowUnfree = true — allow an unfree package by name (allowUnfreePredicate)"

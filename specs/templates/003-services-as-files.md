@@ -27,3 +27,8 @@ services.
 ## How
 
 The entrypoint copies `sv/*` from the profile into `$SVROOT` each boot (RUN-06).
+Hooks of the older templates still nest heredocs (generated config files);
+`assert_template` models Nix's indentation stripping and fails when a
+terminator would not land at column 0, so a shift is caught by the unit test
+instead of at runtime. New hooks write files with `printf` or ship them with
+`writeTextDir` and `install` them.
