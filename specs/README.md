@@ -52,7 +52,7 @@ enforced-by:                    # optional: tests that fail when it is broken
 ### Toolchain — The shared Nix store, project flakes, PATH
 
 - [TOOL-01](toolchain/001-base-flake-no-runtimes.md) The base flake ships no language runtimes
-- [TOOL-02](toolchain/002-shared-profile-reset.md) build resets the shared profile before installing
+- [TOOL-02](toolchain/002-shared-profile-reset.md) build switches a profile only after a successful build
 - [TOOL-03](toolchain/003-zmx-pinned-prebuilt.md) zmx is a pinned prebuilt binary (SEC-09)
 - [TOOL-04](toolchain/004-project-flakes-untrusted.md) Project flakes are untrusted (SEC-04)
 - [TOOL-05](toolchain/005-flake-dir-remembered.md) build --dir is remembered per project

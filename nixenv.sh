@@ -1688,6 +1688,30 @@ cmd_github_token() {
   esac
 }
 
+# The builder script for `build`: BUILD the flake first, then point the profile
+# at the result in one step (a new generation). The old profile stays live the
+# whole time, so a running container keeps its tools during a long build and
+# keeps them when the build fails (rate limit, 401, hash mismatch); before,
+# the profile was deleted up front. --set REPLACES the contents, so a package
+# removed from the flake disappears (why the profile used to be reset). Old
+# generations remain as a rollback until `gc`. Run as
+#   sh -euc "$(profile_switch_script)" sh <flake ref> <profile>
+# so the values are positional args, never spliced into the code.
+profile_switch_script() {
+  # shellcheck disable=SC2016
+  printf '%s\n' 'ref="$1"; prof="$2"' \
+    'mkdir -p "$(dirname "$prof")"' \
+    'echo "--- building $ref (the current profile stays in place until this succeeds) ---"' \
+    'nix build "$ref" --no-link --print-out-paths --print-build-logs > /tmp/nixenv-out' \
+    'out="$(tail -n 1 /tmp/nixenv-out)"' \
+    '[ -n "$out" ] && [ -d "$out" ] || { echo "nix build printed no output path" >&2; exit 1; }' \
+    'echo "--- switching $prof → $out ---"' \
+    'nix-env --profile "$prof" --set "$out"' \
+    'echo "--- on PATH ---"' \
+    'ls -1 "$prof/bin" 2>/dev/null | head -n 40 || true'
+  printf 'exit 0\n'
+}
+
 # Run a builder command, echoing its output, and explain a GitHub rate limit or
 # a rejected token if that's what made it fail. $1 = base|project.
 run_builder() {
@@ -1718,10 +1742,16 @@ run_builder() {
   return "$rc"
 }
 
+# Without the GitHub token: for builder runs that fetch nothing (gc, roots).
+# auto-optimise-store hardlinks each new path as it is added, instead of a full
+# `nix store optimise` pass over the whole store after every build.
+nix_config_local() {
+  printf 'experimental-features = nix-command flakes\nmax-jobs = auto\nauto-optimise-store = true'
+}
 # NIX_CONFIG for builder containers. Carries the optional GitHub token (see
 # github_token) so `github:` inputs don't hit the anonymous API limit.
 nix_config() {
-  printf 'experimental-features = nix-command flakes\nmax-jobs = auto'
+  nix_config_local
   local tok; tok="$(github_token)"
   if [ -n "$tok" ] && valid_github_token "$tok"; then
     printf '\naccess-tokens = github.com=%s' "$tok"
@@ -1738,7 +1768,7 @@ nix_config() {
 #     container usually can't, and Nix then falls back to building unsandboxed.
 #     The trust boundary is documented rather than assumed.
 nix_config_project() {
-  printf 'experimental-features = nix-command flakes\nmax-jobs = auto\n'
+  nix_config_local; printf '\n'
   printf 'accept-flake-config = false\nsandbox = true\nsandbox-fallback = true'
 }
 
@@ -1762,8 +1792,11 @@ ensure_volume()  {
 # Existing files are never clobbered (-n), so our packages and DB survive.
 ensure_builder_usable() {
   volume_exists || return 0
-  "$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" \
-    nix --version >/dev/null 2>&1 && return 0
+  if "$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" \
+       nix --version >/dev/null 2>&1; then
+    ensure_builder_current
+    return 0
+  fi
 
   warn "the store volume has no working nix (a previous 'gc' collected the builder's tools)"
   log "restoring the builder toolchain from $BUILDER_IMAGE — no downloads"
@@ -1779,11 +1812,43 @@ ensure_builder_usable() {
   fi
 }
 
+# The volume is mounted over the image's /nix, and an engine seeds a volume
+# from the image only while it is EMPTY. So the nix that runs (the image's PATH
+# goes through /nix/var/nix/profiles/default) is the one the FIRST builder
+# image put there: bumping BUILDER_IMAGE changed nothing on existing machines,
+# only on fresh ones. When the versions differ, copy the image's store in,
+# register it in the volume's database, and point the default profile at the
+# image's. Best effort: on failure the old nix keeps working.
+ensure_builder_current() {
+  local want have
+  want="$("$ENGINE" run --rm "$(img "$BUILDER_IMAGE")" nix --version 2>/dev/null)" || return 0
+  have="$("$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" nix --version 2>/dev/null)" || return 0
+  [ -n "$want" ] && [ "$want" != "$have" ] || return 0
+  log "the store volume runs '$have' but $BUILDER_IMAGE ships '$want' — upgrading the volume's nix"
+  # 1. The image's own /nix: copy its store into the volume (at /mnt), record
+  #    the registrations and the profile the image's PATH points at.
+  "$ENGINE" run --rm -v "$NIX_VOLUME":/mnt "$(img "$BUILDER_IMAGE")" sh -euc '
+    cp -an /nix/store/. /mnt/store/
+    nix-store --dump-db > /mnt/var/nix/.nixenv-image-db
+    readlink -f /nix/var/nix/profiles/default > /mnt/var/nix/.nixenv-image-profile
+  ' >/dev/null 2>&1 || { warn "could not copy $BUILDER_IMAGE's nix into the store volume"; return 0; }
+  # 2. The volume as /nix: register those paths, then switch the profile.
+  "$ENGINE" run --rm -v "$NIX_VOLUME":/nix -e NIX_CONFIG="$(nix_config_local)" \
+    "$(img "$BUILDER_IMAGE")" sh -euc '
+    nix-store --load-db < /nix/var/nix/.nixenv-image-db
+    nix-env --profile /nix/var/nix/profiles/default --set "$(cat /nix/var/nix/.nixenv-image-profile)"
+    rm -f /nix/var/nix/.nixenv-image-db /nix/var/nix/.nixenv-image-profile
+  ' >/dev/null 2>&1 || { warn "could not switch the store volume to $BUILDER_IMAGE's nix"; return 0; }
+  have="$("$ENGINE" run --rm -v "$NIX_VOLUME":/nix "$(img "$BUILDER_IMAGE")" nix --version 2>/dev/null || true)"
+  if [ "$have" = "$want" ]; then ok "builder nix upgraded: $want"
+  else warn "the store volume still runs '$have' (wanted '$want')"; fi
+}
+
 # Register the builder's own toolchain as GC roots so a collect can never
 # remove the tools the next build needs. Idempotent; safe to call before any gc.
 protect_builder_toolchain() {
   "$ENGINE" run --rm -v "$NIX_VOLUME":/nix \
-    -e NIX_CONFIG="$(nix_config)" "$(img "$BUILDER_IMAGE")" \
+    -e NIX_CONFIG="$(nix_config_local)" "$(img "$BUILDER_IMAGE")" \
     sh -euc '
       mkdir -p /nix/var/nix/gcroots
       for b in nix sh bash cp du tail env; do
@@ -2729,22 +2794,8 @@ cmd_build() {
     -w /flake \
     -e NIX_CONFIG="$(nix_config)" \
     "$(img "$BUILDER_IMAGE")" \
-    sh -euc '
-      echo "--- resetting shared profile (so flake changes take effect) ---"
-      rm -f "'"$PROFILE"'" "'"$PROFILE"'"-*-link 2>/dev/null || true
-      echo "--- nix profile install into shared profile ---"
-      # --profile keeps the GC root + symlinks inside /nix (the volume),
-      # so the runtime container sees them. Pure evaluation: every fetch is
-      # hash-pinned (zmx used to need --impure).
-      nix profile install "'"$FLAKE_REF"'" \
-        --profile "'"$PROFILE"'" \
-        --accept-flake-config \
-        --print-build-logs
-      echo "--- optimising store (hardlink identical files) ---"
-      nix store optimise || true
-      echo "--- installed profile contents ---"
-      ls -1 "'"$PROFILE"'/bin" | head -n 40
-    ' || die "building the shared toolchain failed"
+    sh -euc "$(profile_switch_script)" sh "$FLAKE_REF" "$PROFILE" \
+    || die "building the shared toolchain failed — the previous toolchain is still in place"
 
   ok "Dependencies downloaded into volume '$NIX_VOLUME'"
   log "Profile available inside the store at: $PROFILE"
@@ -2762,6 +2813,29 @@ cmd_build() {
 # flake.nix plus anything it references). <path> is relative to /app. Use this
 # when the flake isn't self-contained.
 # =============================================================================
+# A project flake with no flake.lock in the app volume gets one generated by
+# its first build (in <project>/flake/). That copy is wiped by the next build,
+# so every build re-resolved the inputs: whatever nixpkgs was that day, through
+# the GitHub API with no token (TOOL-04). Write it back next to flake.nix — as
+# the app user, never over an existing lock — and say to commit it.
+keep_project_lock() {
+  local name="$1" appv="$2" fdir="$3" sub="$4"
+  [ -f "$fdir/flake.lock" ] || return 0
+  local harden; harden=($(container_hardening_args))
+  local res
+  res="$("$ENGINE" run --rm --user "$(id -u):$(id -g)" $(engine_userns) \
+    ${harden[@]+"${harden[@]}"} \
+    -e SUB="$sub" -v "$appv":/app -v "$fdir/flake.lock":/tmp/flake.lock:ro \
+    "$(img "$RUNTIME_IMAGE")" \
+    sh -c 'd="/app${SUB:+/$SUB}"; [ -e "$d/flake.lock" ] && exit 0
+           cp /tmp/flake.lock "$d/flake.lock" && echo written' 2>/dev/null)" \
+    || { warn "could not write flake.lock into the app volume — next build re-resolves the inputs"; return 0; }
+  if [ "$res" = written ]; then
+    ok "pinned the inputs: wrote ${sub:+$sub/}flake.lock into '$name''s app volume"
+    log "commit it, or every fresh clone resolves them again"
+  fi
+}
+
 cmd_build_project() {
   local name="${1:-}"
   [ -n "$name" ] || die "usage: $0 build <project> [--dir=<path>]"
@@ -2835,18 +2909,9 @@ cmd_build_project() {
     -w /flake \
     -e NIX_CONFIG="$(nix_config_project)" \
     "$(img "$BUILDER_IMAGE")" \
-    sh -euc '
-      mkdir -p /nix/var/nix/profiles
-      echo "--- resetting project profile ---"
-      rm -f "'"$prof"'" "'"$prof"'"-*-link 2>/dev/null || true
-      echo "--- nix profile install (project extras) ---"
-      nix profile install "path:/flake#'"$PROJECT_ATTR"'" \
-        --profile "'"$prof"'" \
-        --print-build-logs
-      nix store optimise || true
-      echo "--- project tooling on PATH ---"
-      ls -1 "'"$prof"'/bin" 2>/dev/null | head -n 40 || true
-    ' || die "building '$name''s flake failed"
+    sh -euc "$(profile_switch_script)" sh "path:/flake#$PROJECT_ATTR" "$prof" \
+    || die "building '$name''s flake failed — its previous tooling is still in place"
+  keep_project_lock "$name" "$appv" "$fdir" "$dir"
 
   ok "Project '$name' extra tooling built → $prof"
   log "It loads ahead of the base toolchain on the next 'start'/'ssh'/'shell' of '$name'"
@@ -7243,9 +7308,15 @@ cmd_update() {
   require_engine
   [ -f "$FLAKE_DIR/flake.nix" ] || die "no flake.nix in $FLAKE_DIR"
   log "Updating flake.lock in $FLAKE_DIR"
+  ensure_volume
+  ensure_builder_usable
   ensure_github_token
   "$ENGINE" rm -f "${CONTAINER_PREFIX}__update" >/dev/null 2>&1 || true
+  # The store volume, not the image's throwaway /nix: the inputs fetched here
+  # are the ones the build below needs, so they are downloaded (and looked up
+  # through the GitHub API) once.
   run_builder base "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__update" \
+    -v "$NIX_VOLUME":/nix \
     -v "$FLAKE_DIR":/flake -w /flake \
     -e NIX_CONFIG="$(nix_config)" \
     "$(img "$BUILDER_IMAGE")" nix flake update \
@@ -7327,7 +7398,7 @@ cmd_gc() {
   if [ "$dry" = 1 ]; then
     log "Dry run — nothing will be deleted"
     "$ENGINE" run --rm -v "$NIX_VOLUME":/nix \
-      -e NIX_CONFIG="$(nix_config)" "$(img "$BUILDER_IMAGE")" \
+      -e NIX_CONFIG="$(nix_config_local)" "$(img "$BUILDER_IMAGE")" \
       nix-collect-garbage --dry-run 2>&1 | tail -20   # piped on the HOST, safe
     return 0
   fi
@@ -7342,12 +7413,12 @@ cmd_gc() {
   # for the same reason (`| tail` would break once coreutils is collected).
   log "Hardlinking identical files"
   "$ENGINE" run --rm -v "$NIX_VOLUME":/nix \
-    -e NIX_CONFIG="$(nix_config)" "$(img "$BUILDER_IMAGE")" \
+    -e NIX_CONFIG="$(nix_config_local)" "$(img "$BUILDER_IMAGE")" \
     nix store optimise >/dev/null 2>&1 || warn "store optimise failed (continuing)"
 
   log "Collecting garbage (keeping the base + every proj-* profile)"
   "$ENGINE" run --rm -v "$NIX_VOLUME":/nix \
-    -e NIX_CONFIG="$(nix_config)" "$(img "$BUILDER_IMAGE")" \
+    -e NIX_CONFIG="$(nix_config_local)" "$(img "$BUILDER_IMAGE")" \
     nix-collect-garbage -d || warn "garbage collection reported errors"
 
   local after; after="$(store_size)"

@@ -153,7 +153,9 @@ interactive `zsh` via `docker exec` (no SSH key needed).
 
 ## Commands
 
-- `build` — (re)write context, then download all flake deps into the volume.
+- `build` — (re)write context, then build the shared toolchain in the volume.
+  The current toolchain stays in place until the build succeeds, so a failed
+  build changes nothing.
 - `build <project> [--dir=<path>]` — build the project's **own** flake into a
   per-project profile, layered on the base. Default reads `flake.nix` from the
   repo root; `--dir=<path>` copies a whole folder (flake + local files it
@@ -1078,13 +1080,18 @@ with `PROJECT_ATTR`), typically a `buildEnv` of the extra tools:
 }
 ```
 
-`build <project>` extracts `flake.nix` (+ `flake.lock`) from the app volume and
-installs it into a per-project profile (`/nix/var/nix/profiles/proj-<name>`) in
-the **same** store, so packages already present (from the base or another
+`build <project>` extracts `flake.nix` (+ `flake.lock`) from the app volume,
+builds it, and only then switches a per-project profile
+(`/nix/var/nix/profiles/proj-<name>`) to the result, in the **same** store, so packages already present (from the base or another
 project) aren't rebuilt. At runtime that profile goes on `PATH` **ahead** of the
 base, so the project sees base ∪ its extras (and can shadow a base tool with a
 pinned version). Rebuild after changing the repo flake; `delete` removes the
 profile too.
+
+If the repo has no `flake.lock`, the first build writes the one Nix generated
+next to `flake.nix` in the app volume; commit it. Without it every build would
+resolve the inputs again (whatever nixpkgs is that day, through GitHub's API
+without your token).
 
 By default only `flake.nix` (+ `flake.lock`) is copied, so a flake that
 references *other* local files won't resolve. For that case, put the flake and
