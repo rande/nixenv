@@ -38,6 +38,9 @@ Claude Code loads the relevant specs automatically through `.claude/rules/`.
 - Releasing: `RELEASING.md` (REL-02).
 - Reviews: `.claude/skills/` has principal-engineer, security and Linux/macOS
   review skills; ask for "a full review of this branch" to apply all three.
+  `review-nix` reviews how nixenv uses Nix (flakes, builder, profiles, templates).
+- Committing: the `commit` skill (`/commit`) splits the changes into focused
+  `type(part): summary` commits with a body; it never pushes.
 
 ## Verifying changes
 
