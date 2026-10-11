@@ -13,14 +13,18 @@
 #
 # HOW NIXENV USES IT (important context for an LLM editing this file)
 # ------------------------------------------------------------------
-#   * Every project container already has a SHARED base toolchain on PATH
-#     (git, zsh, ripgrep, fd, jq, tmux, zellij, Node, Go, Rust, PHP, Python, uv,
-#     the Claude CLI, …). Do NOT re-declare those here — only add what's missing.
+#   * Every project container already has a SHARED base toolchain on PATH:
+#     shell, editor and CLI tools (git, zsh, neovim, ripgrep, fd, jq, curl,
+#     zmx, the Claude CLI, …). It has NO language runtime: no Node, PHP,
+#     Python, Go, Rust or Ruby, no package manager (composer, uv) and no
+#     language server that needs one. Declare the runtime THIS project needs
+#     here, together with its language server.
 #   * `nixenv build <project>` extracts THIS `flake.nix` (and `flake.lock`) from
 #     the project's code volume, then runs roughly:
-#         nix profile install path:/flake#default \
-#           --profile /nix/var/nix/profiles/proj-<project>
-#     i.e. it installs the output attribute `packages.<system>.default`.
+#         nix build path:/flake#default
+#         nix-env --profile /nix/var/nix/profiles/proj-<project> --set <result>
+#     i.e. it builds the output attribute `packages.<system>.default`, and
+#     only once that succeeds switches the project's profile to it.
 #   * That per-project profile is mounted read-only and put on PATH *ahead of*
 #     the base profile, so the container sees: base tools ∪ these extras, and an
 #     entry here can SHADOW a base tool (e.g. pin a different Node version).
@@ -41,8 +45,13 @@
 #      repo at build time. Therefore this flake MUST be self-contained: do NOT
 #      reference other local files in the repo (no `./overlays/x.nix`, no
 #      `src = ./.`, no building the project itself). Declare DEPENDENCIES only.
+#      (A flake that needs files next to it lives in a subfolder built with
+#      `nixenv build <project> --dir=<subfolder>`, which copies that folder.)
 #   4. Target Linux systems only — the build runs inside a Linux container.
-#   5. Commit `flake.lock` for reproducible builds (run `nix flake lock`).
+#   5. Commit `flake.lock` for reproducible builds. If the repo has none, the
+#      first `nixenv build` writes the one it generated next to this file.
+#   6. Services and hooks ship as FILES in the profile (`writeTextDir`), see
+#      `svExample` and `startupHook` below; never write them from a hook.
 #
 # This flake is also a normal flake: developers can use it directly on a host
 # with Nix via `nix build` / `nix develop` (see the devShell at the bottom).
@@ -68,12 +77,11 @@
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
 
-      # Per-system nixpkgs instance. `allowUnfree = true` mirrors the base so
-      # unfree packages (if you need any) evaluate; drop it if you prefer.
-      pkgsFor = system: import nixpkgs {
-        inherit system;
-        config.allowUnfree = true;
-      };
+      # Per-system nixpkgs instance. Free software only; to use an unfree
+      # package, allow it BY NAME so nothing else unfree slips in:
+      #   config.allowUnfreePredicate = p:
+      #     builtins.elem (nixpkgs.lib.getName p) [ "terraform" ];
+      pkgsFor = system: import nixpkgs { inherit system; };
     in
     {
       # -----------------------------------------------------------------------
@@ -95,7 +103,7 @@
           # native /etc/hosts format ("<ip><TAB or spaces><name>"), one per line.
           # `writeTextDir` produces a derivation containing exactly
           # $out/etc/hosts.extra, which buildEnv (below) merges into the profile.
-          # Leave the list empty (or drop `hostsExtra` from `paths`) for none.
+          # These are EXAMPLES: replace them, then enable `hostsExtra` in `paths`.
           hostsExtra = pkgs.writeTextDir "etc/hosts.extra" ''
             10.0.0.5      db
             10.0.0.6      cache.internal
@@ -112,24 +120,31 @@
           # with this profile already first on PATH.
           # Handy variables: $SVROOT ($HOME/.nixenv-sv), $NIXENV_APP_MOUNT,
           # $NIXENV_PROJECT, $NIXENV_EXTRA_PROFILE.
-          # Anything it writes into $SVROOT/<name>/run is supervised THIS boot.
+          # Use it for first-run setup (create project files, seed a database),
+          # guarded by a marker so restarts stay instant. Services are NOT
+          # created here: declare them as files (`svExample` below).
           #
-          # Simplest form — the file is sourced, so top-level code just runs.
-          # A <project>-setup script shipped by this same flake is on PATH:
+          # The FUNCTION form lets a repo/home hook override it (last definition
+          # wins) and can `return`; an `exit` at top level skips every later
+          # hook and is reported as a failure. Enable it in `paths` below.
           startupHook = pkgs.writeTextDir "etc/nixenv-hooks.sh" ''
-            myproject-setup
+            nixenv_pre_ssh_start() {
+              marker="''${NIXENV_APP_MOUNT:-/app}/.nixenv/.setup-done"
+              [ -e "$marker" ] && return 0
+              echo "first start: replace this with the project's setup" &&
+                mkdir -p "$(dirname "$marker")" && touch "$marker"
+            }
           '';
-          # Equivalent using the optional hook FUNCTION instead. Use this form if
-          # you want a repo/home hook to be able to override it (last definition
-          # wins), or if the body needs `return` — an `exit` at top level skips
-          # every later hook and is reported as a failure:
-          #
-          #   startupHook = pkgs.writeTextDir "etc/nixenv-hooks.sh" '''
-          #     nixenv_pre_ssh_start() {
-          #       mkdir -p "$SVROOT/supervisord"
-          #       install -Dm755 ${"\${supervisordRun}"}/bin/run "$SVROOT/supervisord/run"
-          #     }
-          #   ''';
+
+          # --- A service (optional) --------------------------------------------
+          # nixenv copies sv/<name>/run from this profile into $SVROOT at every
+          # start and supervises it with runit. The script must exec a
+          # FOREGROUND process; exiting makes runit restart it (sleep first when
+          # waiting for a dependency). Enable it in `paths` below.
+          svExample = pkgs.writeTextDir "sv/example/run" ''
+            #!/bin/sh
+            exec ${pkgs.python3}/bin/python3 -m http.server 8000 --bind 0.0.0.0
+          '';
         in {
           default = pkgs.buildEnv {
             name = "project-deps";
@@ -140,8 +155,9 @@
             # >>> EDIT THIS LIST <<<  — the project's extra dependencies.
             # These are EXAMPLES; replace with what your project actually needs.
             paths = with pkgs; [
-              # --- Example: pin a specific language runtime (shadows the base) ---
-              # nodejs_22            # base already provides Node 22; override here if needed
+              # --- The project's language runtime (the base has none) ---
+              # nodejs_22            # + typescript-language-server for the editor
+              # php83                # + php83Packages.composer
 
               # --- Example: databases / infra clients ---
               # postgresql_16        # provides psql, pg_dump, …
@@ -163,15 +179,10 @@
               # before you add anything. Remove once you add real deps.
               pkgs.hello
 
-              # --- Custom /etc/hosts entries (see `hostsExtra` above) ---
-              # Ships etc/hosts.extra in the profile; nixenv merges it into the
-              # container's /etc/hosts at start. Remove this line to disable.
-              hostsExtra
-
-              # --- Startup hook (see `startupHook` above) ---
-              # Ships etc/nixenv-hooks.sh; nixenv sources it and calls
-              # nixenv_pre_ssh_start before services start. Remove to disable.
-              startupHook
+              # --- Optional pieces declared above: uncomment to ship them ---
+              # hostsExtra           # etc/hosts.extra, merged into /etc/hosts
+              # startupHook          # etc/nixenv-hooks.sh, run at every start
+              # svExample            # sv/example/run, a supervised service
 
               # --- Example using the optional unstable input (see inputs above) ---
               # unstable.some-bleeding-edge-tool
@@ -223,25 +234,24 @@
 # 4. Build + (re)start the project:
 #
 #      nixenv build <project>      # so `supervisord` is on PATH
-#      nixenv stop <project> && nixenv run <project>
+#      nixenv stop <project> && nixenv start <project>
 #
 # Then `supervisorctl` (also on PATH) manages your supervisord-defined processes.
 # Add more services the same way: one <repo>/.nixenv/sv/<name>/run per service.
 #
-# ── Alternative: declare the service from THIS flake ────────────────────────
-# A flake build is sandboxed — it can only write to its own $out in the store,
-# so it can NEVER create files in $HOME (e.g. ~/.nixenv-sv/<name>/run) or in the
-# app volume. To ship a service with the toolchain instead of the repo, use the
-# STARTUP HOOK (`startupHook` above): the flake declares etc/nixenv-hooks.sh at
-# build time, and nixenv calls `nixenv_pre_ssh_start` at container start — in
-# the real container, where writing to $HOME works. Services it creates in
-# $SVROOT are supervised in the same boot.
+# ── Alternative: declare the service in THIS flake ──────────────────────────
+# Ship the run script in the profile with `pkgs.writeTextDir "sv/<name>/run"`
+# (`svExample` above) and add it to `paths`: nixenv copies every sv/<name>/run
+# from this profile into ~/.nixenv-sv at each start, before the repo's own
+# .nixenv/sv (which wins on a name clash). Don't write services from the
+# startup hook: a heredoc inside a Nix indented string breaks as soon as the
+# indentation shifts, and the hook then fails silently.
 # =============================================================================
 
 # =============================================================================
 # PER-PROJECT HOME OVERRIDES (<repo>/.nixenv/home/)
 # =============================================================================
-# The container's home (dotfiles: nvim, zsh, git, tmux, ssh config) comes from a
+# The container's home (dotfiles: nvim, zsh, git, ssh config) comes from a
 # shared skeleton baked into nixenv. To customise it FOR THIS PROJECT, commit
 # files under <repo>/.nixenv/home/ mirroring their path in $HOME, e.g.:
 #
@@ -271,7 +281,7 @@
 # above. Then build + restart to apply:
 #
 #     nixenv build <project>
-#     nixenv stop <project> && nixenv run <project>
+#     nixenv stop <project> && nixenv start <project>
 #     getent hosts db          # -> 10.0.0.5  db
 #
 # Precedence: base localhost lines + "127.0.1.1 <hostname>", then this flake's
