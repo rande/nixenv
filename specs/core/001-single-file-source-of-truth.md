@@ -31,5 +31,6 @@ second copy of any embedded file would drift from the one that actually runs.
 ## How
 
 On every command, `materialize_context()` writes the files into `$CONTEXT_DIR`
-(default `~/.nixenv/context`) and the build runs from there. `flake.lock` is
-never written by the script, so it persists in `$CONTEXT_DIR` across runs.
+(default `~/.nixenv/context`) and the build runs from there. An existing
+`flake.lock` is never overwritten, so it persists in `$CONTEXT_DIR` across
+runs; a missing one is seeded from the lock embedded in the script (TOOL-09).

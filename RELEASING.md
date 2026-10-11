@@ -218,3 +218,18 @@ The two must agree (they're also shown as `sha256:` digests on the GitHub
 release page). Then update the hashes in `tests/unit/26-pinned-fetches.sh`,
 run `./nixenv.sh build`, and release as a **minor** — every user's store
 rebuilds the zmx path.
+
+## Refreshing the base flake.lock
+
+nixenv ships the base flake's `flake.lock` inside `nixenv.sh` (TOOL-09), so
+every machine on a version builds the same toolchain. Refresh it before a
+release (`release.sh` warns while none is embedded):
+
+```sh
+./nixenv.sh update               # resolves the inputs, rebuilds, writes ~/.nixenv/context/flake.lock
+./dev/embed-flake-lock.sh        # copies that lock into nixenv.sh (checks it first)
+./tests/run.sh && git commit -am "chore(toolchain): refresh the base flake.lock"
+```
+
+The embedded lock only seeds a machine that has none yet; `update` keeps
+rolling an existing one forward.

@@ -17,3 +17,4 @@ change alters a rule, update its spec in the same commit.
 - TOOL-06 PATH order: ~/.local/bin, project profile, base: @../../specs/toolchain/006-path-order.md
 - TOOL-07 Optional GitHub token for flake inputs: @../../specs/toolchain/007-github-token.md
 - TOOL-08 Claude CLI from nixpkgs-unstable on the shared profile: @../../specs/toolchain/008-claude-cli.md
+- TOOL-09 The base flake.lock ships inside nixenv.sh: @../../specs/toolchain/009-base-flake-lock.md

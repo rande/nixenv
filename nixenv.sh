@@ -156,13 +156,73 @@ warn() { printf "${c_yellow}!${c_reset} %s\n" "$*"; }
 die()  { printf "${c_red}✗ %s${c_reset}\n" "$*" >&2; exit 1; }
 
 # =============================================================================
+# The base flake's lock as of this release (TOOL-09): without it, the first
+# `build` on each machine resolved whatever the channels pointed at that day,
+# so two users of one version got different toolchains. Refresh it with
+#   ./nixenv.sh update && ./dev/embed-flake-lock.sh
+# (release.sh warns while it is empty). Empty = no lock shipped.
+embedded_flake_lock() {
+  cat <<'NIXENV_FLAKE_LOCK'
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1791426274,
+        "narHash": "sha256-MWhktfFtFE8Jl7bf9Pkp7TR5MSdYCjCswSo0Gkb4ywc=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "7c8764b7c7b09b34f632464276218ef9090eaa11",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-26.05",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs-unstable": {
+      "locked": {
+        "lastModified": 1791594108,
+        "narHash": "sha256-XK4KceonkwD8LuMAt/vNrz982mXJM5jeHAxMwsUXXAQ=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "6510408d147d8c5e6d76043e899e9251756f6a75",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "nixpkgs-unstable": "nixpkgs-unstable"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
+NIXENV_FLAKE_LOCK
+}
+
+# =============================================================================
 # materialize_context — write all embedded files into $CONTEXT_DIR
 # =============================================================================
-# Called at the start of every real command. flake.lock is NOT touched, so it
-# persists across runs. Heredocs are single-quoted: content is written verbatim.
+# Called at the start of every real command. An existing flake.lock is NOT
+# touched, so it persists across runs (`update` rolls it forward); a missing one
+# is seeded from the lock this release ships (TOOL-09). Heredocs are
+# single-quoted: content is written verbatim.
 materialize_context() {
   local c="$CONTEXT_DIR"
   mkdir -p "$c/home-skel/.config/nvim" "$c/home-skel/.ssh"
+  if [ ! -e "$c/flake.lock" ] && [ -n "$(embedded_flake_lock)" ]; then
+    embedded_flake_lock > "$c/flake.lock"
+  fi
 
   cat > "$c/flake.nix" <<'NIXENV_FLAKE'
 {

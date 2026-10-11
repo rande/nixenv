@@ -84,6 +84,12 @@ have curl || die "curl is required (update-formula.sh downloads the tag tarball)
 [ -f "$SCRIPT" ] && [ -f "$SITE" ] && [ -f "$FORMULA" ] || die "run this from the nixenv repository"
 grep -q '^NIXENV_VERSION="' "$SCRIPT" || die "could not find NIXENV_VERSION in $SCRIPT"
 grep -q '<b id="rev">[^<]*</b>' "$SITE" || die "could not find <b id=\"rev\"> in $SITE"
+# TOOL-09: the base flake's lock ships inside nixenv.sh. Not fatal (it needs an
+# engine and the network to produce), but a release without it is unpinned.
+if [ "$(sed -n "/^  cat <<'NIXENV_FLAKE_LOCK'\$/,/^NIXENV_FLAKE_LOCK\$/p" "$SCRIPT" | wc -l)" -le 2 ]; then
+  warn "no flake.lock embedded in $SCRIPT: every machine resolves the base inputs on its first build"
+  warn "  fix: ./nixenv.sh update && ./dev/embed-flake-lock.sh, commit, then release again"
+fi
 ok "releasing nixenv $version ($tag)"
 
 # The tap clone lives inside this repo; it must never be committed here.

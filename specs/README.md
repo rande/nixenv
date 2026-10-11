@@ -59,6 +59,7 @@ enforced-by:                    # optional: tests that fail when it is broken
 - [TOOL-06](toolchain/006-path-order.md) PATH order: ~/.local/bin, project profile, base
 - [TOOL-07](toolchain/007-github-token.md) Optional GitHub token for flake inputs
 - [TOOL-08](toolchain/008-claude-cli.md) Claude CLI from nixpkgs-unstable on the shared profile
+- [TOOL-09](toolchain/009-base-flake-lock.md) The base flake.lock ships inside nixenv.sh
 
 ### Runtime — Project containers, volumes, entrypoint, services
 
