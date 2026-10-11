@@ -17,7 +17,11 @@
 #   * `nixenv-docker` / `nixenv-podman`: the same, pinned to one engine, each
 #     with its own nixenv state, so both can run side by side;
 #   * what the test suite and reviews need: python3 (the squid ACL model in
-#     tests/), shellcheck, shfmt, jq, gh.
+#     tests/), shellcheck, shfmt, jq, gh;
+#   * `nix`, for the Nix review (.claude/skills/review-nix): the store is
+#     mounted READ-ONLY here, so it parses and evaluates (nix-instantiate
+#     --parse, nix eval on what the store already holds) but cannot build or
+#     fetch — `./nixenv.sh build` on the host does that.
 #
 # The engines are privileged sidecars, NOT something this flake can start: a
 # project container is non-root with every capability dropped, so no daemon can
@@ -121,6 +125,17 @@
               mkdir -p "$HOME/.nixenv" && printf '%s\n' "$e" > "$HOME/.nixenv/engine"
             }
             nixenv_dev_pick_engine || true
+
+            # nix on the read-only /nix: open the store without writing its
+            # database (read-only-local-store). Written once; your edits stay.
+            nixenv_dev_nix_conf() {
+              c="$HOME/.config/nix/nix.conf"
+              [ -e "$c" ] && return 0
+              mkdir -p "$HOME/.config/nix" && printf '%s\n' \
+                "experimental-features = nix-command flakes read-only-local-store" \
+                "store = local?read-only=true" > "$c"
+            }
+            nixenv_dev_nix_conf || true
           '';
         in
         {
@@ -137,6 +152,7 @@
               pkgs.shfmt
               pkgs.jq
               pkgs.gh
+              pkgs.nix
               startupHook
             ];
           };

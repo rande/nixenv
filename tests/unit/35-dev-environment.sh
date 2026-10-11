@@ -68,6 +68,12 @@ assert_contains "$fl" 'etc/nixenv-hooks.sh' "picks the nested engine at start"
 paths="$(printf '%s\n' "$fl" | sed -n '/paths = \[/,/\];/p' | code_only)"
 assert_not_contains "$paths" "docker-client" "real docker client referenced, not installed (bin/docker collision)"
 assert_not_contains "$paths" "pkgs.podman" "real podman referenced, not installed (bin/podman collision)"
+# nix for the Nix review; the store is read-only in a project container, so
+# the hook points it at a read-only local store, without clobbering a user's file.
+assert_contains "$paths" "pkgs.nix" "nix installed"
+assert_contains "$fl" '"store = local?read-only=true"' "nix opens the RO store read-only"
+assert_contains "$fl" 'read-only-local-store' "with the feature that setting needs"
+assert_contains "$fl" '[ -e "$c" ] && return 0' "an existing nix.conf is kept"
 # `nixenv` on PATH runs the checkout under development.
 assert_contains "$fl" 'pkgs.writeShellScriptBin "nixenv"' "nixenv command provided"
 assert_contains "$(printf '%s\n' "$fl" | sed -n '/paths = \[/,/\];/p')" "              nixenv" "and installed"

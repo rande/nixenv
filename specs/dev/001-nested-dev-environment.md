@@ -25,6 +25,15 @@ enforced-by:
   `nixenv-docker`/`nixenv-podman` set `CONTAINER_ENGINE`,
   `HOME=$real/.nixenv-dev/<engine>` and default `CONTAINER_PREFIX=nixdev`.
 - Every nixenv state path MUST follow `$HOME`.
+- `dev/flake.nix` also ships `nix` for Nix reviews. The store is read-only in a
+  project container, so its hook writes `~/.config/nix/nix.conf` (only when
+  missing) with `store = local?read-only=true` and the
+  `read-only-local-store` feature: parse and evaluate only, never build.
+- `dev/embed-flake-lock.sh` (host side) embeds the base flake's lock into
+  `nixenv.sh` (TOOL-09). `dev/flake.nix` and `examples/hello` commit their
+  own `flake.lock`, pinned to the same nixpkgs revision as the base lock so
+  they share its store paths (`nix flake lock --override-input nixpkgs
+  github:NixOS/nixpkgs/<rev>`; the input still tracks `nixos-26.05`).
 
 ## Why
 
