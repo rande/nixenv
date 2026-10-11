@@ -72,7 +72,9 @@ assert_contains "$body" '.windmill-installed' "first-run marker"
 # workspaces (wmill sync is scoped to cwd + selected workspace, so one dir each)
 assert_contains "$body" 'writeShellScriptBin "wmill"' "ships the wmill CLI"
 assert_contains "$body" 'wmillCli'                    "wmill is in buildEnv paths"
-assert_contains "$body" 'jsr:@windmill-labs/wmill'    "CLI comes from JSR"
+# windmill-cli is published on npm (JSR has no @windmill-labs/wmill: a 404).
+assert_contains "$body" 'npm:windmill-cli@${wmillVersion}/wmill' "CLI from npm, pinned to the server's version"
+assert_not_contains "$(printf '%s' "$body" | code_only)" 'jsr:@windmill-labs/wmill' "not the JSR spec that does not exist"
 assert_contains "$body" 'mkdir -p "$APP/workspaces"'  "scaffolds a per-workspace root"
 assert_contains "$body" 'workspace switch'            "documents switching workspaces"
 assert_contains "$body" '.gitignore'                  "writes a .gitignore"

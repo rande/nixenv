@@ -33,5 +33,7 @@ upstream by ~200 releases.
 
 Replaces upstream's docker-compose with runit services: `windmill-server`, two
 worker groups and postgres (one binary embeds the frontend). `windmillNixpkgs`
-copies nixpkgs' wrapper with the python swapped (no rebuild). The `wmill` CLI is wrapped from JSR through the deno in windmill's closure. The
+copies nixpkgs' wrapper with the python swapped (no rebuild). The `wmill` CLI is npm's `windmill-cli` (`npm:windmill-cli@<v>/wmill`; it is
+not on JSR) run by the deno in windmill's closure, pinned to the server's
+version (`wmillVersion`). The
 build fails if nixpkgs' wrapper changes shape.

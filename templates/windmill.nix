@@ -31,8 +31,8 @@
 #   with just flake.nix and a README, and nothing is ever written there
 #   automatically. Files appear only when you run `wmill sync pull`.
 #
-#   The `wmill` CLI is on PATH (it is not in nixpkgs, so it runs from JSR via the
-#   deno already inside the windmill closure). One SERVER hosts as many
+#   The `wmill` CLI is on PATH (it is not in nixpkgs, so npm's windmill-cli runs
+#   through the deno already inside the windmill closure). One SERVER hosts as many
 #   workspaces as you want — create them in the UI. `wmill sync` is scoped to the
 #   current directory AND the selected workspace, so the layout is one directory
 #   per workspace, with the app volume as the git repo:
@@ -103,13 +103,6 @@
       useUpstreamBinary = false;
       upstreamVersion   = "1.798.0";
       upstreamSha256    = "8dd41341d300f11272ae31511081113f300ea885091501ae0a81aee93341a444";
-
-      # --- wmill CLI (git sync) ----------------------------------------------
-      # Not in nixpkgs, so it runs straight from JSR via deno — which is already
-      # in the windmill closure, making this near-free. Append a version
-      # (…/wmill@1.601.1) to pin it; bare means latest at first run, cached in
-      # DENO_DIR from then on.
-      wmillSpec = "jsr:@windmill-labs/wmill";
     in
     {
       packages = forAllSystems (system:
@@ -189,11 +182,20 @@
             else windmillUpstream;
 
           # --- wmill CLI --------------------------------------------------------
+          # Not in nixpkgs, so deno (already in the windmill closure) runs the
+          # `wmill` bin of npm's windmill-cli, PINNED to the server's version.
+          # It is not on JSR: the former jsr:@windmill-labs/wmill spec was a 404,
+          # and unpinned it would have run the latest CLI (with `deno run -A`,
+          # every permission) against an older server.
           # `wmill sync` is scoped to the CURRENT DIRECTORY and the currently
           # selected workspace, which is why the scaffold below gives each
           # workspace its own directory under the app volume.
+          wmillVersion = if useUpstreamBinary then upstreamVersion else pkgs.windmill.version;
+          wmillSpec = "npm:windmill-cli@${wmillVersion}/wmill";
           wmillCli = pkgs.writeShellScriptBin "wmill" ''
             export DENO_DIR="''${DENO_DIR:-$HOME/.cache/deno}"
+            # Upstream now prefers node; deno is the runtime this closure has.
+            export SKIP_DENO_DEPRECATION_WARNING=true
             mkdir -p "$DENO_DIR"
             exec ${pkgs.deno}/bin/deno run -A --unstable-worker-options ${wmillSpec} "$@"
           '';
@@ -349,7 +351,7 @@
               fi
 
               # printf, not a heredoc: heredocs nested in a Nix indented string
-              # are fragile (see CLAUDE.md → "Writing templates — hard-won rules").
+              # are fragile (TPL-03, specs/templates/003-services-as-files.md).
               if [ ! -f "$APP/README.windmill.md" ]; then
                 printf '%s\n' \
                   "# @@PROJECT@@ — Windmill" \
