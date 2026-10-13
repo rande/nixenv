@@ -103,6 +103,8 @@ ENGINE_FILE="${ENGINE_FILE:-$HOME/.nixenv/engine}"   # remembered engine choice
 GITHUB_TOKEN_FILE="${GITHUB_TOKEN_FILE:-$HOME/.nixenv/github_token}"  # optional, raises GitHub's API limit
 GITHUB_TOKEN_SKIP="${GITHUB_TOKEN_SKIP:-$HOME/.nixenv/github_token.skip}" # "don't ask again" marker
 IMPORT_DIR="${IMPORT_DIR:-$HOME/.nixenv/import}"     # 'import' unpacks archives here (not /tmp)
+SSH_REMOTE_FILE="${SSH_REMOTE_FILE:-$HOME/.nixenv/ssh-remote}"  # 'ssh-config --remote' on: projects accept this host's login keys
+HOST_AUTHORIZED_KEYS="${HOST_AUTHORIZED_KEYS:-$HOME/.ssh/authorized_keys}"
 ENGINE=""                                            # resolved at runtime
 
 # --- Reverse proxy (nixenv proxy) --------------------------------------------
@@ -2344,8 +2346,19 @@ ensure_project_ssh_key() {
     if [ -f "$sd/authorized_keys.extra" ]; then
       grep -v '^[[:space:]]*#' "$sd/authorized_keys.extra" | grep -v '^[[:space:]]*$' || true
     fi
+    if [ -f "$SSH_REMOTE_FILE" ]; then host_login_keys; fi
   } > "$sd/authorized_keys"
   chmod 644 "$sd/authorized_keys"
+}
+
+# With 'ssh-config --remote' on (SSH-04): the keys that may log in to THIS host
+# as you, which can already 'nixenv shell' any project, so a project accepting
+# them grants nothing new. Plain key lines only: a key restricted on the host
+# (command=, from=, restrict…) must not become a full shell in a project.
+host_login_keys() {
+  [ -f "$HOST_AUTHORIZED_KEYS" ] && [ ! -L "$HOST_AUTHORIZED_KEYS" ] || return 0
+  grep -E '^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com) [A-Za-z0-9+/]+={0,3}( [^[:cntrl:]]*)?$' \
+    "$HOST_AUTHORIZED_KEYS" || true
 }
 
 # The name a project's host key is recorded under — independent of the port.
@@ -4801,8 +4814,137 @@ cmd_ssh_config() {
         ok "added to $f:  $inc"
       fi
       ;;
-    *) die "usage: $0 ssh-config [--install]";;
+    --remote=off)  ssh_remote_off;;
+    --remote|--remote=*) ssh_remote_on "${1#--remote}";;
+    --port)        ssh_remote_port "${2:-}";;
+    --known-hosts) ssh_remote_known_hosts "${2:-}";;
+    *) die "usage: $0 ssh-config [--install | --remote[=<alias>|=off]]";;
   esac
+}
+
+# --- ssh from another machine, with every setting kept HERE (SSH-04) ----------
+# The laptop holds one generic 'Host <alias>.*' block. For each connection its
+# ProxyCommand asks this nixenv for the project's port (--port, starting the
+# project if needed) and tunnels with 'ssh -W'; KnownHostsCommand fetches the
+# pinned host key (--known-hosts), so the SSH-02 squatter check still holds.
+# --port and --known-hosts are plumbing: dispatched before materialize_context,
+# and stdout carries ONLY the answer (warn prints to stdout, hence the >&2).
+
+# '<alias>.<project>[.<session>]' (as ssh got it, maybe '[h]:port') -> project.
+# Alias FIRST: the laptop's own nixenv blocks ('Host <p> <p>.*', SSH-03) come
+# first in its ~/.ssh/config, and '<p>.<alias>' would match a local project of
+# the same name and take its port, key and HostKeyAlias.
+ssh_remote_project() {
+  local h="$1" name
+  case "$h" in ""|*[!a-zA-Z0-9._:\[\]-]*) die "invalid host name: '$h'";; esac
+  h="${h#\[}"; h="${h%%]*}"
+  case "$h" in *.*) ;; *) die "expected <alias>.<project>, got '$h'";; esac
+  name="${h#*.}"; name="${name%%.*}"
+  valid_project_name "$name" >&2 || die "invalid project name: '$name'"
+  [ -d "$(project_dir "$name")" ] || die "no project '$name' on $(hostname)"
+  printf '%s' "$name"
+}
+
+ssh_remote_port() {
+  local name pdir port i
+  name="$(ssh_remote_project "$1")" || exit 1
+  pdir="$(project_dir "$name")"
+  port="$(cat "$pdir/port" 2>/dev/null || true)"
+  case "$port" in ""|*[!0-9]*) die "project '$name' has no ssh port yet: start it once";; esac
+  [ -f "$SSH_REMOTE_FILE" ] || die "ssh from other machines is off here: run '$0 ssh-config --remote' on $(hostname)"
+  # Rebuilt in place, so a key added to this host's login keys works at once.
+  ensure_project_ssh_key "$pdir" </dev/null >&2
+  # Like 'ssh <project>': start it when it isn't running. stdin is the remote
+  # ssh's (ssh -n on the laptop), and every message goes to stderr.
+  # (Probed in a subshell first: resolve_engine dies on a bad CONTAINER_ENGINE,
+  # and no engine here only means the port is answered as is.)
+  if ( resolve_engine ) </dev/null >/dev/null 2>&1 && resolve_engine </dev/null >&2 \
+     && ! container_running "$(container_name "$name")"; then
+    ( materialize_context && NIXENV_QUIET=1 cmd_run "$name" ) </dev/null >&2 \
+      || die "could not start '$name'"
+    # sshd comes up just after the container: wait for the port (bash /dev/tcp,
+    # no nc on the host), so the first 'ssh -W' isn't refused.
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
+      sleep 1
+    done
+  fi
+  printf '%s\n' "$port"
+}
+
+ssh_remote_known_hosts() {
+  local h="$1" name kh
+  name="$(ssh_remote_project "$h")" || exit 1
+  kh="$(project_dir "$name")/ssh/known_hosts"
+  [ -f "$kh" ] || die "project '$name' has no pinned host key yet: start it once"
+  # Recorded as 'nixenv-<p> <type> <key>'; ssh wants the name it looked up.
+  printf '%s %s\n' "$h" "$(head -n 1 "$kh" | cut -d' ' -f2,3)"
+}
+
+# Turn remote ssh on: every project accepts this host's login keys (refreshed
+# now and on each connection), then print the LAPTOP's ~/.ssh/config block. It
+# names no project, port or key: everything is looked up here at connect time.
+refresh_project_keys() {
+  local d
+  for d in "$PROJECTS_DIR"/*/; do
+    [ -f "$d/ssh/id_ed25519" ] || continue
+    ensure_project_ssh_key "${d%/}"
+  done
+}
+
+ssh_remote_off() {
+  rm -f "$SSH_REMOTE_FILE"
+  refresh_project_keys
+  ok "ssh from other machines is off: projects accept only their own keys again"
+}
+
+ssh_remote_on() {
+  local alias="${1#=}" self
+  [ -n "$alias" ] || alias="$(hostname -s 2>/dev/null || hostname)"
+  case "$alias" in ""|-*|*[!a-zA-Z0-9._-]*) die "invalid alias: '$alias' (letters, digits, '.', '-', '_')";; esac
+  self="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+  case "$self" in *[!a-zA-Z0-9._/+-]*)
+    warn "nixenv's path has unusual characters ($self); using 'nixenv' from the remote PATH"
+    self=nixenv;;
+  esac
+  mkdir -p "$(dirname "$SSH_REMOTE_FILE")"
+  [ -f "$SSH_REMOTE_FILE" ] || printf '# ssh-config --remote: projects accept the plain keys of %s\n' "$HOST_AUTHORIZED_KEYS" > "$SSH_REMOTE_FILE"
+  refresh_project_keys
+  ok "projects now accept the keys that can log in here as $(id -un) ($HOST_AUTHORIZED_KEYS; restricted ones left out)"
+  echo "   turn it off with: $0 ssh-config --remote=off" >&2
+  log "On the laptop: add this to ~/.ssh/config (OpenSSH 8.5+ for KnownHostsCommand):"
+  echo
+  # ssh runs ProxyCommand through a shell; KnownHostsCommand is split into argv
+  # and needs an absolute program, hence /bin/sh -c. -n: the lookup must not
+  # read the ProxyCommand's stdin, which is the project connection itself.
+  cat <<NIXENV_SSH_REMOTE
+# --- nixenv projects on '$alias' (generated by: nixenv ssh-config --remote=$alias)
+#   ssh $alias.<project>            -> a plain shell (the project starts if needed)
+#   ssh $alias.<project>.<x>        -> a persistent zmx session
+# Don't name a project on THIS laptop '$alias': its own block would match first.
+# Ports and pinned host keys stay on $alias; nothing per project lives here.
+Host $alias
+    HostName $alias                 # the address of this machine, if '$alias' doesn't resolve
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 10m
+
+Host $alias.*
+    User $APP_USER
+    ProxyCommand sh -c 'p=\$(ssh -n $alias $self ssh-config --port %n) && exec ssh -W "127.0.0.1:\$p" $alias'
+    KnownHostsCommand /bin/sh -c 'ssh -n $alias $self ssh-config --known-hosts %H'
+    UserKnownHostsFile /dev/null
+    GlobalKnownHostsFile /dev/null
+    StrictHostKeyChecking yes
+    LogLevel ERROR
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%C
+    ControlPersist 10m
+
+Host $alias.*.*
+    RequestTTY yes
+    RemoteCommand $PROFILE/bin/zmx attach %n
+NIXENV_SSH_REMOTE
 }
 
 # =============================================================================
@@ -5649,6 +5791,7 @@ nixenv proxy reload</pre></td></tr>
           <tr><td>capture &lt;project&gt; [action]<span class="opt">on [egress|ingress]  off  untrust  status  web  log [-f]  tui  har &lt;file&gt;  clear</span></td><td>Record a restricted project&#x27;s HTTP(S) traffic with mitmproxy, behind squid.</td><td><pre class="ex">nixenv capture shop on
 nixenv capture shop web</pre></td></tr>
           <tr><td>ssh-config [--install]<span class="opt">--install</span></td><td>Add the Include that makes ssh &lt;project&gt; work from your shell.</td><td><pre class="ex">nixenv ssh-config --install</pre></td></tr>
+          <tr><td>ssh-config --remote[=&lt;alias&gt;]<span class="opt">--remote=off turns it off</span></td><td>Let another machine ssh into the projects: they accept the keys that log in to this host, and it prints the block for that machine&#39;s ~/.ssh/config (ssh &lt;alias&gt;.&lt;project&gt; jumps through this host, which keeps the ports and host keys).</td><td><pre class="ex">nixenv ssh-config --remote=devbox</pre></td></tr>
         </tbody>
       </table>
     </div>
@@ -7789,6 +7932,10 @@ Commands:
                             its egress log / remove a leftover deploy container
   ssh-config [--install]    Print (or install) the ~/.ssh/config Include so
                             'ssh <project>' works via each <project>/ssh/config
+  ssh-config --remote[=<alias>|=off]   Let other machines reach the projects:
+                            projects accept the keys that log in to this host,
+                            and it prints the block for the OTHER machine's
+                            ~/.ssh/config ('ssh <alias>.<project>' jumps here)
   up <project>              build if needed, then start the service
   stop [<project>]          Stop & remove the project's service container.
                             With NO project: stops every nixenv container,
@@ -7916,6 +8063,9 @@ main() {
     -v|--version|version) printf 'nixenv %s\n' "$NIXENV_VERSION"; return 0;;
     install)   cmd_install "$@"; return $?;;
     uninstall) cmd_uninstall "$@"; return $?;;
+    # Plumbing for a laptop's ProxyCommand/KnownHostsCommand (SSH-04): it runs
+    # on every connection, so no context write, and stdout is the answer only.
+    ssh-config) case "${1:-}" in --port|--known-hosts) cmd_ssh_config "$@"; return $?;; esac;;
   esac
 
   # Always (re)materialise the embedded context first, then run from it.

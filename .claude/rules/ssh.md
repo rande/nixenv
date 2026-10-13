@@ -12,3 +12,4 @@ change alters a rule, update its spec in the same commit.
 - SSH-01 Container sshd accepts only the host-generated project key: @../../specs/ssh/001-key-only.md
 - SSH-02 The container host key is pinned: @../../specs/ssh/002-host-key-pinning.md
 - SSH-03 Host ssh config with zmx sessions: @../../specs/ssh/003-ssh-config-zmx.md
+- SSH-04 ssh from another machine: settings stay on the nixenv host: @../../specs/ssh/004-remote-host.md

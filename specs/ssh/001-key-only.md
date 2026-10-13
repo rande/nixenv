@@ -20,6 +20,8 @@ enforced-by:
   `authorized_keys.extra`, rewritten IN PLACE (keeps the bind-mounted inode).
   It is mounted read-only at `/etc/nixenv/authorized_keys`, sshd's ONLY
   `AuthorizedKeysFile` (`AuthenticationMethods publickey`, passwords off).
+  With `ssh-config --remote` on, the host's own plain login keys are added
+  too (SSH-04).
 - The entrypoint MUST NOT build authorized keys from the home volume.
 - The project key, host key and generated `ssh/` files are never exported
   (re-created on import); only `ssh/authorized_keys.extra` travels, gated.

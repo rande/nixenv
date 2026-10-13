@@ -15,7 +15,8 @@ enforced-by:
 
 - `-h|--help`, `-v|--version|version`, `install` and `uninstall` MUST be
   dispatched in `main` BEFORE `materialize_context`: no engine, no network, no
-  writes (no `$CONTEXT_DIR` created).
+  writes (no `$CONTEXT_DIR` created). So are `ssh-config --port|--known-hosts`,
+  the per-connection plumbing of SSH-04.
 - The script executes `main` only when run directly (`BASH_SOURCE` guard), so
   tests can `source` it.
 

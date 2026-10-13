@@ -179,6 +179,8 @@ interactive `zsh` via `docker exec` (no SSH key needed).
   [Terminal sessions](#terminal-sessions-zmx-via-ssh-project)).
 - `shell <project>` — interactive zsh via `docker exec` (no SSH key needed).
 - `ssh-config [--install]` — wire `ssh <project>` into your `~/.ssh/config`.
+- `ssh-config --remote[=<alias>|=off]` — ssh into the projects of a remote
+  nixenv host from your laptop (see below).
 - `expose <project> <port>…` — publish extra port(s) (see
   [Exposing ports](#exposing-ports)).
 - `host <project> <name:ip>…` — add custom `/etc/hosts` entries (see
@@ -298,6 +300,35 @@ is not changed. Move its `RequestTTY yes` and `RemoteCommand` lines into a new
 `Host myapp.*` block at the end, or delete
 `~/.nixenv/projects/myapp/ssh/config` and `nixenv start myapp` writes the new
 one.
+
+### From another machine (nixenv on a remote host)
+
+When nixenv runs on a remote box you already ssh into, your laptop needs ONE
+generic block; the ports and pinned host keys stay on the box and are looked
+up per connection:
+
+```sh
+# on the remote host, once ('devbox' = the name you give it on the laptop):
+nixenv ssh-config --remote=devbox        # prints the block for the laptop
+# on the laptop: paste it into ~/.ssh/config (keep your own 'Host devbox'
+# entry if you have one and drop the stub), then:
+ssh devbox.myapp                         # plain shell; starts the project if needed
+ssh devbox.myapp.main                    # persistent zmx session
+```
+
+The projects then accept the keys that can log in to the box as you (the plain
+lines of its `~/.ssh/authorized_keys`; keys restricted there with `command=`,
+`from=` and the like are left out). That grants nothing new: whoever logs in
+to the box can already `nixenv shell` any project. `--remote=off` stops it.
+
+`ssh devbox.myapp` runs a `ProxyCommand` that asks the remote nixenv for
+`myapp`'s port and tunnels with `ssh -W` through `devbox`; a
+`KnownHostsCommand` fetches the project's pinned host key from the remote, so
+an impostor on that port is still refused. A new or imported project (which
+gets a fresh port) needs no change on the laptop. It works with scp, rsync and
+VS Code Remote-SSH (`devbox.myapp`). The alias comes first so a local
+nixenv project of the same name (`myapp.*`) never captures it; just don't
+name a local project like the alias. The laptop needs OpenSSH 8.5 or newer.
 
 `nixenv ssh <project>` and `nixenv shell <project>` connect directly (plain zsh,
 no zmx), like `ssh <project>`. The prompt shows the project name (the

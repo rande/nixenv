@@ -85,6 +85,7 @@ enforced-by:                    # optional: tests that fail when it is broken
 - [SSH-01](ssh/001-key-only.md) Container sshd accepts only the host-generated project key (SEC-02)
 - [SSH-02](ssh/002-host-key-pinning.md) The container host key is pinned (SEC-10)
 - [SSH-03](ssh/003-ssh-config-zmx.md) Host ssh config with zmx sessions
+- [SSH-04](ssh/004-remote-host.md) ssh from another machine: settings stay on the nixenv host
 
 ### Networking — Shared reverse proxy, TLS, cross-project isolation
 

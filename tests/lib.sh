@@ -28,6 +28,9 @@ export CLAUDE_JSON="$NIXTEST_HOME/claude.json"
 export GITHUB_TOKEN_FILE="$NIXTEST_HOME/github_token"
 export GITHUB_TOKEN_SKIP="$NIXTEST_HOME/github_token.skip"
 export IMPORT_DIR="$NIXTEST_HOME/import"
+export SSH_REMOTE_FILE="$NIXTEST_HOME/ssh-remote"
+export HOST_AUTHORIZED_KEYS="$NIXTEST_HOME/host_authorized_keys"
+rm -f "$SSH_REMOTE_FILE" "$HOST_AUTHORIZED_KEYS"   # off unless a test turns it on
 unset GITHUB_TOKEN
 export CONTEXT_DIR="$NIXTEST_HOME/context"
 # The remembered engine choice too: with BOTH docker and podman on PATH and no
