@@ -7,6 +7,8 @@ source_nixenv
 body="$(cat "$REPO_DIR/nixenv.sh")"
 imp="$(printf '%s' "$body" | sed -n '/^cmd_import()/,/^}/p' | code_only)"
 assert_contains "$imp" 'import_meta_files' "import goes through the validating copier"
+assert_contains "$imp" 'mktemp -d "$IMPORT_DIR/' "import stages under IMPORT_DIR, not /tmp"
+assert_not_contains "$imp" 'mktemp -d)' "import never stages in the default temp dir"
 assert_not_contains "$imp" 'cp -a "$root/meta' "no verbatim cp -a of meta files"
 
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
@@ -68,6 +70,17 @@ assert_eq "$(cat "$pdir/flake_dir")" "infra/nixos" "valid flake dir kept"
 assert_file "$pdir/hosts.extra"                     "regular hosts.extra kept"
 [ -L "$pdir/hosts.extra" ] && fail "hosts.extra must be a fresh regular file"
 [ -e "$pdir/extra-parameters.imported" ] && fail "a comments-only scaffold is not quarantined"
+
+# macOS tar's AppleDouble files (._<file>) are metadata, never imported
+rm -rf "$meta" "$pdir"; mkdir -p "$meta/home" "$pdir"
+printf 'example.org\n' > "$meta/allowed_hosts"
+printf 'junk' > "$meta/._allowed_hosts"; printf 'junk' > "$meta/home/._.zshrc"
+import_meta_files "$meta" "$pdir" ok </dev/null >/dev/null 2>&1
+assert_file "$pdir/allowed_hosts" "the real file next to a ._ file is imported"
+[ -e "$pdir/._allowed_hosts" ] && fail "a ._ AppleDouble file was imported"
+[ -e "$pdir/home/._.zshrc" ] && fail "a nested ._ AppleDouble file was imported"
+exp_fn="$(printf '%s' "$body" | sed -n '/^cmd_export()/,/^}/p' | code_only)"
+assert_contains "$exp_fn" 'COPYFILE_DISABLE=1 tar -cf' "export keeps macOS metadata out of the archive"
 
 # --- the wider project files: gated, sanitised or ignored ---------------------
 rm -rf "$meta" "$pdir"; mkdir -p "$meta/ssh" "$meta/home/.ssh" "$meta/home/.config" "$pdir"

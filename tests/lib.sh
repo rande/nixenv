@@ -27,6 +27,7 @@ export CLAUDE_DIR="$NIXTEST_HOME/claude"
 export CLAUDE_JSON="$NIXTEST_HOME/claude.json"
 export GITHUB_TOKEN_FILE="$NIXTEST_HOME/github_token"
 export GITHUB_TOKEN_SKIP="$NIXTEST_HOME/github_token.skip"
+export IMPORT_DIR="$NIXTEST_HOME/import"
 unset GITHUB_TOKEN
 export CONTEXT_DIR="$NIXTEST_HOME/context"
 # The remembered engine choice too: with BOTH docker and podman on PATH and no

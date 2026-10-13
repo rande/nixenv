@@ -6,6 +6,7 @@ applies-to:
   - "nixenv.sh"
 enforced-by:
   - tests/unit/23-export-import.sh
+  - tests/unit/27-import-hostile-meta.sh
   - tests/integration/14-export-import.sh
 ---
 
@@ -30,3 +31,13 @@ we didn't create.
 ## How
 
 `import <file> [new-name] [--force]`. The manifest records `home=0|1` and `deploy=0|1`.
+Import unpacks the whole archive first into a `mktemp -d` stage under
+`IMPORT_DIR` (`~/.nixenv/import`, mode 700, following `$HOME`), never `/tmp`:
+that is often a small tmpfs (half the RAM on Debian 13) and a `--with-home`
+archive is gigabytes. It checks the free space there against the archive's size and, when `tar` fails,
+shows tar's own last lines (truncated copy, full disk, not a tar) instead of a
+bare "could not extract".
+The outer tar runs with `COPYFILE_DISABLE=1`: macOS tar otherwise adds a
+`._<file>` AppleDouble entry and an xattr header per file, which Linux tar
+warns about one by one. Import skips `._*` files in `meta/`, so archives made
+before this don't leave that junk in the project dir.

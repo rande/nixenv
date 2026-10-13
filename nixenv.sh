@@ -102,6 +102,7 @@ CONTAINER_ENGINE="${CONTAINER_ENGINE:-}"             # docker|podman; empty = au
 ENGINE_FILE="${ENGINE_FILE:-$HOME/.nixenv/engine}"   # remembered engine choice
 GITHUB_TOKEN_FILE="${GITHUB_TOKEN_FILE:-$HOME/.nixenv/github_token}"  # optional, raises GitHub's API limit
 GITHUB_TOKEN_SKIP="${GITHUB_TOKEN_SKIP:-$HOME/.nixenv/github_token.skip}" # "don't ask again" marker
+IMPORT_DIR="${IMPORT_DIR:-$HOME/.nixenv/import}"     # 'import' unpacks archives here (not /tmp)
 ENGINE=""                                            # resolved at runtime
 
 # --- Reverse proxy (nixenv proxy) --------------------------------------------
@@ -7006,7 +7007,9 @@ EOF
   } > "$stage/nixenv-export/manifest"
 
   log "Writing $out"
-  ( cd "$stage" && tar -cf "$out" nixenv-export ) || die "failed to write $out"
+  # COPYFILE_DISABLE: macOS tar would add a ._<file> (AppleDouble) next to
+  # every file and an xattr header for each; Linux tar warns on every one.
+  ( cd "$stage" && COPYFILE_DISABLE=1 tar -cf "$out" nixenv-export ) || die "failed to write $out"
   rm -rf "$stage"; trap - EXIT
 
   ok "Exported '$name' → $out"
@@ -7171,7 +7174,8 @@ import_meta_files() {
         cat "$src" > "$dst"; chmod 0644 "$dst";;
     esac
   done <<EOF
-$( cd "$meta" && find . -type f | sed 's#^\./##' | LC_ALL=C sort )
+$( # ._<file>: AppleDouble metadata from an archive made by macOS tar, not data.
+   cd "$meta" && find . -type f ! -name '._*' | sed 's#^\./##' | LC_ALL=C sort )
 EOF
 }
 
@@ -7210,12 +7214,29 @@ cmd_import() {
   [ -n "$arc" ] || die "usage: $0 import <archive.tar> [new-name] [--force] [--yes]"
   [ -f "$arc" ] || die "no such archive: $arc"
 
-  local stage; stage="$(mktemp -d)"
+  # The whole archive is unpacked first, so the stage needs about its own size.
+  # Not /tmp: it is often a small tmpfs (Debian 13 makes it half the RAM) and a
+  # --with-home archive is gigabytes. 700: the archive may carry credentials.
+  mkdir -p "$IMPORT_DIR" && chmod 700 "$IMPORT_DIR" \
+    || die "cannot create $IMPORT_DIR"
+  local stage; stage="$(mktemp -d "$IMPORT_DIR/import.XXXXXX")" \
+    || die "cannot create a staging dir in $IMPORT_DIR"
   # shellcheck disable=SC2064
   trap "rm -rf '$stage'" EXIT
-  # --no-same-owner: the archive's uids mean nothing here.
-  tar -xf "$arc" -C "$stage" --no-same-owner 2>/dev/null \
-    || die "could not extract $arc"
+  local need_kb free_kb
+  need_kb="$(du -k "$arc" 2>/dev/null | cut -f1)"
+  free_kb="$(df -Pk "$stage" 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [ -n "$need_kb" ] && [ -n "$free_kb" ] && [ "$free_kb" -lt "$need_kb" ]; then
+    die "not enough space to unpack $arc in $IMPORT_DIR: needs $((need_kb / 1024)) MB, $((free_kb / 1024)) MB free.
+       Point IMPORT_DIR at a disk with room, e.g.: IMPORT_DIR=/data/nixenv-import $0 import $arc"
+  fi
+  # --no-same-owner: the archive's uids mean nothing here. tar's own message
+  # is the diagnosis (truncated copy, full disk, not a tar), so show it.
+  local tar_err
+  if ! tar_err="$(tar -xf "$arc" -C "$stage" --no-same-owner 2>&1)"; then
+    die "could not extract $arc into $IMPORT_DIR:
+$(printf '%s\n' "$tar_err" | tail -n 5 | sed 's/^/       /')"
+  fi
   local root="$stage/nixenv-export"
   [ -f "$root/manifest" ] || die "not a nixenv export (no manifest): $arc"
   [ "$(manifest_get "$root/manifest" nixenv-export)" = "1" ] \

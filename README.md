@@ -1282,6 +1282,10 @@ machine — handy for forking a database-heavy environment. Importing onto a nam
 that already exists needs `--force`, which **replaces that project's volumes** —
 it warns and asks first (`--yes` to skip the prompt).
 
+`import` unpacks the archive in `~/.nixenv/import/` first (not `/tmp`, which is
+often a small RAM disk), so that disk needs about the archive's size free; set
+`IMPORT_DIR=/some/disk` to stage elsewhere.
+
 **What travels by default:** the `app` and `databases` volumes, the `deploy`
 state volume if [`deploy`](#deploying-deploy) has created one, plus everything
 in `~/.nixenv/projects/<project>/` that isn't regenerated per machine — egress
