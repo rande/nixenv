@@ -2896,6 +2896,73 @@ keep_project_lock() {
   fi
 }
 
+# The project flake's header (TOOL-10): the same `# nixenv:<key> <value>`
+# lines a template carries (TPL-01). `init --template` applies them before the
+# first build; this offers them on every later `build <project>`, so a repo
+# can declare the hosts its setup needs. The flake comes from the repo, and
+# these settings widen egress or move the code volume, so they are SHOWN and
+# applied only after an interactive yes. Only what differs from the project is
+# offered: hosts not yet allowed, and an app-path while the project has none of
+# its own (an explicit --app-path is never challenged). A "no" is remembered
+# for that exact set, so the next build doesn't ask again.
+apply_flake_header() {
+  local name="$1" f="$2" pdir desc port allow appp h nh new_hosts="" new_path=""
+  [ -f "$f" ] || return 0
+  pdir="$(project_dir "$name")"
+  desc="$(template_meta "$f" description)"
+  port="$(template_meta "$f" port | tr -cd '0-9')"
+  allow="$(template_meta "$f" allow)"
+  appp="$(template_meta "$f" app-path)"
+
+  for h in $allow; do
+    if ! nh="$(normalize_allowed_host "$h")"; then
+      warn "flake header: ignoring invalid allow entry '$h'"; continue
+    fi
+    grep -qxF "$nh" "$pdir/allowed_hosts" 2>/dev/null && continue
+    case " $new_hosts " in *" $nh "*) continue;; esac
+    new_hosts="$new_hosts $nh"
+  done
+  if [ -n "$appp" ] && [ ! -e "$pdir/app_mount" ] && [ "$appp" != /app ]; then
+    if valid_app_mount "$appp"; then new_path="$appp"
+    else warn "flake header: ignoring invalid app-path '$appp'"; fi
+  fi
+  [ -n "$new_hosts$new_path" ] || return 0
+
+  local sig declined="$pdir/.flake-header-declined"
+  sig="allow:$new_hosts app-path:$new_path"
+  if [ -f "$declined" ] && [ "$(cat "$declined")" = "$sig" ]; then
+    log "flake header: not applied (declined earlier):${new_hosts:+ allow$new_hosts}${new_path:+ app-path $new_path}"
+    return 0
+  fi
+
+  warn "'$name''s flake.nix declares project settings in its header (# nixenv:…):"
+  [ -z "$desc" ] || echo "   description: $desc"
+  [ -z "$new_hosts" ] || echo "   egress:   allow$new_hosts"
+  [ -z "$new_path" ] || echo "   app-path: /app → $new_path (where the code volume is mounted; next start)"
+  [ -z "$port" ] || echo "   serves:   port $port (https://$name-$port.$PROXY_DOMAIN/)"
+  if [ -n "$new_hosts" ]; then
+    echo "   An allowed host is a place data can be SENT. The flake comes from the repo:"
+    echo "   apply these only if you trust what declared them."
+  fi
+  if confirm_tty "Apply them to '$name'?"; then
+    rm -f "$declined"
+    # shellcheck disable=SC2086  # validated host names, one per word
+    if [ -n "$new_hosts" ]; then cmd_allow "$name" $new_hosts; fi
+    if [ -n "$new_path" ]; then
+      printf '%s' "$new_path" > "$pdir/app_mount"
+      ok "code volume will mount at '$new_path'"
+      if resolve_engine 2>/dev/null && container_running "$(container_name "$name")"; then
+        warn "'$name' is running: apply the new app-path with $0 stop $name && $0 start $name"
+      fi
+    fi
+  elif stdin_is_tty; then
+    printf '%s' "$sig" > "$declined"
+    log "not applied — this set won't be asked again${new_hosts:+; allow later with: $0 allow $name$new_hosts}"
+  else
+    warn "not applied: no terminal to confirm — run '$0 build $name' in a terminal${new_hosts:+, or: $0 allow $name$new_hosts}"
+  fi
+}
+
 cmd_build_project() {
   local name="${1:-}"
   [ -n "$name" ] || die "usage: $0 build <project> [--dir=<path>]"
@@ -2971,6 +3038,7 @@ cmd_build_project() {
     warn "Nix store used by EVERY project — only build flakes you trust"
     : > "$pdir/.flake-trust-noted" 2>/dev/null || true
   fi
+  apply_flake_header "$name" "$fdir/flake.nix"
   "$ENGINE" rm -f "${CONTAINER_PREFIX}__build-$name" >/dev/null 2>&1 || true
   run_builder project "$ENGINE" run --rm --name "${CONTAINER_PREFIX}__build-$name" \
     -v "$NIX_VOLUME":/nix \
@@ -6974,8 +7042,9 @@ safe_port_spec() {
 
 # Ask a yes/no question on the terminal. Returns 1 (no) when there's no TTY —
 # a non-interactive import must never grant something by default.
+stdin_is_tty() { [ -t 0 ]; }
 confirm_tty() {
-  [ -t 0 ] || return 1
+  stdin_is_tty || return 1
   printf '%s [y/N] ' "$1"
   local ans=""; read -r ans || true
   case "$ans" in [yY]|[yY][eE][sS]) return 0;; esac
@@ -7606,7 +7675,9 @@ Commands:
                             flake.nix from the repo root; --dir=P copies a whole
                             folder (flake.nix + local deps it references).
                             --dir is REMEMBERED per project, so later rebuilds
-                            are just 'build <project>'; --dir= (empty) clears it
+                            are just 'build <project>'; --dir= (empty) clears it.
+                            '# nixenv:allow' / '# nixenv:app-path' lines in the
+                            flake's header are offered, applied only on a yes
   init <project> [git-url] [--branch=<name>] [--template=<name|url|path>]
        [--build] [--unrestricted] [--allow=host,…] [--app-path=/path] [--yes] [--force]
                             Fails if <project> already exists (--force re-runs

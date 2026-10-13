@@ -160,8 +160,9 @@ interactive `zsh` via `docker exec` (no SSH key needed).
   per-project profile, layered on the base. Default reads `flake.nix` from the
   repo root; `--dir=<path>` copies a whole folder (flake + local files it
   references) and is **remembered**, so later rebuilds are just
-  `nixenv build <project>`. `--dir=` (empty) forgets it. See
-  [Per-project tooling](#per-project-tooling).
+  `nixenv build <project>`. `--dir=` (empty) forgets it. Settings declared in
+  the flake's header (`# nixenv:allow`, `# nixenv:app-path`) are shown and
+  applied only if you confirm. See [Per-project tooling](#per-project-tooling).
 - `init <project> [git-url] [--build] [--unrestricted] [--allow=host,…] [--app-path=/path]` — scaffold the
   project, prompt for git name/email, assign a stable random SSH port, and
   optionally clone `git-url` into the app volume. `--build` also builds the
@@ -1106,6 +1107,24 @@ absolute paths and `..` are refused. It copies the entire folder into the build,
 so relative references inside it (overlays, a vendored package, `./.`-style
 local inputs) work. Keep it small: `--dir=.` copies the whole repo
 (`node_modules`, `.git`…) into the store on every build, and nixenv warns.
+
+A repo flake can declare the project settings it needs in leading comments,
+the same header a [template](#templates--a-ready-to-run-stack-in-one-command) carries:
+
+```nix
+# nixenv:description  Billing API (Node 24 + Postgres)
+# nixenv:allow        registry.npmjs.org api.stripe.com
+# nixenv:app-path     /srv/billing
+# nixenv:port         3000
+```
+
+`build <project>` reads it and offers what the project doesn't have yet: the
+`allow` hosts missing from its allowlist, and the `app-path` when the project
+still mounts its code at the default `/app`. It shows them and asks before
+applying anything: these widen egress or move the code volume, and they come
+from the repo. Answer no and that same set isn't asked again (add the hosts
+later with `nixenv allow`); without a terminal nothing is applied. `port` and
+`description` are only shown.
 
 **Only build flakes you trust.** Building a flake runs its build code as root,
 with write access to the Nix store that *every* project shares. nixenv limits

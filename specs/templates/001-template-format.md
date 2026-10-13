@@ -21,6 +21,8 @@ enforced-by:
 - Metadata is read from leading `# nixenv:<key> <value>` comments
   (`description`, `port`, `allow`, `app-path`) BEFORE the build; the header also
   shows the `init` command.
+- The same keys in a repo's own flake are offered by `build <project>` and
+  applied only after confirmation (TOOL-10).
 - Only `@@PROJECT@@`, `@@APP_MOUNT@@`, `@@DOMAIN@@`, `@@PORT@@` are substituted.
   `install_template` writes `flake.nix` into the app volume (never clobbers an
   existing one); `init` then forces a project build.
