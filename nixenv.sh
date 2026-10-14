@@ -30,7 +30,7 @@
 set -euo pipefail
 
 # Bump on release; the Homebrew formula's `test` asserts this matches its tag.
-NIXENV_VERSION="0.6.0"
+NIXENV_VERSION="0.6.1"
 
 # ── Global settings file ──────────────────────────────────────────────────────
 # ~/.nixenv/config holds KEY=VALUE lines for the settings in NIXENV_CONFIG_KEYS,
