@@ -46,6 +46,9 @@ assert_contains "$body" '-e CLAUDE_CODE_PROJECT_DIR_NAME="nixenv-$name" \' \
 # It must agree with the ~/.claude/projects mount, or transcripts land elsewhere.
 assert_contains "$body" 'CLAUDE_DIR/projects/nixenv-$name' "matches the transcripts mount"
 
+# zmx: one session dir for every shell, whatever XDG_RUNTIME_DIR a project sets
+assert_contains "$ep" 'export ZMX_DIR="/tmp/zmx-$(id -u)"' ".zshenv pins ZMX_DIR"
+
 # egress: exported for services AND written to .zshenv; ssh ProxyCommand block
 assert_contains "$ep" 'NIXENV_EGRESS_PROXY'
 assert_contains "$ep" 'export HTTP_PROXY='

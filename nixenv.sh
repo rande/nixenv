@@ -521,6 +521,10 @@ export NIXENV_APP_MOUNT="$APP_MOUNT"
 # the container's -e never reaches an ssh/zmx session.
 export CLAUDE_CODE_PROJECT_DIR_NAME="nixenv-${NIXENV_PROJECT:-unknown}"
 export NIXENV_EXTRA_PROFILE="${NIXENV_EXTRA_PROFILE:-}"
+# zmx finds its sessions in ZMX_DIR, else \$XDG_RUNTIME_DIR/zmx, else /tmp.
+# Pin it: a project setup that exported XDG_RUNTIME_DIR (for rootless podman)
+# made 'zmx list' in a shell miss every session started over ssh.
+export ZMX_DIR="/tmp/zmx-$(id -u)"
 # PATH order: the user's own ~/.local/bin wins over everything (pip --user,
 # pipx, hand-dropped binaries — it lives in the home volume, so it persists),
 # then the per-project profile (extra tooling), then base.
