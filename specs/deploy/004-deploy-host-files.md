@@ -23,6 +23,11 @@ enforced-by:
 - Host files `deploy_gitconfig` (included by `.gitconfig`), `deploy_ssh_config`
   (included by `.ssh/config`) and `deploy_known_hosts` (read-write,
   `StrictHostKeyChecking accept-new`) are mounted when present.
+- `deploy_ssh_config` MUST be included through a copy the deploy entrypoint
+  makes in the tmpfs `~/.ssh` at mode 600, never the bind-mounted file:
+  ssh refuses an `Include`d config that its group or others can write, and a
+  bind mount keeps the host file's mode (664 under umask 002). The host
+  file's mode is left alone; edits apply from the next session.
 - Every host file here MUST be refused if it is a symlink. They travel in
   exports; on import the configs are gated and the seed's identity and
   credentials sanitised (EXP-04).

@@ -985,10 +985,18 @@ fi
 # Egress: the deploy network is --internal; squid (the project's allowed_hosts
 # + deploy_hosts) is the only way out — HTTP via the env vars, ssh via CONNECT.
 # Without any allowed host there is no proxy and no network at all.
+# ssh refuses a config file (Include'd ones too) that its group or others can
+# write, and the bind mount keeps the host file's mode: a 664 from umask 002
+# broke every Host in it. Copy it into the tmpfs HOME, mode 600 (like the host
+# key below); the host file is never touched.
+if [ -f /etc/nixenv/deploy_ssh_config ]; then
+  cp /etc/nixenv/deploy_ssh_config "$HOME_DIR/.ssh/deploy_ssh_config"
+  chmod 600 "$HOME_DIR/.ssh/deploy_ssh_config"
+fi
 {
-  if [ -f /etc/nixenv/deploy_ssh_config ]; then
-    echo "# Your host-side <project>/deploy_ssh_config (read-only here)."
-    echo "Include /etc/nixenv/deploy_ssh_config"
+  if [ -f "$HOME_DIR/.ssh/deploy_ssh_config" ]; then
+    echo "# Your host-side <project>/deploy_ssh_config (a copy made at start)."
+    echo "Include $HOME_DIR/.ssh/deploy_ssh_config"
     echo
   fi
   if [ -n "${NIXENV_EGRESS_PROXY:-}" ]; then

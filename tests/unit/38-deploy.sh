@@ -187,6 +187,10 @@ assert_contains "$body" "GIT_CONFIG_KEY_0=core.fsmonitor" "git: no fsmonitor fro
 assert_contains "$body" "core.hooksPath" "git: no hooks from the repo"
 assert_contains "$body" "StrictHostKeyChecking accept-new" "TOFU into the host-side known_hosts"
 assert_contains "$body" "/etc/nixenv/deploy_gitconfig" "deploy_gitconfig included"
+# ssh refuses a group-writable Include; the mount keeps the host's mode
+assert_contains "$body" 'cp /etc/nixenv/deploy_ssh_config "$HOME_DIR/.ssh/deploy_ssh_config"' "deploy_ssh_config copied"
+assert_contains "$body" 'chmod 600 "$HOME_DIR/.ssh/deploy_ssh_config"' "deploy_ssh_config copy is 600"
+assert_not_contains "$body" "Include /etc/nixenv/deploy_ssh_config" "the bind-mounted file is not included directly"
 assert_not_contains "$body" "cp /etc/nixenv/git" "git files are shared, not copied"
 # dev credentials first, seed second; nothing else is read from the dev volume
 assert_contains "$body" 'helper = store --file=/etc/nixenv/dev-home/.git-credentials' "dev credentials first"
