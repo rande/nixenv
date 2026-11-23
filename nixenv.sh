@@ -1583,6 +1583,16 @@ container_needs_recreate() {
     warn "'$name' does not trust the capture CA yet — its HTTPS requests fail while capture is on"
     stale=1
   fi
+  # Memory/CPU limits ('limits'): the label records what the container was
+  # created with; no label = created before limits existed = none.
+  local want have
+  want="$(project_limits_summary "$name" 2>/dev/null)"
+  have="$("$ENGINE" inspect -f "{{index .Config.Labels \"$LIMITS_LABEL\"}}" "$cname" 2>/dev/null || true)"
+  case "$have" in '<no value>') have="";; esac
+  if [ "$want" != "$have" ]; then
+    warn "'$name' runs with limits '${have:-none}', but $(project_dir "$name")/limits says '${want:-none}'"
+    stale=1
+  fi
   [ -n "$stale" ] || return 0
   echo "    apply it with: $0 stop $name && $0 start $name"
   return 1
@@ -2021,6 +2031,68 @@ project_extra_args() {
   sed 's/#.*//' "$f" | tr '\n\t' '  ' | tr -s ' ' | sed 's/^ *//; s/ *$//'
 }
 
+# Memory and CPU limits for a project's container, from the per-project file
+#   ~/.nixenv/projects/<project>/limits      ('limits <project>' writes it)
+# "memory=<size>" (a number with an optional b/k/m/g unit: 512m, 4g) and
+# "cpus=<n>" (a decimal: 2, 1.5) lines, '#' comments allowed; the last line for
+# a key wins. They become --memory / --cpus on the container's `run`, placed
+# BEFORE extra-parameters so a flag there still wins. Values are validated
+# here (the file travels in exports) and an invalid one is ignored with a
+# warning. Fixed at container CREATION, like every other flag.
+LIMIT_KEYS="memory cpus"
+valid_limit_memory() {
+  case "$1" in
+    ''|[!1-9]*|*[!0-9bkmgBKMG]*|*[bkmgBKMG]?*) return 1;;
+  esac
+  [ "${#1}" -le 12 ]
+}
+valid_limit_cpus() {
+  case "$1" in
+    ''|*[!0-9.]*|.*|*.|*.*.*) return 1;;
+    *[1-9]*) [ "${#1}" -le 8 ];;
+    *) return 1;;   # all zeros
+  esac
+}
+valid_limit() {
+  case "$1" in
+    memory) valid_limit_memory "$2";;
+    cpus)   valid_limit_cpus "$2";;
+    *) return 1;;
+  esac
+}
+# The raw value of one key (no validation), empty when unset.
+project_limit_raw() {
+  local f; f="$(project_dir "$1")/limits"
+  [ -f "$f" ] || return 0
+  sed 's/#.*//' "$f" | tr -d ' \t\r' | sed -n "s/^$2=//p" | tail -n 1
+}
+# The validated value of one key; warns (stderr) and prints nothing if invalid.
+project_limit() {
+  local v; v="$(project_limit_raw "$1" "$2")"
+  [ -n "$v" ] || return 0
+  if valid_limit "$2" "$v"; then printf '%s\n' "$v"; return 0; fi
+  warn "ignoring invalid $2 limit '$v' in $(project_dir "$1")/limits" >&2
+}
+# Normalised summary, e.g. "memory=4g cpus=2" (empty = no limits). Stored as a
+# container label so a running container that predates an edit is detected.
+project_limits_summary() {
+  local k v out=""
+  for k in $LIMIT_KEYS; do
+    v="$(project_limit "$1" "$k")"
+    if [ -n "$v" ]; then out="${out:+$out }$k=$v"; fi
+  done
+  printf '%s' "$out"
+}
+# Engine flags, one per line.
+project_limit_args() {
+  local k v
+  for k in $LIMIT_KEYS; do
+    v="$(project_limit "$1" "$k")"
+    if [ -n "$v" ]; then printf -- '--%s=%s\n' "$k" "$v"; fi
+  done
+}
+LIMITS_LABEL="nixenv.limits"
+
 # Defence-in-depth flags for every container nixenv runs long-lived.
 # The containers already run as your uid with no usable root, so none of this
 # costs a feature:
@@ -2031,8 +2103,8 @@ project_extra_args() {
 #   --pids-limit                   a fork bomb in one project can't take down the
 #                                  engine VM, and with it every other project.
 # NIXENV_PIDS_LIMIT=0 drops the pids limit (e.g. rootless podman without cgroup
-# delegation, which rejects it). Memory is NOT limited by default — databases and
-# builds vary too much; add --memory via extra-parameters.
+# delegation, which rejects it). Memory and CPU are NOT limited by default —
+# databases and builds vary too much; set them per project with 'limits'.
 container_hardening_args() {
   printf '%s\n' --cap-drop=ALL --security-opt=no-new-privileges
   if [ "${NIXENV_PIDS_LIMIT:-4096}" != 0 ]; then
@@ -3115,7 +3187,7 @@ cmd_run() {
   # symlink among them could make the engine bind-mount (or read) a host file
   # outside the project dir — e.g. hosts.extra -> ~/.ssh/id_ed25519.
   local _mf
-  for _mf in ports hosts.extra extra-parameters app_mount; do
+  for _mf in ports hosts.extra extra-parameters app_mount limits; do
     if [ -L "$pdir/$_mf" ]; then
       die "$pdir/$_mf is a symlink — refusing to use it (replace it with a regular file)"
     fi
@@ -3236,6 +3308,9 @@ cmd_run() {
     # Hardening, placed BEFORE extra_args so a deliberate override in
     # extra-parameters (e.g. --cap-add for podman-in-container) still wins.
     local harden; harden=($(container_hardening_args))
+    # Memory/CPU limits from <project>/limits, also before extra_args.
+    local limits limsum; limits=($(project_limit_args "$name")); limsum="$(project_limits_summary "$name" 2>/dev/null)"
+    if [ -n "$limsum" ]; then log "limits ($pdir/limits): $limsum"; fi
     local _extra extra_args; _extra="$(project_extra_args "$name")"; extra_args=()
     if [ -n "$_extra" ]; then
       extra_args=($_extra)
@@ -3248,6 +3323,8 @@ cmd_run() {
       --user "$(id -u):$(id -g)" \
       $(engine_userns) \
       ${harden[@]+"${harden[@]}"} \
+      ${limits[@]+"${limits[@]}"} \
+      --label "$LIMITS_LABEL=$limsum" \
       ${extra_args[@]+"${extra_args[@]}"} \
       --sysctl net.ipv4.ping_group_range="0 2147483647" \
       --sysctl net.ipv4.ip_unprivileged_port_start=0 \
@@ -3385,6 +3462,71 @@ cmd_expose() {
     cmd_run "$name"
   else
     log "ports saved — they apply on the next '$0 start $name'"
+  fi
+}
+
+# =============================================================================
+# limits — memory and CPU limits for a project's container (stored in
+#          <project>/limits), then restart it to apply. Examples:
+#   limits shop                       show the current limits
+#   limits shop memory=4g cpus=2      set both (512m, 4g; 2, 1.5)
+#   limits shop memory=               remove one limit
+#   limits shop off                   remove every limit
+# =============================================================================
+cmd_limits() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: $0 limits <project> [memory=<size>] [cpus=<n>] | off"
+  valid_project_name "$name" || die "invalid project name: $name"
+  shift
+  local pdir; pdir="$(project_dir "$name")"
+  [ -d "$pdir" ] || die "unknown project '$name' — run '$0 init $name' first"
+  local lf="$pdir/limits"
+  [ -L "$lf" ] && die "$lf is a symlink — refusing to use it (replace it with a regular file)"
+
+  if [ "$#" -eq 0 ]; then
+    local cur; cur="$(project_limits_summary "$name")"
+    echo "limits for '$name': ${cur:-none (no memory or CPU limit)}"
+    echo "  set with: $0 limits $name memory=4g cpus=2   (remove: $0 limits $name off)"
+    return 0
+  fi
+
+  local k a mem cpus
+  mem="$(project_limit "$name" memory)"; cpus="$(project_limit "$name" cpus)"
+  for a in "$@"; do
+    case "$a" in
+      off|none|clear) mem=""; cpus="";;
+      --*=*|*=*)
+        a="${a#--}"; k="${a%%=*}"; a="${a#*=}"
+        case "$k" in mem) k=memory;; cpu) k=cpus;; esac
+        if [ -n "$a" ] && ! valid_limit "$k" "$a"; then
+          case "$k" in
+            memory) die "invalid memory '$a' — a number with an optional b/k/m/g unit, e.g. 512m or 4g";;
+            cpus)   die "invalid cpus '$a' — a number above 0, e.g. 2 or 1.5";;
+            *)      die "unknown limit '$k' — use memory=<size> or cpus=<n>";;
+          esac
+        fi
+        case "$k" in memory) mem="$a";; cpus) cpus="$a";; esac;;
+      *) die "invalid argument '$a' — use memory=<size>, cpus=<n> or off";;
+    esac
+  done
+
+  if [ -z "$mem$cpus" ]; then
+    rm -f "$lf"; ok "no memory or CPU limit for '$name'"
+  else
+    {
+      echo "# nixenv: memory and CPU limits for this container (written by 'limits')."
+      if [ -n "$mem" ]; then echo "memory=$mem"; fi
+      if [ -n "$cpus" ]; then echo "cpus=$cpus"; fi
+    } > "$lf"
+    ok "limits for '$name': $(project_limits_summary "$name")"
+  fi
+
+  if resolve_engine 2>/dev/null && container_running "$(container_name "$name")"; then
+    warn "restarting '$name' to apply the new limits"
+    cmd_stop "$name" >/dev/null 2>&1 || true
+    cmd_run "$name"
+  else
+    log "limits saved — they apply on the next '$0 start $name'"
   fi
 }
 
@@ -5794,6 +5936,7 @@ nixenv stop</pre></td></tr>
         <thead><tr><th>command</th><th>what it does</th><th>example</th></tr></thead>
         <tbody>
           <tr><td>expose &lt;project&gt; &lt;port&gt;…<span class="opt">N  or  host:container</span></td><td>Publish extra ports on 127.0.0.1 (stored in &lt;project&gt;/ports); restarts the project.</td><td><pre class="ex">nixenv expose shop 8080 3000:3000</pre></td></tr>
+          <tr><td>limits &lt;project&gt; [memory=…] [cpus=…]<span class="opt">off  removes them</span></td><td>Memory and CPU limits for the container (stored in &lt;project&gt;/limits); restarts the project.</td><td><pre class="ex">nixenv limits shop memory=4g cpus=2</pre></td></tr>
           <tr><td>host &lt;project&gt; &lt;name:ip&gt;…</td><td>Add /etc/hosts entries (stored in &lt;project&gt;/hosts.extra).</td><td><pre class="ex">nixenv host shop shop-8000.nixenv.localhost:127.0.0.1</pre></td></tr>
           <tr><td>proxy [action]<span class="opt">up  reload  stop  status  logs [egress]  renew  remove-cert</span></td><td>The shared HTTPS proxy: https://&lt;project&gt;-&lt;port&gt;.nixenv.localhost/ and this page.</td><td><pre class="ex">nixenv proxy up
 nixenv proxy reload</pre></td></tr>
@@ -5846,6 +5989,7 @@ nixenv build shop --dir=nix</pre></td></tr>
           <tr><td>accept-from</td><td>projects allowed to reach this one through the proxy; * = all</td></tr>
           <tr><td>unrestricted</td><td>present = egress restriction off (restrict … off)</td></tr>
           <tr><td>ports</td><td>extra published ports (expose appends)</td></tr>
+          <tr><td>limits</td><td>memory=/cpus= limits for the container (limits writes it)</td></tr>
           <tr><td>hosts.extra</td><td>extra /etc/hosts lines (host appends)</td></tr>
           <tr><td>extra-parameters</td><td>engine flags passed verbatim to the container&#x27;s run</td></tr>
           <tr><td>deploy_hosts</td><td>extra egress hosts for deploy only</td></tr>
@@ -7293,6 +7437,20 @@ import_meta_files() {
         done < "$src"
         chmod 0644 "$dst"
         log "$rel from the archive: $(tr '\n' ' ' < "$dst")";;
+      limits)
+        # Only memory=/cpus= lines with valid values come in.
+        kept=""
+        while IFS= read -r line || [ -n "$line" ]; do
+          line="$(printf '%s' "${line%%#*}" | tr -d '[:space:]')"
+          [ -n "$line" ] || continue
+          if valid_limit "${line%%=*}" "${line#*=}"; then
+            kept="$kept$line
+"
+          else
+            warn "ignoring the archive's limit '$line'"
+          fi
+        done < "$src"
+        if [ -n "$kept" ]; then printf '%s' "$kept" > "$dst"; fi;;
       app_mount)
         spec="$(tr -d '[:space:]' < "$src")"
         if [ -n "$spec" ] && ! valid_app_mount "$spec"; then
@@ -7884,6 +8042,10 @@ Commands:
   shell <project>           Interactive zsh via the engine's 'exec' (no SSH key)
   expose <project> <port>…  Publish extra port(s) (e.g. 8080 or 3000:3000),
                             stored in <project>/ports; restarts to apply
+  limits <project> [memory=<size>] [cpus=<n>] | off
+                            Memory/CPU limits for the container (e.g. memory=4g
+                            cpus=2), stored in <project>/limits; no argument
+                            shows them; restarts a running project to apply
   host <project> <name:ip>… Append /etc/hosts entries (e.g. db:10.0.0.5) to
                             <project>/hosts.extra; the entrypoint merges that file
                             into /etc/hosts at start. Edit the file by hand too.
@@ -8007,6 +8169,7 @@ Per-project (runtime runs as non-root user '$APP_USER'):
   <project>/app_mount   → custom container path for the code volume (opt; --app-path)
   <project>/port        → the project's stable random host SSH port
   <project>/ports       → extra published ports (one per line; via 'expose')
+  <project>/limits      → memory=/cpus= limits for the container (via 'limits')
   <project>/hosts.extra → extra /etc/hosts lines (native "ip name" format), merged
                           into /etc/hosts at container start (edit by hand or 'host')
   <project>/unrestricted → opt-OUT marker: egress restriction disabled for this
@@ -8093,6 +8256,7 @@ main() {
     ssh-config) cmd_ssh_config "$@";;
     expose)   cmd_expose "$@";;
     host)     cmd_host "$@";;
+    limits)   cmd_limits "$@";;
     proxy)    cmd_proxy "$@";;
     restrict) cmd_restrict "$@";;
     allow)    cmd_allow "$@";;

@@ -183,6 +183,8 @@ interactive `zsh` via `docker exec` (no SSH key needed).
   nixenv host from your laptop (see below).
 - `expose <project> <port>…` — publish extra port(s) (see
   [Exposing ports](#exposing-ports)).
+- `limits <project> [memory=<size>] [cpus=<n>] | off` — cap the container's
+  RAM and CPU (see [Memory and CPU limits](#memory-and-cpu-limits)).
 - `host <project> <name:ip>…` — add custom `/etc/hosts` entries (see
   [Custom /etc/hosts](#custom-etchosts)).
 - `restrict <project> [on|off]` / `allow <project> <host>…` /
@@ -476,6 +478,31 @@ persist and you can also edit that file by hand. `expose` restarts the service
 to apply them; otherwise they take effect on the next `start`. A bare number binds
 to `127.0.0.1` (local only); pass a full `host:container` or
 `address:host:container` spec for anything else.
+
+## Memory and CPU limits
+
+No limit is set by default. To cap a project's container:
+
+```sh
+nixenv limits myapp memory=4g cpus=2   # set (512m, 4g; 1, 1.5, 2)
+nixenv limits myapp                    # show
+nixenv limits myapp cpus=              # remove one limit
+nixenv limits myapp off                # remove all
+```
+
+They are stored in `~/.nixenv/projects/<name>/limits` (`memory=`/`cpus=`
+lines; you can edit it by hand) and become `--memory`/`--cpus` on the
+container. `limits` restarts a running project to apply them; after a hand
+edit run `stop` then `start` (`start` warns while the running container has
+different limits). A flag in `extra-parameters` wins over the file, e.g.
+`--memory-swap`.
+
+Works with docker and podman. Rootless podman needs the `memory` and `cpu`
+cgroup v2 controllers delegated to your user (the systemd default on current
+distributions; check `cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cgroup.controllers`).
+On a cgroup v1 host rootless podman ignores the limits. On macOS the limits
+apply inside the Docker Desktop / podman machine VM, so they can't exceed what
+the VM itself has.
 
 ## Reverse proxy (`https://<project>-<port>.nixenv.localhost/`)
 
@@ -1047,7 +1074,7 @@ for you. Anything you put there is appended **verbatim** to the container's
 `start` — one flag per line, `#` comments allowed, no presets and no magic:
 
 ```
---memory=4g
+--memory-swap=4g
 --ulimit nofile=8192
 ```
 
@@ -1492,8 +1519,8 @@ nixenv host myapp "host.docker.internal:$gw"
 nixenv stop myapp && nixenv start myapp
 ```
 
-Use `extra-parameters` for flags the engine applies itself (`--memory`,
-`--ulimit`, `--device`, …). It is read only when the container is **created**,
+Use `extra-parameters` for flags the engine applies itself (`--ulimit`,
+`--memory-swap`, `--device`, …). It is read only when the container is **created**,
 so after an edit run `stop` and then `start`: `start` on a running container keeps
 the old flags.
 

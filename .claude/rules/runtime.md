@@ -24,3 +24,4 @@ change alters a rule, update its spec in the same commit.
 - RUN-13 Bare RUNTIME_IMAGE helpers have only Debian tools: @../../specs/runtime/013-bare-helpers-no-store-tools.md
 - RUN-14 sync-home refreshes dotfiles into an existing home volume: @../../specs/runtime/014-sync-home.md
 - RUN-15 run, shell, ssh, stop and logs lifecycle: @../../specs/runtime/015-run-stop-lifecycle.md
+- RUN-16 Memory and CPU limits come from <project>/limits: @../../specs/runtime/016-memory-cpu-limits.md

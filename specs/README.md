@@ -79,6 +79,7 @@ enforced-by:                    # optional: tests that fail when it is broken
 - [RUN-13](runtime/013-bare-helpers-no-store-tools.md) Bare RUNTIME_IMAGE helpers have only Debian tools
 - [RUN-14](runtime/014-sync-home.md) sync-home refreshes dotfiles into an existing home volume
 - [RUN-15](runtime/015-run-stop-lifecycle.md) run, shell, ssh, stop and logs lifecycle
+- [RUN-16](runtime/016-memory-cpu-limits.md) Memory and CPU limits come from <project>/limits
 
 ### SSH — Key-only login, pinned host key, zmx sessions
 
